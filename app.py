@@ -6,11 +6,12 @@ import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+# Load environment variables from .env or Render environment settings
 load_dotenv()
 
 app = Flask(__name__)
 
-# Load credentials
+# Load API keys from environment
 CLICKSEND_USERNAME = os.getenv("CLICKSEND_USERNAME")
 CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -22,7 +23,7 @@ USAGE_FILE = "usage.json"
 USAGE_LIMIT = 200
 RESET_DAYS = 30
 
-# Load whitelist
+# Load phone number whitelist
 def load_whitelist():
     try:
         with open(WHITELIST_FILE, "r") as f:
@@ -33,7 +34,7 @@ def load_whitelist():
 
 WHITELIST = load_whitelist()
 
-# Load and save usage
+# Load and save usage limits
 def load_usage():
     try:
         with open(USAGE_FILE, "r") as f:
@@ -45,13 +46,13 @@ def save_usage(data):
     with open(USAGE_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# Limit check
 def can_send(sender):
     usage = load_usage()
     now = datetime.utcnow()
     record = usage.get(sender, {"count": 0, "last_reset": now.isoformat()})
-
     last_reset = datetime.fromisoformat(record["last_reset"])
+
+    # Reset if more than 30 days have passed
     if now - last_reset > timedelta(days=RESET_DAYS):
         record["count"] = 0
         record["last_reset"] = now.isoformat()
@@ -59,6 +60,7 @@ def can_send(sender):
     if record["count"] >= USAGE_LIMIT:
         return False
 
+    # Count this message
     record["count"] += 1
     usage[sender] = record
     save_usage(usage)
@@ -69,14 +71,12 @@ def send_sms(to_number, message):
     url = "https://rest.clicksend.com/v3/sms/send"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "messages": [
-            {
-                "source": "python",
-                "body": message[:1600],
-                "to": to_number,
-                "custom_string": "gpt_reply"
-            }
-        ]
+        "messages": [{
+            "source": "python",
+            "body": message[:1600],
+            "to": to_number,
+            "custom_string": "gpt_reply"
+        }]
     }
     response = requests.post(
         url,
@@ -86,18 +86,19 @@ def send_sms(to_number, message):
     )
     return response.json()
 
-# Ask ChatGPT for short reply
+# Ask ChatGPT for a short, SMS-friendly reply
 def ask_gpt(message):
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": "Answer concisely in 1–2 short sentences. Be clear and SMS-friendly."},
+            {"role": "system", "content": "Answer clearly in 1–2 short sentences, optimized for SMS."},
             {"role": "user", "content": message}
         ],
         max_tokens=50,
         temperature=0.7
     )
     reply = response.choices[0].message.content.strip()
+    # Trim to 320 characters and ideally to a full sentence
     if len(reply) > 320:
         trimmed = reply[:320]
         if "." in trimmed:
@@ -105,11 +106,10 @@ def ask_gpt(message):
         reply = trimmed
     return reply
 
-# Webhook route
+# Handle incoming webhook from ClickSend
 @app.route("/sms", methods=["POST"])
 def sms_webhook():
     print("🛰 HEADERS:", dict(request.headers))
-    print("🛰 RAW BODY:", request.data.decode(errors='replace'))
     print("🧾 FORM DATA:", dict(request.form))
 
     sender = request.form.get("from")
@@ -124,8 +124,8 @@ def sms_webhook():
         return "Number not authorized", 403
 
     if not can_send(sender):
-        print(f"⏳ Limit reached for {sender}")
-        return "Monthly message limit reached (200). Try again later.", 403
+        print(f"⏳ Monthly message limit reached for {sender}")
+        return "Monthly message limit reached (200). Try again next month.", 403
 
     print(f"📩 SMS from {sender}: {body}")
 
@@ -133,12 +133,13 @@ def sms_webhook():
         reply = ask_gpt(body)
     except Exception as e:
         print("❌ GPT error:", e)
-        reply = "Sorry, I had trouble generating a response. Try again later."
+        reply = "There was an error generating a response. Try again later."
 
-    sms_result = send_sms(sender, reply)
-    print(f"📤 SMS Sent: {sms_result}")
+    result = send_sms(sender, reply)
+    print(f"📤 SMS Sent: {result}")
 
     return "OK", 200
 
+# Run the Flask app with host binding for Render
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
