@@ -654,14 +654,42 @@ def sms_webhook():
 
             elif intent_type == "hours":
                 search_parts = []
-                if e["biz"]:
-                    search_parts.append(f'"{e["biz"]}"')
-                if e.get("city"):
-                    search_parts.append(f"in {e['city']}")
-                search_parts.append("hours")
+                biz_name = e["biz"]
+                city = e.get("city")
                 
-                search_query = " ".join(search_parts)
-                reply = web_search(search_query, search_type="local")
+                if biz_name:
+                    # Try multiple search variations
+                    search_attempts = []
+                    
+                    # Attempt 1: Exact quoted search
+                    if city:
+                        search_attempts.append(f'"{biz_name}" in {city} hours')
+                        search_attempts.append(f'"{biz_name} in {city}" hours')  # Try business name WITH location
+                        search_attempts.append(f'{biz_name} {city} hours')  # No quotes
+                        search_attempts.append(f'{biz_name} restaurant {city}')  # Add restaurant context
+                    else:
+                        search_attempts.append(f'"{biz_name}" hours')
+                        search_attempts.append(f'{biz_name} restaurant hours')
+                    
+                    reply = "No results found"
+                    for i, search_query in enumerate(search_attempts):
+                        logger.info(f"Hours search attempt {i+1}: {search_query}")
+                        reply = web_search(search_query, search_type="local")
+                        
+                        # If we found results, stop trying
+                        if "No results found" not in reply:
+                            logger.info(f"Success with search attempt {i+1}")
+                            break
+                        else:
+                            logger.info(f"Search attempt {i+1} failed, trying next...")
+                    
+                    # If all searches failed, try one more general search
+                    if "No results found" in reply and city:
+                        final_search = f'{biz_name} {city}'
+                        logger.info(f"Final fallback search: {final_search}")
+                        reply = web_search(final_search, search_type="local")
+                else:
+                    reply = "Please specify a business name for hours information."
 
             elif intent_type == "weather":
                 query = "weather"
