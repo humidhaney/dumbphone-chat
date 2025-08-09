@@ -89,10 +89,10 @@ RESET_DAYS = 30
 DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 WELCOME_MSG = (
-    "Welcome to the Dirty Coast chatbot powered by Claude AI. "
-    "You can ask me to search the web, check business hours, get news, find sunrise/sunset times, "
-    "get directions, check movie showtimes, find restaurants, check flight status, and much more. "
-    "If at anytime you wish to unsubscribe, reply with STOP."
+    "Hey there! This is Alex, your SMS assistant powered by Claude AI. "
+    "I help you stay connected to the info you need without spending time online. "
+    "Ask me about weather, restaurants, directions, news, business hours, and more. "
+    "Text STOP anytime to unsubscribe."
 )
 
 # === Enhanced Error Handling Decorator ===
@@ -816,7 +816,16 @@ def ask_claude(phone, user_msg):
     try:
         history = load_history(phone, limit=6)
         
-        system_context = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. Keep responses under 160 characters when possible for SMS. Be concise but friendly and conversational. For medical emergencies, always advise calling 911. Don't provide medical diagnoses. If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs. Use local New Orleans knowledge when relevant. Be helpful with local recommendations. Keep the tone casual and friendly, like a local friend helping out."""
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. Your mission is to provide quick, useful answers via text message.
+
+Key guidelines:
+- Keep responses under 160 characters when possible for SMS
+- Be friendly, conversational, and helpful like a knowledgeable friend
+- For medical emergencies, always advise calling 911
+- Don't provide medical diagnoses
+- Help users get the information they need efficiently
+- Be concise but warm in your responses
+- When you don't know something specific, offer to search for it"""
         
         # Build a simple prompt for module-level API
         conversation_parts = [system_context]
@@ -902,7 +911,7 @@ def ask_claude(phone, user_msg):
         log_usage_analytics(phone, "claude_chat", False, response_time)
         
         # Return a helpful fallback message
-        return "I'm having trouble with the AI service right now, but I can still help you search for things! Try asking about restaurants, weather, or directions."
+        return "Hi! I'm Alex, your SMS assistant. I'm having trouble with AI responses right now, but I can still help you search for restaurants, weather, directions, and more!"
 
 # === Main SMS Route ===
 @app.route("/sms", methods=["POST"])
@@ -937,7 +946,7 @@ def sms_webhook():
     if body.upper() == "START":
         if add_to_whitelist(sender):
             WHITELIST.add(sender)
-        send_sms(sender, "Welcome back! You're now resubscribed to Dirty Coast chatbot.")
+        send_sms(sender, "Welcome back to Hey Alex! I'm here to help you stay connected to info without staying online.")
         return "OK", 200
 
     # Auto-add new number + welcome
@@ -1007,8 +1016,8 @@ def sms_webhook():
                 if e.get("city"): 
                     search_parts.append(f"in {e['city']}")
                 else:
-                    # Try to infer location from context or use default
-                    search_parts.append("in New Orleans")
+                    # Default to a broad search instead of assuming New Orleans
+                    pass
                     
                 if e.get("price_range"):
                     min_p, max_p = e["price_range"]
@@ -1031,8 +1040,7 @@ def sms_webhook():
                     search_parts.append(e["title"])
                 if e.get("city"): 
                     search_parts.append(f"in {e['city']}")
-                else:
-                    search_parts.append("in New Orleans")
+                # Removed New Orleans default - let search be broader
                 if e.get("date"): 
                     search_parts.append(e["date"])
                 
@@ -1064,8 +1072,7 @@ def sms_webhook():
                 query = "weather"
                 if e.get("city"): 
                     query += f" in {e['city']}"
-                else:
-                    query += " in New Orleans"  # Default
+                # Removed New Orleans default  # Default
                 if e.get("day") != "today": 
                     query += f" {e['day']}"
                 reply = web_search(query)
@@ -1140,17 +1147,21 @@ def sms_webhook():
 def index():
     """Root endpoint with enhanced service information"""
     return jsonify({
-        "service": "Dirty Coast SMS Chatbot",
+        "service": "Hey Alex SMS Assistant",
+        "description": "SMS assistant powered by Claude AI for staying connected without staying online",
         "status": "running",
-        "version": "2.1",
+        "version": "1.0",
+        "mission": "Help users access information efficiently via SMS to reduce online time",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "features": [
-            "Intent-based routing",
+            "Claude AI conversation",
             "Web search integration", 
+            "Restaurant and business lookup",
+            "Weather and news updates",
+            "Directions and local info",
             "Content filtering",
             "Rate limiting",
-            "Message history",
-            "Analytics tracking"
+            "Message history"
         ],
         "endpoints": {
             "sms_webhook": "/sms (POST)",
@@ -1384,7 +1395,8 @@ port = int(os.getenv("PORT", 5000))
 
 if __name__ == "__main__":
     configure_app()
-    logger.info("🔥 STARTING DIRTY COAST SMS CHATBOT - NEW VERSION 2.0 🔥")
+    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT 🔥")
+    logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Database: {DB_PATH}")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     
@@ -1402,7 +1414,7 @@ if __name__ == "__main__":
     
     # Check if running in Render (production)
     if os.getenv("RENDER"):
-        logger.info("🚀 RUNNING IN RENDER ENVIRONMENT - VERSION 2.0 🚀")
+        logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
         # Start with production settings
         app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
     else:
