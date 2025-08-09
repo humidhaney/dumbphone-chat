@@ -5,7 +5,7 @@ import os
 import json
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import calendar
 from dataclasses import dataclass
@@ -172,16 +172,36 @@ def save_usage(data):
 
 def can_send(sender):
     usage = load_usage()
-    now = datetime.utcnow()
-    record = usage.get(sender, {
-        "count": 0, 
-        "last_reset": now.isoformat(),
-        "hourly_count": 0,
-        "last_hour": now.replace(minute=0, second=0, microsecond=0).isoformat()
-    })
+    now = datetime.now(timezone.utc)
     
-    last_reset = datetime.fromisoformat(record["last_reset"])
-    last_hour = datetime.fromisoformat(record["last_hour"])
+    # Get existing record or create new one
+    record = usage.get(sender, {})
+    
+    # Ensure all required fields exist with defaults
+    if "count" not in record:
+        record["count"] = 0
+    if "last_reset" not in record:
+        record["last_reset"] = now.isoformat()
+    if "hourly_count" not in record:
+        record["hourly_count"] = 0
+    if "last_hour" not in record:
+        record["last_hour"] = now.replace(minute=0, second=0, microsecond=0).isoformat()
+    
+    try:
+        last_reset = datetime.fromisoformat(record["last_reset"])
+        last_hour = datetime.fromisoformat(record["last_hour"])
+        # Ensure timezone awareness
+        if last_reset.tzinfo is None:
+            last_reset = last_reset.replace(tzinfo=timezone.utc)
+        if last_hour.tzinfo is None:
+            last_hour = last_hour.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        # Reset corrupted timestamps
+        record["last_reset"] = now.isoformat()
+        record["last_hour"] = now.replace(minute=0, second=0, microsecond=0).isoformat()
+        last_reset = now
+        last_hour = now.replace(minute=0, second=0, microsecond=0)
+    
     current_hour = now.replace(minute=0, second=0, microsecond=0)
     
     # Reset monthly count
@@ -731,9 +751,79 @@ def sms_webhook():
         send_sms(sender, error_msg)
         return "OK", 200
 
+@app.route("/", methods=["GET"])
+def index():
+    """Root endpoint for health checks and service verification"""
+    return {
+        "service": "Dirty Coast SMS Chatbot",
+        "status": "running",
+        "version": "2.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "endpoints": {
+            "sms_webhook": "/sms (POST)",
+            "health_check": "/health (GET)"
+        }
+    }, 200
+
 @app.route("/health", methods=["GET"])
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}, 200
+    """Detailed health check endpoint"""
+    try:
+        # Test database connection
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
+        
+        # Check required environment variables
+        env_status = {
+            "clicksend_configured": bool(CLICKSEND_USERNAME and CLICKSEND_API_KEY),
+            "openai_configured": bool(OPENAI_API_KEY),
+            "serpapi_configured": bool(SERPAPI_API_KEY)
+        }
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": {
+                "connected": True,
+                "message_count": message_count
+            },
+            "environment": env_status,
+            "whitelist_count": len(load_whitelist())
+        }, 200
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, 500
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors gracefully"""
+    return {
+        "error": "Not Found",
+        "message": "The requested endpoint does not exist",
+        "available_endpoints": ["/", "/sms", "/health"]
+    }, 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 errors gracefully"""
+    return {
+        "error": "Internal Server Error",
+        "message": "An unexpected error occurred",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }, 500
+
+# Get port from environment variable (Render sets this automatically)
+port = int(os.getenv("PORT", 5000))
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # Use gunicorn in production, Flask dev server locally
+    if os.getenv("RENDER"):
+        # This should not run in Render since gunicorn starts the app
+        pass
+    else:
+        app.run(debug=True, host="0.0.0.0", port=port)
