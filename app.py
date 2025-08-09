@@ -2139,4 +2139,1321 @@ if __name__ == "__main__":
         app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
     else:
         logger.info(f"Starting development server on port {port}")
+        app.run(debug=True, host="0.0.0.0", port=port), '', biz, flags=re.I)
+
+def detect_news_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"(latest|current)\s+news", text, re.I) or "headlines" in text.lower():
+        topic = re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", "", text, flags=re.I).strip()
+        return IntentResult("news", {"topic": topic})
+    return None
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\b(weather|temp|temperature|forecast)\b", text, re.I):
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        return IntentResult("weather", {"city": city, "day": day})
+    return None
+
+# Add other intent detectors as needed...
+
+DET_ORDER = [
+    detect_hours_intent,
+    detect_news_intent,
+    detect_weather_intent,
+    detect_restaurant_intent,
+    # Add other detectors...
+]
+
+def detect_intent(text: str) -> Optional[IntentResult]:
+    for fn in DET_ORDER:
+        res = fn(text)
+        if res:
+            return res
+    return None
+
+# === Enhanced Claude Chat ===
+def ask_claude(phone, user_msg):
+    """Enhanced Claude integration with better error handling"""
+    start_time = time.time()
+    
+    if not anthropic_client:
+        logger.error("Anthropic client not initialized")
+        return "Sorry, the AI service is currently unavailable."
+    
+    try:
+        history = load_history(phone, limit=6)
+        
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. Your mission is to provide quick, useful answers via text message.
+
+Key guidelines:
+- Keep responses under 160 characters when possible for SMS
+- Be friendly, conversational, and helpful like a knowledgeable friend
+- For medical emergencies, always advise calling 911
+- Don't provide medical diagnoses
+- Help users get the information they need efficiently
+- Be concise but warm in your responses
+- When you don't know something specific, offer to search for it"""
+        
+        # Build a simple prompt for module-level API
+        conversation_parts = [system_context]
+        
+        # Add conversation history
+        for msg in history[-4:]:
+            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+            conversation_parts.append(f"{role_prefix}{msg['content']}")
+        
+        # Add current user message
+        conversation_parts.append(f"Human: {user_msg}")
+        conversation_parts.append("Assistant: ")
+        
+        prompt = "\n\n".join(conversation_parts)
+        
+        # Make a direct HTTP request to Anthropic API using Messages API
+        try:
+            import requests
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            # Convert history to messages format
+            messages = []
+            for msg in history[-4:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
+            data = {
+                "model": "claude-3-haiku-20240307",  # Use Claude 3 Haiku (fast and cost-effective)
+                "max_tokens": 150,
+                "temperature": 0.7,
+                "system": system_context,
+                "messages": messages
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+                logger.info("Used direct HTTP Messages API call")
+            else:
+                logger.error(f"HTTP API call failed: {response.status_code} - {response.text}")
+                raise Exception(f"API call failed with status {response.status_code}")
+                
+        except Exception as api_error:
+            logger.error(f"Direct HTTP API call failed: {api_error}")
+            # Fallback to a simple response
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
+        
+        # Clean up the response
+        if not reply or len(reply.strip()) == 0:
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
+        
+        # Ensure SMS length compliance
+        if len(reply) > 320:
+            reply = reply[:317] + "..."
+            
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", True, response_time)
+        
+        logger.info(f"Claude response for {phone} in {response_time}ms: {reply[:50]}...")
+        return reply
+        
+    except Exception as e:
+        logger.error(f"Claude error for {phone}: {e}")
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", False, response_time)
+        
+        # Return a helpful fallback message
+        return "Hi! I'm Alex, your SMS assistant. I'm having trouble with AI responses right now, but I can still help you search for restaurants, weather, directions, and more!"
+
+# === Main SMS Route ===
+@app.route("/sms", methods=["POST"])
+@handle_errors
+def sms_webhook():
+    start_time = time.time()
+    
+    sender = request.form.get("from")
+    body = (request.form.get("body") or "").strip()
+    
+    logger.info(f"📱 SMS received from {sender}: {body[:50]}...")
+    
+    if not sender or not body:
+        logger.warning("❌ Missing sender or body in SMS")
+        return "Missing fields", 400
+
+    # Enhanced content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        logger.info(f"Message filtered from {sender}: {filter_reason}")
+        return jsonify({"status": "filtered", "reason": filter_reason}), 400
+
+    # Handle STOP unsubscribe
+    if body.upper() in ["STOP", "UNSUBSCRIBE", "QUIT"]:
+        if remove_from_whitelist(sender):
+            WHITELIST.discard(sender)
+            send_sms(sender, "You have been unsubscribed. Text START to reactivate.")
+        logger.info(f"User {sender} unsubscribed")
+        return "OK", 200
+
+    # Handle START resubscribe
+    if body.upper() == "START":
+        if add_to_whitelist(sender):
+            WHITELIST.add(sender)
+        send_sms(sender, "Welcome back to Hey Alex! I'm here to help you stay connected to info without staying online.")
+        return "OK", 200
+
+    # Auto-add new number + welcome
+    is_new = add_to_whitelist(sender)
+    if is_new:
+        WHITELIST.add(sender)
+        send_sms(sender, WELCOME_MSG)
+        logger.info(f"New user {sender} added and welcomed")
+
+    if sender not in WHITELIST:
+        logger.warning(f"Unauthorized number: {sender}")
+        return "Number not authorized", 403
+
+    # Enhanced rate limiting
+    can_send_result, limit_reason = can_send(sender)
+    if not can_send_result:
+        logger.info(f"Rate limited {sender}: {limit_reason}")
+        send_sms(sender, f"Rate limit exceeded: {limit_reason}. Please try again later.")
+        return "Rate limited", 429
+
+    # Save user message
+    save_message(sender, "user", body)
+
+    # --- Enhanced intent routing ---
+    intent = detect_intent(body)
+    reply = ""
+    intent_type = "general"
+    
+    try:
+        if intent:
+            intent_type = intent.type
+            e = intent.entities
+
+            if intent_type == "medical":
+                if e.get("is_emergency"):
+                    reply = "⚠️ For medical emergencies, call 911 immediately. For non-emergency medical help:"
+                else:
+                    reply = "For medical assistance:"
+                
+                search_query = e["query"]
+                if e.get("city"):
+                    search_query += f" in {e['city']}"
+                
+                search_result = web_search(search_query, search_type="local")
+                reply += f" {search_result}"
+                
+            elif intent_type == "restaurant":
+                # Build more specific search query
+                search_parts = []
+                
+                # Debug logging
+                logger.info(f"Restaurant entities: {e}")
+                
+                # If we have a specific restaurant name, prioritize that
+                if e.get("restaurant_name"):
+                    search_parts.append(f'"{e["restaurant_name"]}"')
+                    if not any(word in e["restaurant_name"].lower() for word in ["restaurant", "cafe", "bar", "grill"]):
+                        search_parts.append("restaurant")
+                    logger.info(f"Found restaurant name: {e['restaurant_name']}")
+                else:
+                    search_parts.append("restaurant")
+                    logger.info("No specific restaurant name found")
+                
+                if e.get("cuisine"): 
+                    search_parts.append(e["cuisine"])
+                    
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    # Default to a broad search instead of assuming New Orleans
+                    pass
+                    
+                if e.get("price_range"):
+                    min_p, max_p = e["price_range"]
+                    search_parts.append(f"${min_p}-{max_p}")
+                
+                search_query = " ".join(search_parts)
+                logger.info(f"Restaurant search query: {search_query}")
+                reply = web_search(search_query, search_type="local")
+
+            elif intent_type == "directions":
+                if e.get("from") and e.get("to"):
+                    query = f"directions from {e['from']} to {e['to']}"
+                else:
+                    query = f"directions to {e['to']}"
+                reply = web_search(query, search_type="local")
+
+            elif intent_type == "movie":
+                search_parts = ["movie showtimes"]
+                if e.get("title"): 
+                    search_parts.append(e["title"])
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                # Removed New Orleans default - let search be broader
+                if e.get("date"): 
+                    search_parts.append(e["date"])
+                
+                reply = web_search(" ".join(search_parts))
+
+            elif intent_type == "flight":
+                if e.get("flight_number"):
+                    query = f"flight status {e['flight_number']}"
+                else:
+                    query = f"{e['airline']} flight status" if e.get("airline") else "flight status"
+                reply = web_search(query)
+
+            elif intent_type == "hours":
+                # Build cleaner search query for business hours
+                search_parts = []
+                
+                biz_name = e["biz"]
+                city = e.get("city")
+                day = e.get("day")
+                
+                logger.info(f"Hours search - Business: '{biz_name}', City: '{city}', Day: '{day}'")
+                
+                # Start with business name in quotes for exact matching
+                if biz_name:
+                    search_parts.append(f'"{biz_name}"')
+                
+                # Add location if specified
+                if city:
+                    search_parts.append(f"in {city}")
+                
+                # Add "hours" keyword
+                search_parts.append("hours")
+                
+                # Add specific day if mentioned
+                if day and day not in ["today"]:
+                    search_parts.append(day)
+                
+                search_query = " ".join(search_parts)
+                logger.info(f"Hours search query: {search_query}")
+                reply = web_search(search_query, search_type="local")
+
+            elif intent_type == "news":
+                query = e["topic"] or "New Orleans news headlines"
+                reply = web_search(query, search_type="news")
+
+            elif intent_type == "weather":
+                query = "weather"
+                if e.get("city"): 
+                    query += f" in {e['city']}"
+                # Removed New Orleans default  # Default
+                if e.get("day") != "today": 
+                    query += f" {e['day']}"
+                reply = web_search(query)
+
+            elif intent_type == "event":
+                search_parts = ["events"]
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    search_parts.append("in New Orleans")
+                if e.get("date"): 
+                    search_parts.append(e["date"])
+                reply = web_search(" ".join(search_parts))
+
+            elif intent_type == "shopping":
+                search_parts = ["shopping"]
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    search_parts.append("in New Orleans")
+                if e.get("price_range"):
+                    min_p, max_p = e["price_range"]
+                    search_parts.append(f"${min_p}-{max_p}")
+                reply = web_search(" ".join(search_parts), search_type="local")
+
+            else:
+                # Fallback to general search
+                reply = web_search(body)
+
+        else:
+            # No intent detected, use Claude
+            reply = ask_claude(sender, body)
+            intent_type = "claude_chat"
+
+        # Ensure reply fits SMS limits
+        if len(reply) > 300:
+            reply = reply[:297] + "..."
+
+        # Calculate response time
+        response_time = int((time.time() - start_time) * 1000)
+        
+        # Save assistant message
+        save_message(sender, "assistant", reply, intent_type, response_time)
+        
+        # Log analytics
+        log_usage_analytics(sender, intent_type, True, response_time)
+        
+        # Send SMS
+        sms_result = send_sms(sender, reply)
+        
+        if "error" in sms_result:
+            logger.error(f"Failed to send SMS to {sender}: {sms_result}")
+            return "SMS send failed", 500
+        
+        logger.info(f"Successfully processed {intent_type} query for {sender} in {response_time}ms")
+        return "OK", 200
+
+    except Exception as e:
+        logger.error(f"Error processing message from {sender}: {e}", exc_info=True)
+        
+        # Calculate response time even for errors
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        
+        error_msg = "Sorry, I'm experiencing technical difficulties. Please try again later."
+        save_message(sender, "assistant", error_msg)
+        send_sms(sender, error_msg)
+        return "OK", 200  # Return 200 to prevent webhook retries
+
+# === Enhanced Routes ===
+@app.route("/", methods=["GET"])
+def index():
+    """Root endpoint with enhanced service information"""
+    return jsonify({
+        "service": "Hey Alex SMS Assistant",
+        "description": "SMS assistant powered by Claude AI for staying connected without staying online",
+        "status": "running",
+        "version": "1.0",
+        "mission": "Help users access information efficiently via SMS to reduce online time",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "features": [
+            "Claude AI conversation",
+            "Web search integration", 
+            "Restaurant and business lookup",
+            "Weather and news updates",
+            "Directions and local info",
+            "Content filtering",
+            "Rate limiting",
+            "Message history"
+        ],
+        "endpoints": {
+            "sms_webhook": "/sms (POST)",
+            "health_check": "/health (GET)",
+            "analytics": "/analytics (GET)",
+            "whitelist_stats": "/whitelist (GET)"
+        }
+    }), 200
+
+@app.route("/health", methods=["GET"])
+@handle_errors
+def health_check():
+    """Comprehensive health check endpoint"""
+    try:
+        # Test database connection
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM usage_analytics")
+            analytics_count = c.fetchone()[0]
+        
+        # Check required environment variables
+        env_status = {
+            "clicksend_configured": bool(CLICKSEND_USERNAME and CLICKSEND_API_KEY),
+            "anthropic_configured": bool(ANTHROPIC_API_KEY),
+            "serpapi_configured": bool(SERPAPI_API_KEY)
+        }
+        
+        # Check file system
+        files_status = {
+            "whitelist_exists": os.path.exists(WHITELIST_FILE),
+            "usage_file_exists": os.path.exists(USAGE_FILE),
+            "db_exists": os.path.exists(DB_PATH)
+        }
+        
+        # Get recent activity
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT COUNT(*) FROM messages 
+                    WHERE ts > datetime('now', '-1 hour')
+                """)
+                recent_messages = c.fetchone()[0]
+        except:
+            recent_messages = 0
+        
+        health_score = sum([
+            env_status["clicksend_configured"],
+            env_status["anthropic_configured"], 
+            env_status["serpapi_configured"],
+            files_status["db_exists"]
+        ])
+        
+        status = "healthy" if health_score >= 3 else "degraded" if health_score >= 2 else "unhealthy"
+        
+        return jsonify({
+            "status": status,
+            "health_score": f"{health_score}/4",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": {
+                "connected": True,
+                "message_count": message_count,
+                "analytics_count": analytics_count,
+                "recent_activity": recent_messages
+            },
+            "environment": env_status,
+            "files": files_status,
+            "whitelist_count": len(load_whitelist()),
+            "uptime_check": True
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 500
+
+@app.route("/analytics", methods=["GET"])
+@handle_errors
+def analytics():
+    """Analytics endpoint for monitoring usage patterns"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Get usage by intent type
+            c.execute("""
+                SELECT intent_type, COUNT(*) as count, 
+                       AVG(response_time_ms) as avg_response_time,
+                       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+                GROUP BY intent_type
+                ORDER BY count DESC
+            """)
+            intent_stats = [
+                {
+                    "intent": row[0] or "unknown",
+                    "count": row[1],
+                    "avg_response_time_ms": round(row[2] or 0, 2),
+                    "success_rate": round((row[3] / row[1]) * 100, 2) if row[1] > 0 else 0
+                }
+                for row in c.fetchall()
+            ]
+            
+            # Get hourly activity for last 24 hours
+            c.execute("""
+                SELECT strftime('%H', timestamp) as hour, COUNT(*) as count
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-1 day')
+                GROUP BY hour
+                ORDER BY hour
+            """)
+            hourly_activity = {str(row[0]).zfill(2): row[1] for row in c.fetchall()}
+            
+            # Get total stats
+            c.execute("""
+                SELECT COUNT(*) as total_messages,
+                       COUNT(DISTINCT phone) as unique_users,
+                       AVG(response_time_ms) as avg_response_time
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+            """)
+            total_stats = c.fetchone()
+            
+        return jsonify({
+            "period": "last_7_days",
+            "summary": {
+                "total_messages": total_stats[0],
+                "unique_users": total_stats[1],
+                "avg_response_time_ms": round(total_stats[2] or 0, 2)
+            },
+            "intent_breakdown": intent_stats,
+            "hourly_activity": hourly_activity,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Analytics error: {e}")
+        return jsonify({"error": "Analytics unavailable"}), 500
+
+@app.route("/whitelist", methods=["GET"])
+@handle_errors
+def whitelist_stats():
+    """Whitelist management endpoint"""
+    try:
+        whitelist = load_whitelist()
+        usage_data = load_usage()
+        
+        # Get stats for whitelisted numbers
+        stats = []
+        for phone in whitelist:
+            user_usage = usage_data.get(phone, {})
+            stats.append({
+                "phone": phone[-4:],  # Only show last 4 digits for privacy
+                "monthly_usage": user_usage.get("count", 0),
+                "daily_usage": user_usage.get("daily_count", 0),
+                "hourly_usage": user_usage.get("hourly_count", 0)
+            })
+        
+        return jsonify({
+            "total_whitelisted": len(whitelist),
+            "usage_stats": sorted(stats, key=lambda x: x["monthly_usage"], reverse=True),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Whitelist stats error: {e}")
+        return jsonify({"error": "Whitelist stats unavailable"}), 500
+
+# === Error Handlers ===
+@app.errorhandler(404)
+def not_found(error):
+    """Enhanced 404 handler"""
+    return jsonify({
+        "error": "Not Found",
+        "message": "The requested endpoint does not exist",
+        "available_endpoints": {
+            "GET /": "Service information",
+            "POST /sms": "SMS webhook", 
+            "GET /health": "Health check",
+            "GET /analytics": "Usage analytics",
+            "GET /whitelist": "Whitelist stats"
+        }
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Enhanced 500 handler with logging"""
+    logger.error(f"Internal server error: {error}")
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": "An unexpected error occurred",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "support": "Check logs for details"
+    }), 500
+
+@app.errorhandler(429)
+def rate_limit_error(error):
+    """Rate limiting error handler"""
+    return jsonify({
+        "error": "Rate Limited", 
+        "message": "Too many requests, please try again later",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 429
+
+# === Startup Configuration ===
+def configure_app():
+    """Configure app settings based on environment"""
+    if os.getenv("FLASK_ENV") == "development":
+        app.config['DEBUG'] = True
+        logger.setLevel(logging.DEBUG)
+    else:
+        app.config['DEBUG'] = False
+        
+    # Security headers for production
+    @app.after_request
+    def after_request(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        return response
+
+# Get port from environment variable (Render sets this automatically)
+port = int(os.getenv("PORT", 5000))
+
+if __name__ == "__main__":
+    configure_app()
+    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT 🔥")
+    logger.info("📱 Helping people stay connected without staying online")
+    logger.info(f"Database: {DB_PATH}")
+    logger.info(f"Whitelist: {len(WHITELIST)} numbers")
+    
+    # Validate configuration
+    missing_configs = []
+    if not CLICKSEND_USERNAME: missing_configs.append("CLICKSEND_USERNAME")
+    if not CLICKSEND_API_KEY: missing_configs.append("CLICKSEND_API_KEY")
+    if not ANTHROPIC_API_KEY: missing_configs.append("ANTHROPIC_API_KEY")
+    if not SERPAPI_API_KEY: missing_configs.append("SERPAPI_API_KEY")
+    
+    if missing_configs:
+        logger.warning(f"Missing configurations: {', '.join(missing_configs)}")
+    else:
+        logger.info("All configurations validated ✓")
+    
+    # Check if running in Render (production)
+    if os.getenv("RENDER"):
+        logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
+        # Start with production settings
+        app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+    else:
+        logger.info(f"Starting development server on port {port}")
+        app.run(debug=True, host="0.0.0.0", port=port), '', biz, flags=re.I)
+            
+            logger.info(f"Extracted business: '{biz}', city: '{city}', day: '{day}'")
+            
+            return IntentResult("hours", {"biz": biz.strip(), "city": city, "day": day})
+    return None
+
+def detect_news_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"(latest|current)\s+news", text, re.I) or "headlines" in text.lower():
+        topic = re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", "", text, flags=re.I).strip()
+        return IntentResult("news", {"topic": topic})
+    return None
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\b(weather|temp|temperature|forecast)\b", text, re.I):
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        return IntentResult("weather", {"city": city, "day": day})
+    return None
+
+# Add other intent detectors as needed...
+
+DET_ORDER = [
+    detect_hours_intent,
+    detect_news_intent,
+    detect_weather_intent,
+    detect_restaurant_intent,
+    # Add other detectors...
+]
+
+def detect_intent(text: str) -> Optional[IntentResult]:
+    for fn in DET_ORDER:
+        res = fn(text)
+        if res:
+            return res
+    return None
+
+# === Enhanced Claude Chat ===
+def ask_claude(phone, user_msg):
+    """Enhanced Claude integration with better error handling"""
+    start_time = time.time()
+    
+    if not anthropic_client:
+        logger.error("Anthropic client not initialized")
+        return "Sorry, the AI service is currently unavailable."
+    
+    try:
+        history = load_history(phone, limit=6)
+        
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. Your mission is to provide quick, useful answers via text message.
+
+Key guidelines:
+- Keep responses under 160 characters when possible for SMS
+- Be friendly, conversational, and helpful like a knowledgeable friend
+- For medical emergencies, always advise calling 911
+- Don't provide medical diagnoses
+- Help users get the information they need efficiently
+- Be concise but warm in your responses
+- When you don't know something specific, offer to search for it"""
+        
+        # Build a simple prompt for module-level API
+        conversation_parts = [system_context]
+        
+        # Add conversation history
+        for msg in history[-4:]:
+            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+            conversation_parts.append(f"{role_prefix}{msg['content']}")
+        
+        # Add current user message
+        conversation_parts.append(f"Human: {user_msg}")
+        conversation_parts.append("Assistant: ")
+        
+        prompt = "\n\n".join(conversation_parts)
+        
+        # Make a direct HTTP request to Anthropic API using Messages API
+        try:
+            import requests
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            # Convert history to messages format
+            messages = []
+            for msg in history[-4:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
+            data = {
+                "model": "claude-3-haiku-20240307",  # Use Claude 3 Haiku (fast and cost-effective)
+                "max_tokens": 150,
+                "temperature": 0.7,
+                "system": system_context,
+                "messages": messages
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+                logger.info("Used direct HTTP Messages API call")
+            else:
+                logger.error(f"HTTP API call failed: {response.status_code} - {response.text}")
+                raise Exception(f"API call failed with status {response.status_code}")
+                
+        except Exception as api_error:
+            logger.error(f"Direct HTTP API call failed: {api_error}")
+            # Fallback to a simple response
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
+        
+        # Clean up the response
+        if not reply or len(reply.strip()) == 0:
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
+        
+        # Ensure SMS length compliance
+        if len(reply) > 320:
+            reply = reply[:317] + "..."
+            
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", True, response_time)
+        
+        logger.info(f"Claude response for {phone} in {response_time}ms: {reply[:50]}...")
+        return reply
+        
+    except Exception as e:
+        logger.error(f"Claude error for {phone}: {e}")
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", False, response_time)
+        
+        # Return a helpful fallback message
+        return "Hi! I'm Alex, your SMS assistant. I'm having trouble with AI responses right now, but I can still help you search for restaurants, weather, directions, and more!"
+
+# === Main SMS Route ===
+@app.route("/sms", methods=["POST"])
+@handle_errors
+def sms_webhook():
+    start_time = time.time()
+    
+    sender = request.form.get("from")
+    body = (request.form.get("body") or "").strip()
+    
+    logger.info(f"📱 SMS received from {sender}: {body[:50]}...")
+    
+    if not sender or not body:
+        logger.warning("❌ Missing sender or body in SMS")
+        return "Missing fields", 400
+
+    # Enhanced content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        logger.info(f"Message filtered from {sender}: {filter_reason}")
+        return jsonify({"status": "filtered", "reason": filter_reason}), 400
+
+    # Handle STOP unsubscribe
+    if body.upper() in ["STOP", "UNSUBSCRIBE", "QUIT"]:
+        if remove_from_whitelist(sender):
+            WHITELIST.discard(sender)
+            send_sms(sender, "You have been unsubscribed. Text START to reactivate.")
+        logger.info(f"User {sender} unsubscribed")
+        return "OK", 200
+
+    # Handle START resubscribe
+    if body.upper() == "START":
+        if add_to_whitelist(sender):
+            WHITELIST.add(sender)
+        send_sms(sender, "Welcome back to Hey Alex! I'm here to help you stay connected to info without staying online.")
+        return "OK", 200
+
+    # Auto-add new number + welcome
+    is_new = add_to_whitelist(sender)
+    if is_new:
+        WHITELIST.add(sender)
+        send_sms(sender, WELCOME_MSG)
+        logger.info(f"New user {sender} added and welcomed")
+
+    if sender not in WHITELIST:
+        logger.warning(f"Unauthorized number: {sender}")
+        return "Number not authorized", 403
+
+    # Enhanced rate limiting
+    can_send_result, limit_reason = can_send(sender)
+    if not can_send_result:
+        logger.info(f"Rate limited {sender}: {limit_reason}")
+        send_sms(sender, f"Rate limit exceeded: {limit_reason}. Please try again later.")
+        return "Rate limited", 429
+
+    # Save user message
+    save_message(sender, "user", body)
+
+    # --- Enhanced intent routing ---
+    intent = detect_intent(body)
+    reply = ""
+    intent_type = "general"
+    
+    try:
+        if intent:
+            intent_type = intent.type
+            e = intent.entities
+
+            if intent_type == "medical":
+                if e.get("is_emergency"):
+                    reply = "⚠️ For medical emergencies, call 911 immediately. For non-emergency medical help:"
+                else:
+                    reply = "For medical assistance:"
+                
+                search_query = e["query"]
+                if e.get("city"):
+                    search_query += f" in {e['city']}"
+                
+                search_result = web_search(search_query, search_type="local")
+                reply += f" {search_result}"
+                
+            elif intent_type == "restaurant":
+                # Build more specific search query
+                search_parts = []
+                
+                # Debug logging
+                logger.info(f"Restaurant entities: {e}")
+                
+                # If we have a specific restaurant name, prioritize that
+                if e.get("restaurant_name"):
+                    search_parts.append(f'"{e["restaurant_name"]}"')
+                    if not any(word in e["restaurant_name"].lower() for word in ["restaurant", "cafe", "bar", "grill"]):
+                        search_parts.append("restaurant")
+                    logger.info(f"Found restaurant name: {e['restaurant_name']}")
+                else:
+                    search_parts.append("restaurant")
+                    logger.info("No specific restaurant name found")
+                
+                if e.get("cuisine"): 
+                    search_parts.append(e["cuisine"])
+                    
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    # Default to a broad search instead of assuming New Orleans
+                    pass
+                    
+                if e.get("price_range"):
+                    min_p, max_p = e["price_range"]
+                    search_parts.append(f"${min_p}-{max_p}")
+                
+                search_query = " ".join(search_parts)
+                logger.info(f"Restaurant search query: {search_query}")
+                reply = web_search(search_query, search_type="local")
+
+            elif intent_type == "directions":
+                if e.get("from") and e.get("to"):
+                    query = f"directions from {e['from']} to {e['to']}"
+                else:
+                    query = f"directions to {e['to']}"
+                reply = web_search(query, search_type="local")
+
+            elif intent_type == "movie":
+                search_parts = ["movie showtimes"]
+                if e.get("title"): 
+                    search_parts.append(e["title"])
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                # Removed New Orleans default - let search be broader
+                if e.get("date"): 
+                    search_parts.append(e["date"])
+                
+                reply = web_search(" ".join(search_parts))
+
+            elif intent_type == "flight":
+                if e.get("flight_number"):
+                    query = f"flight status {e['flight_number']}"
+                else:
+                    query = f"{e['airline']} flight status" if e.get("airline") else "flight status"
+                reply = web_search(query)
+
+            elif intent_type == "hours":
+                parts = [e["biz"]]
+                if e.get("city"): 
+                    parts.append(e["city"])
+                else:
+                    parts.append("New Orleans")  # Default
+                parts.append("hours")
+                if e.get("day"): 
+                    parts.append(e["day"])
+                reply = web_search(" ".join(parts), search_type="local")
+
+            elif intent_type == "news":
+                query = e["topic"] or "New Orleans news headlines"
+                reply = web_search(query, search_type="news")
+
+            elif intent_type == "weather":
+                query = "weather"
+                if e.get("city"): 
+                    query += f" in {e['city']}"
+                # Removed New Orleans default  # Default
+                if e.get("day") != "today": 
+                    query += f" {e['day']}"
+                reply = web_search(query)
+
+            elif intent_type == "event":
+                search_parts = ["events"]
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    search_parts.append("in New Orleans")
+                if e.get("date"): 
+                    search_parts.append(e["date"])
+                reply = web_search(" ".join(search_parts))
+
+            elif intent_type == "shopping":
+                search_parts = ["shopping"]
+                if e.get("city"): 
+                    search_parts.append(f"in {e['city']}")
+                else:
+                    search_parts.append("in New Orleans")
+                if e.get("price_range"):
+                    min_p, max_p = e["price_range"]
+                    search_parts.append(f"${min_p}-{max_p}")
+                reply = web_search(" ".join(search_parts), search_type="local")
+
+            else:
+                # Fallback to general search
+                reply = web_search(body)
+
+        else:
+            # No intent detected, use Claude
+            reply = ask_claude(sender, body)
+            intent_type = "claude_chat"
+
+        # Ensure reply fits SMS limits
+        if len(reply) > 300:
+            reply = reply[:297] + "..."
+
+        # Calculate response time
+        response_time = int((time.time() - start_time) * 1000)
+        
+        # Save assistant message
+        save_message(sender, "assistant", reply, intent_type, response_time)
+        
+        # Log analytics
+        log_usage_analytics(sender, intent_type, True, response_time)
+        
+        # Send SMS
+        sms_result = send_sms(sender, reply)
+        
+        if "error" in sms_result:
+            logger.error(f"Failed to send SMS to {sender}: {sms_result}")
+            return "SMS send failed", 500
+        
+        logger.info(f"Successfully processed {intent_type} query for {sender} in {response_time}ms")
+        return "OK", 200
+
+    except Exception as e:
+        logger.error(f"Error processing message from {sender}: {e}", exc_info=True)
+        
+        # Calculate response time even for errors
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        
+        error_msg = "Sorry, I'm experiencing technical difficulties. Please try again later."
+        save_message(sender, "assistant", error_msg)
+        send_sms(sender, error_msg)
+        return "OK", 200  # Return 200 to prevent webhook retries
+
+# === Enhanced Routes ===
+@app.route("/", methods=["GET"])
+def index():
+    """Root endpoint with enhanced service information"""
+    return jsonify({
+        "service": "Hey Alex SMS Assistant",
+        "description": "SMS assistant powered by Claude AI for staying connected without staying online",
+        "status": "running",
+        "version": "1.0",
+        "mission": "Help users access information efficiently via SMS to reduce online time",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "features": [
+            "Claude AI conversation",
+            "Web search integration", 
+            "Restaurant and business lookup",
+            "Weather and news updates",
+            "Directions and local info",
+            "Content filtering",
+            "Rate limiting",
+            "Message history"
+        ],
+        "endpoints": {
+            "sms_webhook": "/sms (POST)",
+            "health_check": "/health (GET)",
+            "analytics": "/analytics (GET)",
+            "whitelist_stats": "/whitelist (GET)"
+        }
+    }), 200
+
+@app.route("/health", methods=["GET"])
+@handle_errors
+def health_check():
+    """Comprehensive health check endpoint"""
+    try:
+        # Test database connection
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM usage_analytics")
+            analytics_count = c.fetchone()[0]
+        
+        # Check required environment variables
+        env_status = {
+            "clicksend_configured": bool(CLICKSEND_USERNAME and CLICKSEND_API_KEY),
+            "anthropic_configured": bool(ANTHROPIC_API_KEY),
+            "serpapi_configured": bool(SERPAPI_API_KEY)
+        }
+        
+        # Check file system
+        files_status = {
+            "whitelist_exists": os.path.exists(WHITELIST_FILE),
+            "usage_file_exists": os.path.exists(USAGE_FILE),
+            "db_exists": os.path.exists(DB_PATH)
+        }
+        
+        # Get recent activity
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT COUNT(*) FROM messages 
+                    WHERE ts > datetime('now', '-1 hour')
+                """)
+                recent_messages = c.fetchone()[0]
+        except:
+            recent_messages = 0
+        
+        health_score = sum([
+            env_status["clicksend_configured"],
+            env_status["anthropic_configured"], 
+            env_status["serpapi_configured"],
+            files_status["db_exists"]
+        ])
+        
+        status = "healthy" if health_score >= 3 else "degraded" if health_score >= 2 else "unhealthy"
+        
+        return jsonify({
+            "status": status,
+            "health_score": f"{health_score}/4",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": {
+                "connected": True,
+                "message_count": message_count,
+                "analytics_count": analytics_count,
+                "recent_activity": recent_messages
+            },
+            "environment": env_status,
+            "files": files_status,
+            "whitelist_count": len(load_whitelist()),
+            "uptime_check": True
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 500
+
+@app.route("/analytics", methods=["GET"])
+@handle_errors
+def analytics():
+    """Analytics endpoint for monitoring usage patterns"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Get usage by intent type
+            c.execute("""
+                SELECT intent_type, COUNT(*) as count, 
+                       AVG(response_time_ms) as avg_response_time,
+                       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+                GROUP BY intent_type
+                ORDER BY count DESC
+            """)
+            intent_stats = [
+                {
+                    "intent": row[0] or "unknown",
+                    "count": row[1],
+                    "avg_response_time_ms": round(row[2] or 0, 2),
+                    "success_rate": round((row[3] / row[1]) * 100, 2) if row[1] > 0 else 0
+                }
+                for row in c.fetchall()
+            ]
+            
+            # Get hourly activity for last 24 hours
+            c.execute("""
+                SELECT strftime('%H', timestamp) as hour, COUNT(*) as count
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-1 day')
+                GROUP BY hour
+                ORDER BY hour
+            """)
+            hourly_activity = {str(row[0]).zfill(2): row[1] for row in c.fetchall()}
+            
+            # Get total stats
+            c.execute("""
+                SELECT COUNT(*) as total_messages,
+                       COUNT(DISTINCT phone) as unique_users,
+                       AVG(response_time_ms) as avg_response_time
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+            """)
+            total_stats = c.fetchone()
+            
+        return jsonify({
+            "period": "last_7_days",
+            "summary": {
+                "total_messages": total_stats[0],
+                "unique_users": total_stats[1],
+                "avg_response_time_ms": round(total_stats[2] or 0, 2)
+            },
+            "intent_breakdown": intent_stats,
+            "hourly_activity": hourly_activity,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Analytics error: {e}")
+        return jsonify({"error": "Analytics unavailable"}), 500
+
+@app.route("/whitelist", methods=["GET"])
+@handle_errors
+def whitelist_stats():
+    """Whitelist management endpoint"""
+    try:
+        whitelist = load_whitelist()
+        usage_data = load_usage()
+        
+        # Get stats for whitelisted numbers
+        stats = []
+        for phone in whitelist:
+            user_usage = usage_data.get(phone, {})
+            stats.append({
+                "phone": phone[-4:],  # Only show last 4 digits for privacy
+                "monthly_usage": user_usage.get("count", 0),
+                "daily_usage": user_usage.get("daily_count", 0),
+                "hourly_usage": user_usage.get("hourly_count", 0)
+            })
+        
+        return jsonify({
+            "total_whitelisted": len(whitelist),
+            "usage_stats": sorted(stats, key=lambda x: x["monthly_usage"], reverse=True),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Whitelist stats error: {e}")
+        return jsonify({"error": "Whitelist stats unavailable"}), 500
+
+# === Error Handlers ===
+@app.errorhandler(404)
+def not_found(error):
+    """Enhanced 404 handler"""
+    return jsonify({
+        "error": "Not Found",
+        "message": "The requested endpoint does not exist",
+        "available_endpoints": {
+            "GET /": "Service information",
+            "POST /sms": "SMS webhook", 
+            "GET /health": "Health check",
+            "GET /analytics": "Usage analytics",
+            "GET /whitelist": "Whitelist stats"
+        }
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Enhanced 500 handler with logging"""
+    logger.error(f"Internal server error: {error}")
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": "An unexpected error occurred",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "support": "Check logs for details"
+    }), 500
+
+@app.errorhandler(429)
+def rate_limit_error(error):
+    """Rate limiting error handler"""
+    return jsonify({
+        "error": "Rate Limited", 
+        "message": "Too many requests, please try again later",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 429
+
+# === Startup Configuration ===
+def configure_app():
+    """Configure app settings based on environment"""
+    if os.getenv("FLASK_ENV") == "development":
+        app.config['DEBUG'] = True
+        logger.setLevel(logging.DEBUG)
+    else:
+        app.config['DEBUG'] = False
+        
+    # Security headers for production
+    @app.after_request
+    def after_request(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        return response
+
+# Get port from environment variable (Render sets this automatically)
+port = int(os.getenv("PORT", 5000))
+
+if __name__ == "__main__":
+    configure_app()
+    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT 🔥")
+    logger.info("📱 Helping people stay connected without staying online")
+    logger.info(f"Database: {DB_PATH}")
+    logger.info(f"Whitelist: {len(WHITELIST)} numbers")
+    
+    # Validate configuration
+    missing_configs = []
+    if not CLICKSEND_USERNAME: missing_configs.append("CLICKSEND_USERNAME")
+    if not CLICKSEND_API_KEY: missing_configs.append("CLICKSEND_API_KEY")
+    if not ANTHROPIC_API_KEY: missing_configs.append("ANTHROPIC_API_KEY")
+    if not SERPAPI_API_KEY: missing_configs.append("SERPAPI_API_KEY")
+    
+    if missing_configs:
+        logger.warning(f"Missing configurations: {', '.join(missing_configs)}")
+    else:
+        logger.info("All configurations validated ✓")
+    
+    # Check if running in Render (production)
+    if os.getenv("RENDER"):
+        logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
+        # Start with production settings
+        app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+    else:
+        logger.info(f"Starting development server on port {port}")
         app.run(debug=True, host="0.0.0.0", port=port)
