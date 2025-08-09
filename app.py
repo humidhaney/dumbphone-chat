@@ -508,6 +508,9 @@ def web_search(q, num=3, search_type="general"):
         params["tbm"] = "isch"
     elif search_type == "local":
         params["engine"] = "google_maps"
+        # For local searches, be more specific with the query
+        if "restaurant" in q.lower() or "cafe" in q.lower() or "bar" in q.lower():
+            params["type"] = "search"
     
     try:
         logger.info(f"Searching: {q} (type: {search_type})")
@@ -543,22 +546,67 @@ def web_search(q, num=3, search_type="general"):
                 result += f" ({source})"
             return result[:320]
     
-    # Handle local/maps results
+    # Handle local/maps results with better matching
     if search_type == "local" and "local_results" in data:
         local = data["local_results"]
         if local:
-            top = local[0]
-            name = top.get('title', '')
-            address = top.get('address', '')
-            rating = top.get('rating', '')
+            # Try to find exact or close matches first
+            query_lower = q.lower()
+            
+            # Extract the restaurant name from the query
+            restaurant_name = ""
+            for word in ["restaurant", "cafe", "bar", "grill", "kitchen", "bistro"]:
+                if word in query_lower:
+                    # Get everything before the restaurant type word
+                    parts = query_lower.split(word)
+                    if parts[0].strip():
+                        restaurant_name = parts[0].strip()
+                        break
+            
+            # If we couldn't extract a name, use the whole query minus location words
+            if not restaurant_name:
+                location_words = ["in", "near", "at", "restaurant", "cafe", "bar"]
+                words = query_lower.split()
+                restaurant_words = [w for w in words if w not in location_words]
+                restaurant_name = " ".join(restaurant_words)
+            
+            # Look for exact or partial matches
+            best_match = None
+            for place in local:
+                place_name = place.get('title', '').lower()
+                if restaurant_name and restaurant_name in place_name:
+                    best_match = place
+                    break
+                # Also check for partial word matches
+                if restaurant_name:
+                    name_words = restaurant_name.split()
+                    if any(word in place_name for word in name_words if len(word) > 3):
+                        best_match = place
+                        break
+            
+            # Use best match or first result
+            result_place = best_match or local[0]
+            
+            name = result_place.get('title', '')
+            address = result_place.get('address', '')
+            rating = result_place.get('rating', '')
+            phone = result_place.get('phone', '')
+            
             result = name
             if rating:
                 result += f" (★{rating})"
             if address:
                 result += f" — {address}"
+            if phone:
+                result += f" — {phone}"
+                
+            # If no exact match found, mention it
+            if not best_match and restaurant_name:
+                result = f"Couldn't find '{restaurant_name}' specifically. Nearest: {result}"
+                
             return result[:320]
     
-    # Handle regular search results
+    # Handle regular search results with better restaurant-specific parsing
     org = data.get("organic_results", [])
     if not org:
         # Try knowledge graph
@@ -566,22 +614,50 @@ def web_search(q, num=3, search_type="general"):
         if kg:
             title = kg.get("title", "")
             description = kg.get("description", "")
-            if title or description:
-                return f"{title} — {description}"[:320]
-        return "No results found."
+            address = kg.get("address", "")
+            phone = kg.get("phone", "")
+            
+            result = title
+            if description:
+                result += f" — {description}"
+            if address:
+                result += f" — {address}"
+            if phone:
+                result += f" — {phone}"
+            
+            if result.strip():
+                return result[:320]
+        
+        return f"No results found for '{q}'. Try being more specific or check spelling."
 
-    top = org[0]
-    title = top.get("title", "")
-    snippet = top.get("snippet", "")
+    # For restaurant searches in regular results, look for restaurant-specific info
+    best_result = None
+    query_lower = q.lower()
+    
+    if "restaurant" in query_lower or "cafe" in query_lower:
+        for result in org[:3]:  # Check first 3 results
+            title = result.get("title", "").lower()
+            snippet = result.get("snippet", "").lower()
+            
+            # Look for restaurant indicators
+            restaurant_indicators = ["menu", "hours", "restaurant", "cafe", "dining", "food", "yelp", "tripadvisor"]
+            if any(indicator in title + " " + snippet for indicator in restaurant_indicators):
+                best_result = result
+                break
+    
+    # Use best result or first result
+    final_result = best_result or org[0]
+    title = final_result.get("title", "")
+    snippet = final_result.get("snippet", "")
     
     if not title and not snippet:
-        return "No relevant results found."
+        return f"No relevant results found for '{q}'. Try a different search term."
     
     result = f"{title}"
     if snippet:
         result += f" — {snippet}"
     
-    return result[:320] if result else "No results found."
+    return result[:320] if result else f"No results found for '{q}'."
 
 # === Keep existing extractors and intent detectors (unchanged) ===
 def _extract_day(text: str) -> Optional[str]:
@@ -909,18 +985,33 @@ def sms_webhook():
                 reply += f" {search_result}"
                 
             elif intent_type == "restaurant":
-                search_parts = ["restaurant"]
+                # Build more specific search query
+                search_parts = []
+                
+                # If we have a specific restaurant name, prioritize that
+                if e.get("restaurant_name"):
+                    search_parts.append(f'"{e["restaurant_name"]}"')
+                    if not any(word in e["restaurant_name"].lower() for word in ["restaurant", "cafe", "bar", "grill"]):
+                        search_parts.append("restaurant")
+                else:
+                    search_parts.append("restaurant")
+                
                 if e.get("cuisine"): 
                     search_parts.append(e["cuisine"])
+                    
                 if e.get("city"): 
                     search_parts.append(f"in {e['city']}")
                 else:
-                    search_parts.append("in New Orleans")  # Default for Dirty Coast
+                    # Try to infer location from context or use default
+                    search_parts.append("in New Orleans")
+                    
                 if e.get("price_range"):
                     min_p, max_p = e["price_range"]
                     search_parts.append(f"${min_p}-{max_p}")
                 
-                reply = web_search(" ".join(search_parts), search_type="local")
+                search_query = " ".join(search_parts)
+                logger.info(f"Restaurant search query: {search_query}")
+                reply = web_search(search_query, search_type="local")
 
             elif intent_type == "directions":
                 if e.get("from") and e.get("to"):
