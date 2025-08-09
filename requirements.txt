@@ -3,8 +3,8 @@
 Flask==2.3.3
 gunicorn==21.2.0
 
-# Anthropic Claude API
-anthropic==0.34.2
+# Anthropic Claude API - using specific compatible version
+anthropic==0.28.1
 
 # HTTP requests
 requests==2.31.0
