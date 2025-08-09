@@ -1,9 +1,11 @@
-# Flask SMS Chatbot Requirements
+# Hey Alex SMS Assistant Requirements
+# SMS assistant powered by Claude AI for staying connected without staying online
+
 # Core web framework
 Flask==2.3.3
 gunicorn==21.2.0
 
-# Anthropic Claude API - using specific compatible version
+# Anthropic Claude API - using compatible version
 anthropic==0.28.1
 
 # HTTP requests
@@ -11,9 +13,6 @@ requests==2.31.0
 
 # Environment variables
 python-dotenv==1.0.0
-
-# Date/time utilities (included in Python standard library)
-# datetime, calendar, re, json, sqlite3, os, logging, time, functools
 
 # Optional: For enhanced logging and monitoring
 werkzeug==2.3.7
