@@ -43,21 +43,42 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 anthropic_client = None
 if ANTHROPIC_API_KEY:
     try:
-        # Simple initialization without extra parameters
-        anthropic_client = anthropic.Anthropic(
-            api_key=ANTHROPIC_API_KEY
-        )
-        logger.info("Anthropic client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize Anthropic client: {e}")
-        # Try alternative initialization method
+        # Direct import and initialization to avoid parameter conflicts
+        import anthropic as anthropic_lib
+        
+        # Try the newest API format first
         try:
-            import anthropic
-            anthropic_client = anthropic.Client(api_key=ANTHROPIC_API_KEY)
-            logger.info("Anthropic client initialized with fallback method")
-        except Exception as e2:
-            logger.error(f"Fallback initialization also failed: {e2}")
-            anthropic_client = None
+            anthropic_client = anthropic_lib.Anthropic(
+                api_key=ANTHROPIC_API_KEY,
+                # Don't pass any other parameters that might conflict
+            )
+            logger.info("Anthropic client initialized successfully (new format)")
+        except Exception as e1:
+            logger.warning(f"New format failed: {e1}")
+            # Try older format
+            try:
+                anthropic_client = anthropic_lib.Client(
+                    api_key=ANTHROPIC_API_KEY
+                )
+                logger.info("Anthropic client initialized successfully (legacy format)")
+            except Exception as e2:
+                logger.warning(f"Legacy format failed: {e2}")
+                # Try the most basic initialization
+                try:
+                    # Set the API key as a module-level variable
+                    anthropic_lib.api_key = ANTHROPIC_API_KEY
+                    anthropic_client = anthropic_lib
+                    logger.info("Anthropic client initialized successfully (module-level)")
+                except Exception as e3:
+                    logger.error(f"All initialization methods failed: {e3}")
+                    anthropic_client = None
+                    
+    except ImportError as e:
+        logger.error(f"Failed to import anthropic: {e}")
+        anthropic_client = None
+    except Exception as e:
+        logger.error(f"Unexpected error initializing Anthropic: {e}")
+        anthropic_client = None
 else:
     logger.warning("ANTHROPIC_API_KEY not found")
 
@@ -719,10 +740,6 @@ def ask_claude(phone, user_msg):
     try:
         history = load_history(phone, limit=6)  # Reduced for token efficiency
         
-        # Build conversation for Claude - convert to single prompt format
-        conversation_parts = []
-        
-        # Add system context
         system_context = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. 
 
 Key guidelines:
@@ -733,47 +750,96 @@ Key guidelines:
 - If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs
 - Use local New Orleans knowledge when relevant
 - Be helpful with local recommendations (restaurants, events, etc.)
-- Keep the tone casual and friendly, like a local friend helping out
-
-"""
+- Keep the tone casual and friendly, like a local friend helping out"""
         
-        conversation_parts.append(system_context)
+        # Try different API methods based on the client type
+        reply = ""
         
-        # Add conversation history
-        for msg in history[-4:]:  # Limit history to prevent token overflow
-            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
-            conversation_parts.append(f"{role_prefix}{msg['content']}")
-        
-        # Add current user message
-        conversation_parts.append(f"Human: {user_msg}")
-        conversation_parts.append("Assistant: ")
-        
-        # Join into single prompt
-        prompt = "\n\n".join(conversation_parts)
-        
-        # Call Claude API using the older format
+        # Method 1: Try new Messages API
         try:
-            response = anthropic_client.completions.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens_to_sample=150,
-                prompt=prompt,
-                temperature=0.7,
-                stop_sequences=["\n\nHuman:"]
-            )
-            reply = response.completion.strip()
-        except AttributeError:
-            # Try the newer API format
-            response = anthropic_client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=150,
-                temperature=0.7,
-                system=system_context.strip(),
-                messages=[
-                    {"role": msg["role"], "content": msg["content"]} 
-                    for msg in history[-4:]
-                ] + [{"role": "user", "content": user_msg}]
-            )
-            reply = response.content[0].text.strip()
+            if hasattr(anthropic_client, 'messages'):
+                messages = []
+                for msg in history[-4:]:
+                    messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+                messages.append({
+                    "role": "user", 
+                    "content": user_msg
+                })
+                
+                response = anthropic_client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=150,
+                    temperature=0.7,
+                    system=system_context.strip(),
+                    messages=messages
+                )
+                reply = response.content[0].text.strip()
+                logger.info("Used Messages API")
+                
+        except Exception as e1:
+            logger.warning(f"Messages API failed: {e1}")
+            
+            # Method 2: Try Completions API
+            try:
+                if hasattr(anthropic_client, 'completions'):
+                    # Build conversation prompt
+                    conversation_parts = [system_context]
+                    
+                    for msg in history[-4:]:
+                        role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+                        conversation_parts.append(f"{role_prefix}{msg['content']}")
+                    
+                    conversation_parts.append(f"Human: {user_msg}")
+                    conversation_parts.append("Assistant: ")
+                    
+                    prompt = "\n\n".join(conversation_parts)
+                    
+                    response = anthropic_client.completions.create(
+                        model="claude-3-sonnet-20240229",
+                        max_tokens_to_sample=150,
+                        prompt=prompt,
+                        temperature=0.7,
+                        stop_sequences=["\n\nHuman:"]
+                    )
+                    reply = response.completion.strip()
+                    logger.info("Used Completions API")
+                    
+            except Exception as e2:
+                logger.warning(f"Completions API failed: {e2}")
+                
+                # Method 3: Try module-level API (oldest)
+                try:
+                    if hasattr(anthropic_client, 'complete'):
+                        conversation_parts = [system_context]
+                        
+                        for msg in history[-4:]:
+                            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+                            conversation_parts.append(f"{role_prefix}{msg['content']}")
+                        
+                        conversation_parts.append(f"Human: {user_msg}")
+                        conversation_parts.append("Assistant: ")
+                        
+                        prompt = "\n\n".join(conversation_parts)
+                        
+                        response = anthropic_client.complete(
+                            model="claude-3-sonnet-20240229",
+                            prompt=prompt,
+                            max_tokens_to_sample=150,
+                            temperature=0.7,
+                            stop_sequences=["\n\nHuman:"]
+                        )
+                        reply = response['completion'].strip()
+                        logger.info("Used module-level API")
+                        
+                except Exception as e3:
+                    logger.error(f"All API methods failed: {e3}")
+                    raise e3
+        
+        if not reply:
+            raise Exception("No response generated from any API method")
         
         # Ensure SMS length compliance
         if len(reply) > 320:
