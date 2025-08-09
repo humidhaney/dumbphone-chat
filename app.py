@@ -6,12 +6,13 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
+import re
+import calendar
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+import datetime as dt
 from dotenv import load_dotenv
 import urllib.parse
-import re, calendar
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-import datetime as dt
 
 # Load env vars
 load_dotenv()
@@ -34,7 +35,8 @@ DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 WELCOME_MSG = (
     "Welcome to the Dirty Coast chatbot powered by OpenAI. "
-    "You can ask me to search the web, check business hours, get news, or find sunrise/sunset times. "
+    "You can ask me to search the web, check business hours, get news, find sunrise/sunset times, "
+    "get directions, check movie showtimes, find restaurants, check flight status, and much more. "
     "If at anytime you wish to unsubscribe, reply with STOP."
 )
 
@@ -49,6 +51,15 @@ def init_db():
             role TEXT NOT NULL CHECK(role IN ('user','assistant')),
             content TEXT NOT NULL,
             ts DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        # Add spam detection table
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS spam_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT NOT NULL UNIQUE,
+            is_spam BOOLEAN NOT NULL DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """)
         conn.commit()
@@ -75,7 +86,128 @@ def load_history(phone, limit=10):
 
 init_db()
 
-# === Whitelist functions ===
+# === Enhanced Content Filtering ===
+class ContentFilter:
+    def __init__(self):
+        self.spam_keywords = {
+            'promotional': ['free', 'win', 'winner', 'prize', 'congratulations', 'click here', 
+                           'limited time', 'act now', 'offer expires', 'cash prize'],
+            'suspicious': ['bitcoin', 'crypto', 'investment opportunity', 'make money fast',
+                          'work from home', 'guaranteed income', 'no experience needed'],
+            'inappropriate': ['adult', 'dating', 'hookup', 'sexy', 'nude', '18+'],
+            'phishing': ['verify account', 'suspended', 'click link', 'update payment',
+                        'security alert', 'urgent action required']
+        }
+        
+        self.offensive_patterns = [
+            r'\b(f[*@#$%]?ck|sh[*@#$%]?t|damn|hell)\b',
+            r'\b(stupid|idiot|moron|dumb[a@]ss)\b',
+            # Add more patterns as needed
+        ]
+    
+    def is_spam(self, text: str) -> tuple[bool, str]:
+        """Check if text contains spam indicators"""
+        text_lower = text.lower()
+        
+        for category, keywords in self.spam_keywords.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return True, f"Spam detected: {category}"
+        
+        # Check for excessive caps
+        if len(text) > 10 and sum(c.isupper() for c in text) / len(text) > 0.7:
+            return True, "Excessive capitalization"
+        
+        # Check for excessive punctuation
+        if text.count('!') > 3 or text.count('?') > 3:
+            return True, "Excessive punctuation"
+        
+        return False, ""
+    
+    def is_offensive(self, text: str) -> tuple[bool, str]:
+        """Check for offensive language"""
+        text_lower = text.lower()
+        
+        for pattern in self.offensive_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True, "Offensive language detected"
+        
+        return False, ""
+    
+    def is_valid_query(self, text: str) -> tuple[bool, str]:
+        """Check if query is valid and appropriate"""
+        # Check minimum length
+        if len(text.strip()) < 3:
+            return False, "Query too short"
+        
+        # Check maximum length
+        if len(text) > 500:
+            return False, "Query too long"
+        
+        # Check for spam
+        is_spam, spam_reason = self.is_spam(text)
+        if is_spam:
+            return False, spam_reason
+        
+        # Check for offensive content
+        is_offensive, offensive_reason = self.is_offensive(text)
+        if is_offensive:
+            return False, offensive_reason
+        
+        return True, ""
+
+content_filter = ContentFilter()
+
+# === Rate Limiting Enhancement ===
+def load_usage():
+    try:
+        with open(USAGE_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_usage(data):
+    with open(USAGE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def can_send(sender):
+    usage = load_usage()
+    now = datetime.utcnow()
+    record = usage.get(sender, {
+        "count": 0, 
+        "last_reset": now.isoformat(),
+        "hourly_count": 0,
+        "last_hour": now.replace(minute=0, second=0, microsecond=0).isoformat()
+    })
+    
+    last_reset = datetime.fromisoformat(record["last_reset"])
+    last_hour = datetime.fromisoformat(record["last_hour"])
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    
+    # Reset monthly count
+    if now - last_reset > timedelta(days=RESET_DAYS):
+        record["count"] = 0
+        record["last_reset"] = now.isoformat()
+    
+    # Reset hourly count
+    if current_hour > last_hour:
+        record["hourly_count"] = 0
+        record["last_hour"] = current_hour.isoformat()
+    
+    # Check limits
+    if record["count"] >= USAGE_LIMIT:
+        return False, "Monthly limit reached"
+    
+    if record["hourly_count"] >= 10:  # Max 10 messages per hour
+        return False, "Hourly limit reached"
+    
+    record["count"] += 1
+    record["hourly_count"] += 1
+    usage[sender] = record
+    save_usage(usage)
+    return True, ""
+
+# === Whitelist functions (unchanged) ===
 def load_whitelist():
     try:
         with open(WHITELIST_FILE, "r") as f:
@@ -103,33 +235,6 @@ def remove_from_whitelist(phone):
 
 WHITELIST = load_whitelist()
 
-# === Usage limit functions ===
-def load_usage():
-    try:
-        with open(USAGE_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-def save_usage(data):
-    with open(USAGE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-def can_send(sender):
-    usage = load_usage()
-    now = datetime.utcnow()
-    record = usage.get(sender, {"count": 0, "last_reset": now.isoformat()})
-    last_reset = datetime.fromisoformat(record["last_reset"])
-    if now - last_reset > timedelta(days=RESET_DAYS):
-        record["count"] = 0
-        record["last_reset"] = now.isoformat()
-    if record["count"] >= USAGE_LIMIT:
-        return False
-    record["count"] += 1
-    usage[sender] = record
-    save_usage(usage)
-    return True
-
 # === ClickSend SMS ===
 def send_sms(to_number, message):
     url = "https://rest.clicksend.com/v3/sms/send"
@@ -149,10 +254,11 @@ def send_sms(to_number, message):
     )
     return resp.json()
 
-# === SerpAPI Search ===
-def web_search(q, num=3):
+# === Enhanced Search Function ===
+def web_search(q, num=3, search_type="general"):
     if not SERPAPI_API_KEY:
         return "Search unavailable (no SERPAPI_API_KEY set)."
+    
     url = "https://serpapi.com/search.json"
     params = {
         "engine": "google",
@@ -162,6 +268,15 @@ def web_search(q, num=3):
         "hl": "en",
         "gl": "us",
     }
+    
+    # Customize search based on type
+    if search_type == "news":
+        params["tbm"] = "nws"
+    elif search_type == "images":
+        params["tbm"] = "isch"
+    elif search_type == "local":
+        params["engine"] = "google_maps"
+    
     try:
         r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
@@ -170,6 +285,12 @@ def web_search(q, num=3):
     except Exception as e:
         return f"Search error: {e}"
 
+    if search_type == "news" and "news_results" in data:
+        news = data["news_results"]
+        if news:
+            top = news[0]
+            return f"{top.get('title', '')} — {top.get('snippet', '')} ({top.get('link', '')})".strip()[:320]
+    
     org = (data.get("organic_results") or [])
     if not org:
         kg = data.get("knowledge_graph") or {}
@@ -184,105 +305,223 @@ def web_search(q, num=3):
     snippet = top.get("snippet", "")
     return f"{title} — {snippet} ({link})".strip()[:320] or "No results found."
 
-# === Sunrise/Sunset via Sunrise-Sunset.org ===
-def sunrise_sunset_lookup(query: str):
-    if not SERPAPI_API_KEY:
-        return "Sunrise/sunset unavailable (no SERPAPI_API_KEY set)."
-
-    day = "today"
-    tl = query.lower()
-    if "tomorrow" in tl: day = "tomorrow"
-    elif any(dn.lower() in tl for dn in calendar.day_name):
-        # optional: could parse a specific weekday; for now we stick to today/tomorrow
-        pass
-
-    cleaned = re.sub(r"\b(sunrise|sunset|in|tomorrow|today|what|time|is|the|for)\b", "", query, flags=re.I).strip()
-    if not cleaned:
-        return "Please specify a location, e.g., 'sunrise tomorrow in New York City'."
-
-    # 1) geocode via SerpAPI Google Maps
-    geo_url = "https://serpapi.com/search.json"
-    params = {"engine": "google_maps", "q": cleaned, "api_key": SERPAPI_API_KEY}
-    try:
-        r = requests.get(geo_url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return f"Geocode error: {e}"
-
-    loc = None
-    if "place_results" in data and "gps_coordinates" in data["place_results"]:
-        coords = data["place_results"]["gps_coordinates"]
-        loc = (coords.get("latitude"), coords.get("longitude"))
-    elif "local_results" in data and data["local_results"]:
-        coords = data["local_results"][0].get("gps_coordinates", {})
-        loc = (coords.get("latitude"), coords.get("longitude"))
-
-    if not loc or None in loc:
-        return "Could not determine location coordinates."
-
-    lat, lng = loc
-
-    # 2) Sunrise-Sunset API
-    ss_url = "https://api.sunrise-sunset.org/json"
-    ss_params = {"lat": lat, "lng": lng, "formatted": 0}
-    if day == "tomorrow":
-        ss_params["date"] = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
-    else:
-        ss_params["date"] = datetime.utcnow().date().isoformat()
-
-    try:
-        r2 = requests.get(ss_url, params=ss_params, timeout=15)
-        r2.raise_for_status()
-        ss_data = r2.json()
-    except Exception as e:
-        return f"Sunrise API error: {e}"
-
-    if ss_data.get("status") != "OK":
-        return "Could not get sunrise/sunset times."
-
-    results = ss_data.get("results", {})
-    sunrise_utc = results.get("sunrise")
-    sunset_utc = results.get("sunset")
-    return f"Sunrise: {sunrise_utc} UTC | Sunset: {sunset_utc} UTC for {cleaned.title()} ({day})"
-
-# ---------- small extractors ----------
+# === Enhanced Extractors ===
 def _extract_day(text: str) -> Optional[str]:
     t = text.lower()
     if "today" in t: return "today"
     if "tomorrow" in t: return "tomorrow"
+    if "yesterday" in t: return "yesterday"
     for name in calendar.day_name:
         if name.lower() in t or re.search(rf"\b{name[:3].lower()}\b", t):
-            return name  # "Monday"
+            return name
     return None
 
 def _extract_city(text: str) -> Optional[str]:
-    m = re.search(r"\bin\s+([A-Z][\w'’\-]*(?:\s+[A-Z][\w'’\-]*){0,4})", text)
-    return m.group(1).strip() if m else None
-
-def _extract_quoted_name(text: str) -> Optional[str]:
-    m = re.search(r"[\"“”'’]([^\"“”'’]{2,})[\"“”'’]", text)
-    return m.group(1).strip() if m else None
-
-def _clean_topic(text: str) -> str:
-    return re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", " ", text, flags=re.I).strip()
-
-def _extract_source(text: str) -> Optional[str]:
-    m = re.search(r"\b(cnn|bbc|reuters|ap news|associated press|nytimes|new york times|fox news|wsj|washington post)\b", text, re.I)
-    return m.group(1).lower() if m else None
-
-def _extract_units(text: str):
-    m = re.search(r"\bconvert\s+([\d\.]+)\s*([a-zA-Z]+)\s+to\s+([a-zA-Z]+)\b", text, re.I)
-    if m: return float(m.group(1)), m.group(2).lower(), m.group(3).lower()
+    # Enhanced city extraction
+    patterns = [
+        r"\bin\s+([A-Z][\w''\-]*(?:\s+[A-Z][\w''\-]*){0,4})",
+        r"\bnear\s+([A-Z][\w''\-]*(?:\s+[A-Z][\w''\-]*){0,4})",
+        r"\bat\s+([A-Z][\w''\-]*(?:\s+[A-Z][\w''\-]*){0,4})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
     return None
 
-# ---------- intent results ----------
+def _extract_time(text: str) -> Optional[str]:
+    """Extract time from text (e.g., '2pm', '14:30', 'noon')"""
+    time_patterns = [
+        r'\b(\d{1,2}):(\d{2})\s*(am|pm)?\b',
+        r'\b(\d{1,2})\s*(am|pm)\b',
+        r'\b(noon|midnight)\b',
+    ]
+    for pattern in time_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return None
+
+def _extract_date(text: str) -> Optional[str]:
+    """Extract date from text"""
+    date_patterns = [
+        r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b',
+        r'\b(\d{1,2})-(\d{1,2})-(\d{2,4})\b',
+        r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b',
+    ]
+    for pattern in date_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return None
+
+def _extract_price_range(text: str) -> Optional[tuple]:
+    """Extract price range (e.g., '$10-20', 'under $50')"""
+    m = re.search(r'\$(\d+)-(\d+)', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    
+    m = re.search(r'under\s+\$(\d+)', text, re.IGNORECASE)
+    if m:
+        return 0, int(m.group(1))
+    
+    m = re.search(r'over\s+\$(\d+)', text, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), 999999
+    
+    return None
+
+# === Intent Results ===
 @dataclass
 class IntentResult:
     type: str
     entities: Dict[str, Any]
+    confidence: float = 1.0
 
-# ---------- individual detectors ----------
+# === Enhanced Intent Detectors ===
+def detect_restaurant_intent(text: str) -> Optional[IntentResult]:
+    """Detect restaurant/food related queries"""
+    food_keywords = ['restaurant', 'food', 'eat', 'dining', 'menu', 'cuisine', 'pizza', 
+                    'burger', 'coffee', 'lunch', 'dinner', 'breakfast']
+    
+    if any(keyword in text.lower() for keyword in food_keywords):
+        city = _extract_city(text)
+        price_range = _extract_price_range(text)
+        
+        # Extract cuisine type
+        cuisine_types = ['italian', 'chinese', 'mexican', 'indian', 'thai', 'japanese', 
+                        'french', 'american', 'mediterranean', 'vietnamese']
+        cuisine = None
+        for c_type in cuisine_types:
+            if c_type in text.lower():
+                cuisine = c_type
+                break
+        
+        return IntentResult("restaurant", {
+            "city": city,
+            "cuisine": cuisine,
+            "price_range": price_range,
+            "query": text
+        })
+    return None
+
+def detect_directions_intent(text: str) -> Optional[IntentResult]:
+    """Detect directions/navigation queries"""
+    direction_keywords = ['directions', 'how to get', 'navigate', 'route', 'drive to', 'walk to']
+    
+    if any(keyword in text.lower() for keyword in direction_keywords):
+        # Extract from and to locations
+        m = re.search(r'from\s+([^to]+)\s+to\s+(.+)', text, re.IGNORECASE)
+        if m:
+            return IntentResult("directions", {
+                "from": m.group(1).strip(),
+                "to": m.group(2).strip()
+            })
+        
+        # Just destination
+        m = re.search(r'(?:directions to|navigate to|route to)\s+(.+)', text, re.IGNORECASE)
+        if m:
+            return IntentResult("directions", {
+                "to": m.group(1).strip(),
+                "from": None
+            })
+    
+    return None
+
+def detect_movie_intent(text: str) -> Optional[IntentResult]:
+    """Detect movie/entertainment queries"""
+    movie_keywords = ['movie', 'film', 'cinema', 'theater', 'showtime', 'tickets']
+    
+    if any(keyword in text.lower() for keyword in movie_keywords):
+        city = _extract_city(text)
+        date = _extract_date(text) or _extract_day(text)
+        
+        # Extract movie title if quoted
+        movie_title = None
+        m = re.search(r'[\"""'']([^\"""'']+)[\"""'']', text)
+        if m:
+            movie_title = m.group(1)
+        
+        return IntentResult("movie", {
+            "city": city,
+            "date": date,
+            "title": movie_title,
+            "query": text
+        })
+    return None
+
+def detect_flight_intent(text: str) -> Optional[IntentResult]:
+    """Detect flight status queries"""
+    flight_keywords = ['flight', 'airline', 'departure', 'arrival', 'gate', 'delay']
+    
+    if any(keyword in text.lower() for keyword in flight_keywords):
+        # Extract flight number
+        m = re.search(r'\b([A-Z]{2}\d{1,4})\b', text)
+        flight_number = m.group(1) if m else None
+        
+        # Extract airline
+        airlines = ['american', 'delta', 'united', 'southwest', 'jetblue', 'alaska']
+        airline = None
+        for a in airlines:
+            if a in text.lower():
+                airline = a
+                break
+        
+        return IntentResult("flight", {
+            "flight_number": flight_number,
+            "airline": airline,
+            "query": text
+        })
+    return None
+
+def detect_event_intent(text: str) -> Optional[IntentResult]:
+    """Detect event/activity queries"""
+    event_keywords = ['event', 'concert', 'show', 'festival', 'party', 'meeting', 'conference']
+    
+    if any(keyword in text.lower() for keyword in event_keywords):
+        city = _extract_city(text)
+        date = _extract_date(text) or _extract_day(text)
+        
+        return IntentResult("event", {
+            "city": city,
+            "date": date,
+            "query": text
+        })
+    return None
+
+def detect_shopping_intent(text: str) -> Optional[IntentResult]:
+    """Detect shopping queries"""
+    shopping_keywords = ['buy', 'shop', 'store', 'purchase', 'price', 'sale', 'deal']
+    
+    if any(keyword in text.lower() for keyword in shopping_keywords):
+        city = _extract_city(text)
+        price_range = _extract_price_range(text)
+        
+        return IntentResult("shopping", {
+            "city": city,
+            "price_range": price_range,
+            "query": text
+        })
+    return None
+
+def detect_medical_intent(text: str) -> Optional[IntentResult]:
+    """Detect medical/health queries (handle carefully)"""
+    medical_keywords = ['doctor', 'hospital', 'pharmacy', 'clinic', 'emergency', 'urgent care']
+    
+    if any(keyword in text.lower() for keyword in medical_keywords):
+        city = _extract_city(text)
+        
+        # Check for emergency
+        is_emergency = any(word in text.lower() for word in ['emergency', 'urgent', '911', 'help'])
+        
+        return IntentResult("medical", {
+            "city": city,
+            "is_emergency": is_emergency,
+            "query": text
+        })
+    return None
+
+# === Keep existing detectors ===
 def detect_hours_intent(text: str) -> Optional[IntentResult]:
     t = text.strip()
     day = _extract_day(t)
@@ -292,39 +531,21 @@ def detect_hours_intent(text: str) -> Optional[IntentResult]:
         r"when\s+is\s+(.+?)\s+open",
         r"hours\s+for\s+(.+)$",
         r"(.+?)\s+hours\b",
-        r"\bcalled\s+([A-Z][\w&'’\-]*(?:\s+[A-Z][\w&'’\-]*)*)",
+        r"\bcalled\s+([A-Z][\w&''\-]*(?:\s+[A-Z][\w&''\-]*)*)",
     ]
     for p in patterns:
         m = re.search(p, t, flags=re.I)
         if m:
-            biz = (m.group(1) if m.lastindex else None) or _extract_quoted_name(t)
+            biz = (m.group(1) if m.lastindex else None)
             if not biz:
                 continue
             return IntentResult("hours", {"biz": biz.strip(), "city": city, "day": day})
-    if ("open" in t.lower() or "hours" in t.lower()):
-        q = _extract_quoted_name(t)
-        if q:
-            return IntentResult("hours", {"biz": q, "city": city, "day": day})
     return None
 
 def detect_news_intent(text: str) -> Optional[IntentResult]:
     if re.search(r"(latest|current)\s+news", text, re.I) or "headlines" in text.lower():
-        source = _extract_source(text)
-        topic = _clean_topic(text)
-        return IntentResult("news", {"topic": topic, "source": source})
-    if re.search(r"\blatest\s+.+", text, re.I) and not re.search(r"\bweather|sunrise|sunset\b", text, re.I):
-        source = _extract_source(text)
-        topic = _clean_topic(text)
-        return IntentResult("news", {"topic": topic, "source": source})
-    return None
-
-def detect_sun_intent(text: str) -> Optional[IntentResult]:
-    t = text.lower()
-    if "sunrise" in t or "sunset" in t:
-        city = _extract_city(text)
-        day = _extract_day(text) or "today"
-        kind = "sunrise" if "sunrise" in t and "sunset" not in t else ("sunset" if "sunset" in t and "sunrise" not in t else "both")
-        return IntentResult("sun", {"city": city, "day": day, "kind": kind})
+        topic = re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", "", text, flags=re.I).strip()
+        return IntentResult("news", {"topic": topic})
     return None
 
 def detect_weather_intent(text: str) -> Optional[IntentResult]:
@@ -334,78 +555,18 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
         return IntentResult("weather", {"city": city, "day": day})
     return None
 
-def detect_contact_intent(text: str) -> Optional[IntentResult]:
-    tl = text.lower()
-    if any(k in tl for k in ["address for", "phone for", "website for", "email for", "contact for"]):
-        m = re.search(r"\b(?:address|phone|website|email|contact)\s+for\s+(.+)$", text, re.I)
-        target = m.group(1).strip() if m else text
-        if "address" in tl: kind = "address"
-        elif "phone" in tl: kind = "phone"
-        elif "website" in tl: kind = "website"
-        elif "email" in tl or "contact" in tl: kind = "contact"
-        else: kind = "contact"
-        return IntentResult("contact", {"kind": kind, "target": target})
-    return None
-
-def detect_time_in_city_intent(text: str) -> Optional[IntentResult]:
-    if re.search(r"\btime\b", text, re.I) and _extract_city(text):
-        return IntentResult("time_city", {"city": _extract_city(text)})
-    return None
-
-def detect_stock_intent(text: str) -> Optional[IntentResult]:
-    m = re.search(r"\b(stock\s+price|price\s+of)\s+([A-Z]{1,5})\b", text, re.I)
-    if m:
-        return IntentResult("stock", {"ticker": m.group(2).upper()})
-    m2 = re.search(r"\b([A-Z]{1,5})\s+stock\s+price\b", text)
-    if m2:
-        return IntentResult("stock", {"ticker": m2.group(1).upper()})
-    return None
-
-def detect_sports_intent(text: str) -> Optional[IntentResult]:
-    if re.search(r"\b(score|scores|schedule|game|games|result|results)\b", text, re.I):
-        m = re.search(r"\bfor\s+([A-Z][A-Za-z0-9\s\.\-]{2,})$", text)
-        target = m.group(1).strip() if m else None
-        return IntentResult("sports", {"target": target})
-    return None
-
-def detect_convert_intent(text: str) -> Optional[IntentResult]:
-    conv = _extract_units(text)
-    if conv:
-        value, from_u, to_u = conv
-        return IntentResult("convert", {"value": value, "from": from_u, "to": to_u})
-    return None
-
-def detect_math_intent(text: str) -> Optional[IntentResult]:
-    if re.search(r"\b(calc|calculate|what\s+is)\s+[-+/*\d\.\s\(\)]+", text, re.I):
-        expr = re.search(r"([-+/*\d\.\s\(\)]+)", text)
-        return IntentResult("math", {"expr": expr.group(1).strip() if expr else None})
-    return None
-
-def detect_define_intent(text: str) -> Optional[IntentResult]:
-    m = re.search(r"\b(define|definition\s+of)\s+([A-Za-z\-]+)\b", text, re.I)
-    if m:
-        return IntentResult("define", {"term": m.group(2)})
-    return None
-
-def detect_translate_intent(text: str) -> Optional[IntentResult]:
-    m = re.search(r"\btranslate\s+(.+?)\s+to\s+([A-Za-z]+)\b", text, re.I)
-    if m:
-        return IntentResult("translate", {"text": m.group(1).strip(), "lang": m.group(2).lower()})
-    return None
-
+# === Updated Detector Order ===
 DET_ORDER = [
+    detect_medical_intent,      # High priority for safety
+    detect_directions_intent,
+    detect_restaurant_intent,
+    detect_movie_intent,
+    detect_flight_intent,
+    detect_event_intent,
+    detect_shopping_intent,
     detect_hours_intent,
     detect_news_intent,
-    detect_sun_intent,
     detect_weather_intent,
-    detect_contact_intent,
-    detect_time_in_city_intent,
-    detect_stock_intent,
-    detect_sports_intent,
-    detect_convert_intent,
-    detect_math_intent,
-    detect_define_intent,
-    detect_translate_intent,
 ]
 
 def detect_intent(text: str) -> Optional[IntentResult]:
@@ -415,40 +576,50 @@ def detect_intent(text: str) -> Optional[IntentResult]:
             return res
     return None
 
-# === GPT Chat ===
+# === Enhanced GPT Chat ===
 def ask_gpt(phone, user_msg):
     history = load_history(phone, limit=10)
-    messages = [{"role": "system", "content": "You are a concise SMS assistant. Reply in 1–2 short sentences, plain language."}]
+    messages = [
+        {"role": "system", "content": """You are a helpful SMS assistant. Keep responses under 160 characters when possible. 
+        Be concise but friendly. For medical emergencies, always advise calling 911. Don't provide medical diagnoses."""}
+    ]
     messages.extend(history)
     messages.append({"role": "user", "content": user_msg})
-    resp = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=messages,
-        max_tokens=50,
-        temperature=0.7
-    )
-    reply = resp.choices[0].message.content.strip()
-    if len(reply) > 320:
-        trimmed = reply[:320]
-        if "." in trimmed:
-            trimmed = trimmed[:trimmed.rfind(".")+1]
-        reply = trimmed
-    return reply
+    
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=messages,
+            max_tokens=80,
+            temperature=0.7
+        )
+        reply = resp.choices[0].message.content.strip()
+        if len(reply) > 320:
+            reply = reply[:317] + "..."
+        return reply
+    except Exception as e:
+        return "Sorry, I'm having trouble processing that right now."
 
 # === Routes ===
 @app.route("/sms", methods=["POST"])
 def sms_webhook():
     sender = request.form.get("from")
     body = (request.form.get("body") or "").strip()
+    
     if not sender or not body:
         return "Missing fields", 400
+
+    # Content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        return f"Message filtered: {filter_reason}", 400
 
     # STOP unsubscribe
     if body.upper() == "STOP":
         if remove_from_whitelist(sender):
             if sender in WHITELIST:
                 WHITELIST.remove(sender)
-            send_sms(sender, "You have been unsubscribed and will no longer receive messages.")
+            send_sms(sender, "You have been unsubscribed.")
         return "OK", 200
 
     # Auto-add new number + welcome
@@ -459,31 +630,110 @@ def sms_webhook():
 
     if sender not in WHITELIST:
         return "Number not authorized", 403
-    if not can_send(sender):
-        return "Monthly message limit reached (200). Try again next month.", 403
+
+    # Enhanced rate limiting
+    can_send_result, limit_reason = can_send(sender)
+    if not can_send_result:
+        send_sms(sender, f"Rate limit exceeded: {limit_reason}")
+        return "Rate limited", 429
 
     save_message(sender, "user", body)
 
-    # --- Unified intent routing ---
+    # --- Enhanced intent routing ---
     intent = detect_intent(body)
     if intent:
         t = intent.type
         e = intent.entities
 
-        if t == "hours":
+        if t == "medical":
+            if e.get("is_emergency"):
+                reply = "⚠️ For medical emergencies, call 911 immediately. For non-emergency medical help:"
+            else:
+                reply = "For medical assistance:"
+            
+            search_query = e["query"]
+            if e.get("city"):
+                search_query += f" in {e['city']}"
+            
+            search_result = web_search(search_query, search_type="local")
+            reply += f" {search_result}"
+            
+        elif t == "restaurant":
+            search_parts = ["restaurant"]
+            if e.get("cuisine"): search_parts.append(e["cuisine"])
+            if e.get("city"): search_parts.append(f"in {e['city']}")
+            if e.get("price_range"):
+                min_p, max_p = e["price_range"]
+                search_parts.append(f"${min_p}-{max_p}")
+            
+            reply = web_search(" ".join(search_parts), search_type="local")
+
+        elif t == "directions":
+            if e.get("from") and e.get("to"):
+                query = f"directions from {e['from']} to {e['to']}"
+            else:
+                query = f"directions to {e['to']}"
+            reply = web_search(query, search_type="local")
+
+        elif t == "movie":
+            search_parts = ["movie showtimes"]
+            if e.get("title"): search_parts.append(e["title"])
+            if e.get("city"): search_parts.append(f"in {e['city']}")
+            if e.get("date"): search_parts.append(e["date"])
+            
+            reply = web_search(" ".join(search_parts))
+
+        elif t == "flight":
+            if e.get("flight_number"):
+                query = f"flight status {e['flight_number']}"
+            else:
+                query = f"{e['airline']} flight status" if e.get("airline") else "flight status"
+            reply = web_search(query)
+
+        elif t == "hours":
             parts = [e["biz"]]
             if e.get("city"): parts.append(e["city"])
             parts.append("hours")
-            if e.get("day") == "tomorrow": parts.append("tomorrow")
-            elif e.get("day") == "today": parts.append("today")
-            reply = web_search(" ".join(parts)) or "No results."
-            reply = reply[:300]
-            save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+            if e.get("day"): parts.append(e["day"])
+            reply = web_search(" ".join(parts), search_type="local")
 
-        if t == "news":
-            q = e["topic"] or body
-            if e.get("source"): q = f"{e['source']} {q} headlines"
-            else: q = f"{q} news"
-            reply = web_search(q) or "No news found."
-            reply = reply[:300]
-            save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+        elif t == "news":
+            query = e["topic"] or "news headlines"
+            reply = web_search(query, search_type="news")
+
+        elif t == "weather":
+            query = "weather"
+            if e.get("city"): query += f" in {e['city']}"
+            if e.get("day") != "today": query += f" {e['day']}"
+            reply = web_search(query)
+
+        else:
+            # Fallback to general search
+            reply = web_search(body)
+
+        # Ensure reply fits SMS limits
+        if len(reply) > 300:
+            reply = reply[:297] + "..."
+
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
+
+    # Fallback to GPT
+    try:
+        reply = ask_gpt(sender, body)
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
+    except Exception as e:
+        error_msg = "Sorry, I'm experiencing technical difficulties."
+        save_message(sender, "assistant", error_msg)
+        send_sms(sender, error_msg)
+        return "OK", 200
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}, 200
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
