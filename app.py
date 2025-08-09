@@ -326,4 +326,14 @@ def health():
         "has_serpapi": bool(SERPAPI_API_KEY),
     }, 200
 
-@app.route("/debug/sear
+@app.route("/debug/search", methods=["GET"])
+def debug_search():
+    q = request.args.get("q", "")
+    if not q:
+        return {"error": "pass ?q=your+query"}, 400
+    res = web_search(q)
+    return {"query": q, "result": res}, 200
+
+# Render-compatible run
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
