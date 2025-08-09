@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: sms-chatbot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: CLICKSEND_USERNAME
+        sync: false
+      - key: CLICKSEND_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SERPAPI_API_KEY
+        sync: false
+      - key: DB_PATH
+        value: /opt/render/project/src/chat.db
+    disk:
+      name: chatbot-storage
+      mountPath: /opt/render/project/src
+      sizeGB: 1
