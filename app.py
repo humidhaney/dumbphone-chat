@@ -8,7 +8,10 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import urllib.parse
-import re
+import re, calendar
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import datetime as dt
 
 # Load env vars
 load_dotenv()
@@ -150,7 +153,6 @@ def send_sms(to_number, message):
 def web_search(q, num=3):
     if not SERPAPI_API_KEY:
         return "Search unavailable (no SERPAPI_API_KEY set)."
-
     url = "https://serpapi.com/search.json"
     params = {
         "engine": "google",
@@ -187,20 +189,20 @@ def sunrise_sunset_lookup(query: str):
     if not SERPAPI_API_KEY:
         return "Sunrise/sunset unavailable (no SERPAPI_API_KEY set)."
 
-    date = "today"
-    if "tomorrow" in query.lower():
-        date = "tomorrow"
+    day = "today"
+    tl = query.lower()
+    if "tomorrow" in tl: day = "tomorrow"
+    elif any(dn.lower() in tl for dn in calendar.day_name):
+        # optional: could parse a specific weekday; for now we stick to today/tomorrow
+        pass
 
     cleaned = re.sub(r"\b(sunrise|sunset|in|tomorrow|today|what|time|is|the|for)\b", "", query, flags=re.I).strip()
     if not cleaned:
         return "Please specify a location, e.g., 'sunrise tomorrow in New York City'."
 
+    # 1) geocode via SerpAPI Google Maps
     geo_url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google_maps",
-        "q": cleaned,
-        "api_key": SERPAPI_API_KEY
-    }
+    params = {"engine": "google_maps", "q": cleaned, "api_key": SERPAPI_API_KEY}
     try:
         r = requests.get(geo_url, params=params, timeout=15)
         r.raise_for_status()
@@ -221,15 +223,11 @@ def sunrise_sunset_lookup(query: str):
 
     lat, lng = loc
 
+    # 2) Sunrise-Sunset API
     ss_url = "https://api.sunrise-sunset.org/json"
-    ss_params = {
-        "lat": lat,
-        "lng": lng,
-        "formatted": 0
-    }
-    if date == "tomorrow":
-        target_date = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
-        ss_params["date"] = target_date
+    ss_params = {"lat": lat, "lng": lng, "formatted": 0}
+    if day == "tomorrow":
+        ss_params["date"] = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
     else:
         ss_params["date"] = datetime.utcnow().date().isoformat()
 
@@ -246,28 +244,176 @@ def sunrise_sunset_lookup(query: str):
     results = ss_data.get("results", {})
     sunrise_utc = results.get("sunrise")
     sunset_utc = results.get("sunset")
+    return f"Sunrise: {sunrise_utc} UTC | Sunset: {sunset_utc} UTC for {cleaned.title()} ({day})"
 
-    return f"Sunrise: {sunrise_utc} UTC | Sunset: {sunset_utc} UTC for {cleaned.title()} ({date})"
+# ---------- small extractors ----------
+def _extract_day(text: str) -> Optional[str]:
+    t = text.lower()
+    if "today" in t: return "today"
+    if "tomorrow" in t: return "tomorrow"
+    for name in calendar.day_name:
+        if name.lower() in t or re.search(rf"\b{name[:3].lower()}\b", t):
+            return name  # "Monday"
+    return None
 
-# === Intent detectors ===
-def detect_hours_intent(text: str):
+def _extract_city(text: str) -> Optional[str]:
+    m = re.search(r"\bin\s+([A-Z][\w'’\-]*(?:\s+[A-Z][\w'’\-]*){0,4})", text)
+    return m.group(1).strip() if m else None
+
+def _extract_quoted_name(text: str) -> Optional[str]:
+    m = re.search(r"[\"“”'’]([^\"“”'’]{2,})[\"“”'’]", text)
+    return m.group(1).strip() if m else None
+
+def _clean_topic(text: str) -> str:
+    return re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", " ", text, flags=re.I).strip()
+
+def _extract_source(text: str) -> Optional[str]:
+    m = re.search(r"\b(cnn|bbc|reuters|ap news|associated press|nytimes|new york times|fox news|wsj|washington post)\b", text, re.I)
+    return m.group(1).lower() if m else None
+
+def _extract_units(text: str):
+    m = re.search(r"\bconvert\s+([\d\.]+)\s*([a-zA-Z]+)\s+to\s+([a-zA-Z]+)\b", text, re.I)
+    if m: return float(m.group(1)), m.group(2).lower(), m.group(3).lower()
+    return None
+
+# ---------- intent results ----------
+@dataclass
+class IntentResult:
+    type: str
+    entities: Dict[str, Any]
+
+# ---------- individual detectors ----------
+def detect_hours_intent(text: str) -> Optional[IntentResult]:
+    t = text.strip()
+    day = _extract_day(t)
+    city = _extract_city(t)
     patterns = [
         r"what\s+time\s+does\s+(.+?)\s+(open|close)",
         r"when\s+is\s+(.+?)\s+open",
-        r"hours\s+for\s+(.+)",
-        r"(.+?)\s+hours\b"
+        r"hours\s+for\s+(.+)$",
+        r"(.+?)\s+hours\b",
+        r"\bcalled\s+([A-Z][\w&'’\-]*(?:\s+[A-Z][\w&'’\-]*)*)",
     ]
     for p in patterns:
-        m = re.search(p, text, flags=re.I)
+        m = re.search(p, t, flags=re.I)
         if m:
-            return m.group(1).strip()
+            biz = (m.group(1) if m.lastindex else None) or _extract_quoted_name(t)
+            if not biz:
+                continue
+            return IntentResult("hours", {"biz": biz.strip(), "city": city, "day": day})
+    if ("open" in t.lower() or "hours" in t.lower()):
+        q = _extract_quoted_name(t)
+        if q:
+            return IntentResult("hours", {"biz": q, "city": city, "day": day})
     return None
 
-def detect_news_intent(text: str):
-    return bool(re.search(r"(latest|current)\s+news", text, flags=re.I) or "headlines" in text.lower())
+def detect_news_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"(latest|current)\s+news", text, re.I) or "headlines" in text.lower():
+        source = _extract_source(text)
+        topic = _clean_topic(text)
+        return IntentResult("news", {"topic": topic, "source": source})
+    if re.search(r"\blatest\s+.+", text, re.I) and not re.search(r"\bweather|sunrise|sunset\b", text, re.I):
+        source = _extract_source(text)
+        topic = _clean_topic(text)
+        return IntentResult("news", {"topic": topic, "source": source})
+    return None
 
-def detect_sun_intent(text: str):
-    return "sunrise" in text.lower() or "sunset" in text.lower()
+def detect_sun_intent(text: str) -> Optional[IntentResult]:
+    t = text.lower()
+    if "sunrise" in t or "sunset" in t:
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        kind = "sunrise" if "sunrise" in t and "sunset" not in t else ("sunset" if "sunset" in t and "sunrise" not in t else "both")
+        return IntentResult("sun", {"city": city, "day": day, "kind": kind})
+    return None
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\b(weather|temp|temperature|forecast)\b", text, re.I):
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        return IntentResult("weather", {"city": city, "day": day})
+    return None
+
+def detect_contact_intent(text: str) -> Optional[IntentResult]:
+    tl = text.lower()
+    if any(k in tl for k in ["address for", "phone for", "website for", "email for", "contact for"]):
+        m = re.search(r"\b(?:address|phone|website|email|contact)\s+for\s+(.+)$", text, re.I)
+        target = m.group(1).strip() if m else text
+        if "address" in tl: kind = "address"
+        elif "phone" in tl: kind = "phone"
+        elif "website" in tl: kind = "website"
+        elif "email" in tl or "contact" in tl: kind = "contact"
+        else: kind = "contact"
+        return IntentResult("contact", {"kind": kind, "target": target})
+    return None
+
+def detect_time_in_city_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\btime\b", text, re.I) and _extract_city(text):
+        return IntentResult("time_city", {"city": _extract_city(text)})
+    return None
+
+def detect_stock_intent(text: str) -> Optional[IntentResult]:
+    m = re.search(r"\b(stock\s+price|price\s+of)\s+([A-Z]{1,5})\b", text, re.I)
+    if m:
+        return IntentResult("stock", {"ticker": m.group(2).upper()})
+    m2 = re.search(r"\b([A-Z]{1,5})\s+stock\s+price\b", text)
+    if m2:
+        return IntentResult("stock", {"ticker": m2.group(1).upper()})
+    return None
+
+def detect_sports_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\b(score|scores|schedule|game|games|result|results)\b", text, re.I):
+        m = re.search(r"\bfor\s+([A-Z][A-Za-z0-9\s\.\-]{2,})$", text)
+        target = m.group(1).strip() if m else None
+        return IntentResult("sports", {"target": target})
+    return None
+
+def detect_convert_intent(text: str) -> Optional[IntentResult]:
+    conv = _extract_units(text)
+    if conv:
+        value, from_u, to_u = conv
+        return IntentResult("convert", {"value": value, "from": from_u, "to": to_u})
+    return None
+
+def detect_math_intent(text: str) -> Optional[IntentResult]:
+    if re.search(r"\b(calc|calculate|what\s+is)\s+[-+/*\d\.\s\(\)]+", text, re.I):
+        expr = re.search(r"([-+/*\d\.\s\(\)]+)", text)
+        return IntentResult("math", {"expr": expr.group(1).strip() if expr else None})
+    return None
+
+def detect_define_intent(text: str) -> Optional[IntentResult]:
+    m = re.search(r"\b(define|definition\s+of)\s+([A-Za-z\-]+)\b", text, re.I)
+    if m:
+        return IntentResult("define", {"term": m.group(2)})
+    return None
+
+def detect_translate_intent(text: str) -> Optional[IntentResult]:
+    m = re.search(r"\btranslate\s+(.+?)\s+to\s+([A-Za-z]+)\b", text, re.I)
+    if m:
+        return IntentResult("translate", {"text": m.group(1).strip(), "lang": m.group(2).lower()})
+    return None
+
+DET_ORDER = [
+    detect_hours_intent,
+    detect_news_intent,
+    detect_sun_intent,
+    detect_weather_intent,
+    detect_contact_intent,
+    detect_time_in_city_intent,
+    detect_stock_intent,
+    detect_sports_intent,
+    detect_convert_intent,
+    detect_math_intent,
+    detect_define_intent,
+    detect_translate_intent,
+]
+
+def detect_intent(text: str) -> Optional[IntentResult]:
+    for fn in DET_ORDER:
+        res = fn(text)
+        if res:
+            return res
+    return None
 
 # === GPT Chat ===
 def ask_gpt(phone, user_msg):
@@ -294,10 +440,10 @@ def ask_gpt(phone, user_msg):
 def sms_webhook():
     sender = request.form.get("from")
     body = (request.form.get("body") or "").strip()
-
     if not sender or not body:
         return "Missing fields", 400
 
+    # STOP unsubscribe
     if body.upper() == "STOP":
         if remove_from_whitelist(sender):
             if sender in WHITELIST:
@@ -305,6 +451,7 @@ def sms_webhook():
             send_sms(sender, "You have been unsubscribed and will no longer receive messages.")
         return "OK", 200
 
+    # Auto-add new number + welcome
     is_new = add_to_whitelist(sender)
     if is_new:
         WHITELIST.add(sender)
@@ -316,67 +463,27 @@ def sms_webhook():
         return "Monthly message limit reached (200). Try again next month.", 403
 
     save_message(sender, "user", body)
-    text_lower = body.lower()
 
-    # Hours intent
-    biz = detect_hours_intent(body)
-    if biz:
-        found = web_search(f"{biz} hours")
-        reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+    # --- Unified intent routing ---
+    intent = detect_intent(body)
+    if intent:
+        t = intent.type
+        e = intent.entities
 
-    # News intent
-    if detect_news_intent(body):
-        found = web_search(body)
-        reply = (found or "No news found.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+        if t == "hours":
+            parts = [e["biz"]]
+            if e.get("city"): parts.append(e["city"])
+            parts.append("hours")
+            if e.get("day") == "tomorrow": parts.append("tomorrow")
+            elif e.get("day") == "today": parts.append("today")
+            reply = web_search(" ".join(parts)) or "No results."
+            reply = reply[:300]
+            save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
-    # Sunrise/sunset intent
-    if detect_sun_intent(body):
-        reply = sunrise_sunset_lookup(body)
-        reply = (reply or "No info found.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
-
-    # Explicit search / lookup
-    if text_lower.startswith("lookup ") or text_lower.startswith("search "):
-        query = body.split(" ", 1)[1] if " " in body else ""
-        found = web_search(query) if query else "Try: search <your query>"
-        reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
-
-    # Generic address/phone/website/hours for
-    if any(k in text_lower for k in ["address for", "phone for", "website for", "hours for"]):
-        found = web_search(body)
-        reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
-
-    # GPT fallback
-    try:
-        reply = ask_gpt(sender, body)
-    except Exception as e:
-        reply = "Sorry, I had trouble. Try again later."
-
-    save_message(sender, "assistant", reply)
-    send_sms(sender, reply)
-    return "OK", 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return {
-        "ok": True,
-        "whitelist_count": len(WHITELIST),
-        "has_openai": bool(OPENAI_API_KEY),
-        "has_clicksend": bool(CLICKSEND_USERNAME and CLICKSEND_API_KEY),
-        "has_serpapi": bool(SERPAPI_API_KEY),
-    }, 200
-
-@app.route("/debug/search", methods=["GET"])
-def debug_search():
-    q = request.args.get("q", "")
-    if not q:
-        return {"error": "pass ?q=your+query"}, 400
-    res = web_search(q)
-    return {"query": q, "result": res}, 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+        if t == "news":
+            q = e["topic"] or body
+            if e.get("source"): q = f"{e['source']} {q} headlines"
+            else: q = f"{q} news"
+            reply = web_search(q) or "No news found."
+            reply = reply[:300]
+            save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
