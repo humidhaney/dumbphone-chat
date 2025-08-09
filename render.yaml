@@ -3,18 +3,22 @@ services:
     name: sms-chatbot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --workers 2 --timeout 30
     envVars:
       - key: CLICKSEND_USERNAME
         sync: false
       - key: CLICKSEND_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
+      - key: ANTHROPIC_API_KEY
         sync: false
       - key: SERPAPI_API_KEY
         sync: false
       - key: DB_PATH
         value: /opt/render/project/src/chat.db
+      - key: FLASK_ENV
+        value: production
+      - key: RENDER
+        value: true
     disk:
       name: chatbot-storage
       mountPath: /opt/render/project/src
