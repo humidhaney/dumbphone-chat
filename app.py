@@ -63,7 +63,7 @@ WELCOME_MSG = (
     "Hey there! This is Alex, your SMS assistant powered by Claude AI. "
     "I help you stay connected to the info you need without spending time online. "
     "Ask me about weather, restaurants, directions, news, business hours, and more. "
-    "Text STOP anytime to unsubscribe."
+    "Reply STOP anytime to unsubscribe from these messages."
 )
 
 # === Error Handling Decorator ===
