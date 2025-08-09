@@ -200,12 +200,18 @@ def can_send(sender):
     usage = load_usage()
     now = datetime.now(timezone.utc)
     
-    record = usage.get(sender, {
-        "count": 0,
-        "last_reset": now.isoformat(),
-        "hourly_count": 0,
-        "last_hour": now.replace(minute=0, second=0, microsecond=0).isoformat()
-    })
+    # Get existing record or create new one with all required fields
+    record = usage.get(sender, {})
+    
+    # Ensure all required fields exist with defaults
+    if "count" not in record:
+        record["count"] = 0
+    if "last_reset" not in record:
+        record["last_reset"] = now.isoformat()
+    if "hourly_count" not in record:
+        record["hourly_count"] = 0
+    if "last_hour" not in record:
+        record["last_hour"] = now.replace(minute=0, second=0, microsecond=0).isoformat()
     
     try:
         last_reset = datetime.fromisoformat(record["last_reset"]).replace(tzinfo=timezone.utc)
