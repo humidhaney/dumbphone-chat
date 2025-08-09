@@ -913,10 +913,10 @@ def sms_webhook():
     sender = request.form.get("from")
     body = (request.form.get("body") or "").strip()
     
-    logger.info(f"SMS received from {sender}: {body[:50]}...")
+    logger.info(f"📱 SMS received from {sender}: {body[:50]}...")
     
     if not sender or not body:
-        logger.warning("Missing sender or body in SMS")
+        logger.warning("❌ Missing sender or body in SMS")
         return "Missing fields", 400
 
     # Enhanced content filtering
@@ -1384,7 +1384,7 @@ port = int(os.getenv("PORT", 5000))
 
 if __name__ == "__main__":
     configure_app()
-    logger.info("Starting Dirty Coast SMS Chatbot...")
+    logger.info("🔥 STARTING DIRTY COAST SMS CHATBOT - NEW VERSION 2.0 🔥")
     logger.info(f"Database: {DB_PATH}")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     
@@ -1402,7 +1402,7 @@ if __name__ == "__main__":
     
     # Check if running in Render (production)
     if os.getenv("RENDER"):
-        logger.info("Running in Render environment")
+        logger.info("🚀 RUNNING IN RENDER ENVIRONMENT - VERSION 2.0 🚀")
         # Start with production settings
         app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
     else:
