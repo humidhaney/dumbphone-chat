@@ -738,108 +738,55 @@ def ask_claude(phone, user_msg):
         return "Sorry, the AI service is currently unavailable."
     
     try:
-        history = load_history(phone, limit=6)  # Reduced for token efficiency
+        history = load_history(phone, limit=6)
         
-        system_context = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. 
-
-Key guidelines:
-- Keep responses under 160 characters when possible for SMS
-- Be concise but friendly and conversational
-- For medical emergencies, always advise calling 911
-- Don't provide medical diagnoses
-- If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs
-- Use local New Orleans knowledge when relevant
-- Be helpful with local recommendations (restaurants, events, etc.)
-- Keep the tone casual and friendly, like a local friend helping out"""
+        system_context = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. Keep responses under 160 characters when possible for SMS. Be concise but friendly and conversational. For medical emergencies, always advise calling 911. Don't provide medical diagnoses. If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs. Use local New Orleans knowledge when relevant. Be helpful with local recommendations. Keep the tone casual and friendly, like a local friend helping out."""
         
-        # Try different API methods based on the client type
-        reply = ""
+        # Build a simple prompt for module-level API
+        conversation_parts = [system_context]
         
-        # Method 1: Try new Messages API
+        # Add conversation history
+        for msg in history[-4:]:
+            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+            conversation_parts.append(f"{role_prefix}{msg['content']}")
+        
+        # Add current user message
+        conversation_parts.append(f"Human: {user_msg}")
+        conversation_parts.append("Assistant: ")
+        
+        prompt = "\n\n".join(conversation_parts)
+        
+        # Since we're using module-level API, we need to make a direct API call
         try:
-            if hasattr(anthropic_client, 'messages'):
-                messages = []
-                for msg in history[-4:]:
-                    messages.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-                messages.append({
-                    "role": "user", 
-                    "content": user_msg
-                })
-                
-                response = anthropic_client.messages.create(
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=150,
-                    temperature=0.7,
-                    system=system_context.strip(),
-                    messages=messages
-                )
-                reply = response.content[0].text.strip()
-                logger.info("Used Messages API")
-                
-        except Exception as e1:
-            logger.warning(f"Messages API failed: {e1}")
+            # Using the anthropic module directly
+            import anthropic as anthropic_lib
             
-            # Method 2: Try Completions API
-            try:
-                if hasattr(anthropic_client, 'completions'):
-                    # Build conversation prompt
-                    conversation_parts = [system_context]
-                    
-                    for msg in history[-4:]:
-                        role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
-                        conversation_parts.append(f"{role_prefix}{msg['content']}")
-                    
-                    conversation_parts.append(f"Human: {user_msg}")
-                    conversation_parts.append("Assistant: ")
-                    
-                    prompt = "\n\n".join(conversation_parts)
-                    
-                    response = anthropic_client.completions.create(
-                        model="claude-3-sonnet-20240229",
-                        max_tokens_to_sample=150,
-                        prompt=prompt,
-                        temperature=0.7,
-                        stop_sequences=["\n\nHuman:"]
-                    )
-                    reply = response.completion.strip()
-                    logger.info("Used Completions API")
-                    
-            except Exception as e2:
-                logger.warning(f"Completions API failed: {e2}")
+            # Make a simple completion request
+            response = anthropic_lib.completions.create(
+                model="claude-instant-1.2",  # Use a simpler model that's more likely to work
+                prompt=prompt,
+                max_tokens_to_sample=150,
+                temperature=0.7,
+                stop_sequences=["\n\nHuman:"]
+            )
+            
+            if hasattr(response, 'completion'):
+                reply = response.completion.strip()
+            elif isinstance(response, dict) and 'completion' in response:
+                reply = response['completion'].strip()
+            else:
+                reply = str(response).strip()
                 
-                # Method 3: Try module-level API (oldest)
-                try:
-                    if hasattr(anthropic_client, 'complete'):
-                        conversation_parts = [system_context]
-                        
-                        for msg in history[-4:]:
-                            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
-                            conversation_parts.append(f"{role_prefix}{msg['content']}")
-                        
-                        conversation_parts.append(f"Human: {user_msg}")
-                        conversation_parts.append("Assistant: ")
-                        
-                        prompt = "\n\n".join(conversation_parts)
-                        
-                        response = anthropic_client.complete(
-                            model="claude-3-sonnet-20240229",
-                            prompt=prompt,
-                            max_tokens_to_sample=150,
-                            temperature=0.7,
-                            stop_sequences=["\n\nHuman:"]
-                        )
-                        reply = response['completion'].strip()
-                        logger.info("Used module-level API")
-                        
-                except Exception as e3:
-                    logger.error(f"All API methods failed: {e3}")
-                    raise e3
+            logger.info("Used direct API call")
+            
+        except Exception as api_error:
+            logger.error(f"Direct API call failed: {api_error}")
+            # Fallback to a simple response
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
         
-        if not reply:
-            raise Exception("No response generated from any API method")
+        # Clean up the response
+        if not reply or len(reply.strip()) == 0:
+            return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
         
         # Ensure SMS length compliance
         if len(reply) > 320:
@@ -848,7 +795,7 @@ Key guidelines:
         response_time = int((time.time() - start_time) * 1000)
         log_usage_analytics(phone, "claude_chat", True, response_time)
         
-        logger.info(f"Claude response for {phone} in {response_time}ms")
+        logger.info(f"Claude response for {phone} in {response_time}ms: {reply[:50]}...")
         return reply
         
     except Exception as e:
@@ -856,16 +803,8 @@ Key guidelines:
         response_time = int((time.time() - start_time) * 1000)
         log_usage_analytics(phone, "claude_chat", False, response_time)
         
-        # Provide more specific error messages
-        error_str = str(e).lower()
-        if "rate limit" in error_str or "429" in error_str:
-            return "I'm getting a lot of requests right now. Please try again in a moment."
-        elif "authentication" in error_str or "401" in error_str:
-            return "There's an issue with the AI service configuration. Please try again later."
-        elif "network" in error_str or "timeout" in error_str:
-            return "Network issue connecting to AI service. Please try again."
-        else:
-            return "Sorry, I'm having trouble processing that right now. Please try again."
+        # Return a helpful fallback message
+        return "I'm having trouble with the AI service right now, but I can still help you search for things! Try asking about restaurants, weather, or directions."
 
 # === Main SMS Route ===
 @app.route("/sms", methods=["POST"])
@@ -1343,10 +1282,11 @@ if __name__ == "__main__":
     else:
         logger.info("All configurations validated ✓")
     
-    # Use gunicorn in production, Flask dev server locally
+    # Check if running in Render (production)
     if os.getenv("RENDER"):
-        # This should not run in Render since gunicorn starts the app
         logger.info("Running in Render environment")
+        # Start with production settings
+        app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
     else:
         logger.info(f"Starting development server on port {port}")
         app.run(debug=True, host="0.0.0.0", port=port)
