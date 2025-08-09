@@ -756,31 +756,41 @@ def ask_claude(phone, user_msg):
         
         prompt = "\n\n".join(conversation_parts)
         
-        # Since we're using module-level API, we need to make a direct API call
+        # Make a direct HTTP request to Anthropic API
         try:
-            # Using the anthropic module directly
-            import anthropic as anthropic_lib
+            import requests
             
-            # Make a simple completion request
-            response = anthropic_lib.completions.create(
-                model="claude-instant-1.2",  # Use a simpler model that's more likely to work
-                prompt=prompt,
-                max_tokens_to_sample=150,
-                temperature=0.7,
-                stop_sequences=["\n\nHuman:"]
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            data = {
+                "model": "claude-instant-1.2",
+                "prompt": prompt,
+                "max_tokens_to_sample": 150,
+                "temperature": 0.7,
+                "stop_sequences": ["\n\nHuman:"]
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/complete",
+                headers=headers,
+                json=data,
+                timeout=15
             )
             
-            if hasattr(response, 'completion'):
-                reply = response.completion.strip()
-            elif isinstance(response, dict) and 'completion' in response:
-                reply = response['completion'].strip()
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("completion", "").strip()
+                logger.info("Used direct HTTP API call")
             else:
-                reply = str(response).strip()
+                logger.error(f"HTTP API call failed: {response.status_code} - {response.text}")
+                raise Exception(f"API call failed with status {response.status_code}")
                 
-            logger.info("Used direct API call")
-            
         except Exception as api_error:
-            logger.error(f"Direct API call failed: {api_error}")
+            logger.error(f"Direct HTTP API call failed: {api_error}")
             # Fallback to a simple response
             return "I'm here to help! Ask me about New Orleans restaurants, weather, directions, or anything else."
         
