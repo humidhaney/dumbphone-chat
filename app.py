@@ -43,10 +43,21 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 anthropic_client = None
 if ANTHROPIC_API_KEY:
     try:
-        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Simple initialization without extra parameters
+        anthropic_client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY
+        )
         logger.info("Anthropic client initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Anthropic client: {e}")
+        # Try alternative initialization method
+        try:
+            import anthropic
+            anthropic_client = anthropic.Client(api_key=ANTHROPIC_API_KEY)
+            logger.info("Anthropic client initialized with fallback method")
+        except Exception as e2:
+            logger.error(f"Fallback initialization also failed: {e2}")
+            anthropic_client = None
 else:
     logger.warning("ANTHROPIC_API_KEY not found")
 
@@ -696,7 +707,7 @@ def detect_intent(text: str) -> Optional[IntentResult]:
             return res
     return None
 
-# === Enhanced GPT Chat - Now using Claude ===
+# === Enhanced Claude Chat ===
 def ask_claude(phone, user_msg):
     """Enhanced Claude integration with better error handling"""
     start_time = time.time()
@@ -706,25 +717,13 @@ def ask_claude(phone, user_msg):
         return "Sorry, the AI service is currently unavailable."
     
     try:
-        history = load_history(phone, limit=8)  # Reduced for token efficiency
+        history = load_history(phone, limit=6)  # Reduced for token efficiency
         
-        # Build conversation for Claude
-        messages = []
+        # Build conversation for Claude - convert to single prompt format
+        conversation_parts = []
         
-        # Convert history to Claude format
-        for msg in history[-6:]:  # Limit history to prevent token overflow
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Add current user message
-        messages.append({
-            "role": "user", 
-            "content": user_msg
-        })
-        
-        system_prompt = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. 
+        # Add system context
+        system_context = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. 
 
 Key guidelines:
 - Keep responses under 160 characters when possible for SMS
@@ -734,18 +733,47 @@ Key guidelines:
 - If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs
 - Use local New Orleans knowledge when relevant
 - Be helpful with local recommendations (restaurants, events, etc.)
-- Keep the tone casual and friendly, like a local friend helping out"""
+- Keep the tone casual and friendly, like a local friend helping out
+
+"""
         
-        # Call Claude API
-        response = anthropic_client.messages.create(
-            model="claude-3-sonnet-20240229",  # Using Claude 3 Sonnet
-            max_tokens=150,  # Limit for SMS responses
-            temperature=0.7,
-            system=system_prompt,
-            messages=messages
-        )
+        conversation_parts.append(system_context)
         
-        reply = response.content[0].text.strip()
+        # Add conversation history
+        for msg in history[-4:]:  # Limit history to prevent token overflow
+            role_prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+            conversation_parts.append(f"{role_prefix}{msg['content']}")
+        
+        # Add current user message
+        conversation_parts.append(f"Human: {user_msg}")
+        conversation_parts.append("Assistant: ")
+        
+        # Join into single prompt
+        prompt = "\n\n".join(conversation_parts)
+        
+        # Call Claude API using the older format
+        try:
+            response = anthropic_client.completions.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens_to_sample=150,
+                prompt=prompt,
+                temperature=0.7,
+                stop_sequences=["\n\nHuman:"]
+            )
+            reply = response.completion.strip()
+        except AttributeError:
+            # Try the newer API format
+            response = anthropic_client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=150,
+                temperature=0.7,
+                system=system_context.strip(),
+                messages=[
+                    {"role": msg["role"], "content": msg["content"]} 
+                    for msg in history[-4:]
+                ] + [{"role": "user", "content": user_msg}]
+            )
+            reply = response.content[0].text.strip()
         
         # Ensure SMS length compliance
         if len(reply) > 320:
@@ -757,23 +785,21 @@ Key guidelines:
         logger.info(f"Claude response for {phone} in {response_time}ms")
         return reply
         
-    except anthropic.APIError as e:
-        logger.error(f"Claude API error for {phone}: {e}")
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(phone, "claude_chat", False, response_time)
-        return "Sorry, I'm having trouble with the AI service right now. Please try again."
-        
-    except anthropic.RateLimitError as e:
-        logger.warning(f"Claude rate limit for {phone}: {e}")
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(phone, "claude_chat", False, response_time)
-        return "I'm getting a lot of requests right now. Please try again in a moment."
-        
     except Exception as e:
-        logger.error(f"Unexpected Claude error for {phone}: {e}")
+        logger.error(f"Claude error for {phone}: {e}")
         response_time = int((time.time() - start_time) * 1000)
         log_usage_analytics(phone, "claude_chat", False, response_time)
-        return "Sorry, I'm having trouble processing that right now. Please try again."
+        
+        # Provide more specific error messages
+        error_str = str(e).lower()
+        if "rate limit" in error_str or "429" in error_str:
+            return "I'm getting a lot of requests right now. Please try again in a moment."
+        elif "authentication" in error_str or "401" in error_str:
+            return "There's an issue with the AI service configuration. Please try again later."
+        elif "network" in error_str or "timeout" in error_str:
+            return "Network issue connecting to AI service. Please try again."
+        else:
+            return "Sorry, I'm having trouble processing that right now. Please try again."
 
 # === Main SMS Route ===
 @app.route("/sms", methods=["POST"])
