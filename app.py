@@ -149,7 +149,6 @@ def send_sms(to_number, message):
 # === SerpAPI Search ===
 def web_search(q, num=3):
     if not SERPAPI_API_KEY:
-        print("❌ SERPAPI_API_KEY missing")
         return "Search unavailable (no SERPAPI_API_KEY set)."
 
     url = "https://serpapi.com/search.json"
@@ -162,21 +161,15 @@ def web_search(q, num=3):
         "gl": "us",
     }
     try:
-        print(f"🔎 SerpAPI GET: {url}?{urllib.parse.urlencode({k:v for k,v in params.items() if k!='api_key'})}")
         r = requests.get(url, params=params, timeout=15)
-        print(f"🔎 SerpAPI status: {r.status_code}")
         if r.status_code != 200:
-            text = r.text[:200]
-            print("❌ SerpAPI non-200 body:", text)
-            return f"Search error ({r.status_code}): {text}"
+            return f"Search error ({r.status_code})"
         data = r.json()
     except Exception as e:
-        print("❌ SerpAPI exception:", e)
         return f"Search error: {e}"
 
     org = (data.get("organic_results") or [])
     if not org:
-        print("ℹ️ SerpAPI returned no organic_results:", list(data.keys()))
         kg = data.get("knowledge_graph") or {}
         summary = kg.get("title") or kg.get("website") or ""
         if summary:
@@ -187,9 +180,74 @@ def web_search(q, num=3):
     title = top.get("title", "")
     link = top.get("link", "")
     snippet = top.get("snippet", "")
-    line = f"{title} — {snippet} ({link})".strip()[:320]
-    print("🔎 SerpAPI top line:", line)
-    return line or "No results found."
+    return f"{title} — {snippet} ({link})".strip()[:320] or "No results found."
+
+# === Sunrise/Sunset via Sunrise-Sunset.org ===
+def sunrise_sunset_lookup(query: str):
+    if not SERPAPI_API_KEY:
+        return "Sunrise/sunset unavailable (no SERPAPI_API_KEY set)."
+
+    date = "today"
+    if "tomorrow" in query.lower():
+        date = "tomorrow"
+
+    cleaned = re.sub(r"\b(sunrise|sunset|in|tomorrow|today|what|time|is|the|for)\b", "", query, flags=re.I).strip()
+    if not cleaned:
+        return "Please specify a location, e.g., 'sunrise tomorrow in New York City'."
+
+    geo_url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google_maps",
+        "q": cleaned,
+        "api_key": SERPAPI_API_KEY
+    }
+    try:
+        r = requests.get(geo_url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return f"Geocode error: {e}"
+
+    loc = None
+    if "place_results" in data and "gps_coordinates" in data["place_results"]:
+        coords = data["place_results"]["gps_coordinates"]
+        loc = (coords.get("latitude"), coords.get("longitude"))
+    elif "local_results" in data and data["local_results"]:
+        coords = data["local_results"][0].get("gps_coordinates", {})
+        loc = (coords.get("latitude"), coords.get("longitude"))
+
+    if not loc or None in loc:
+        return "Could not determine location coordinates."
+
+    lat, lng = loc
+
+    ss_url = "https://api.sunrise-sunset.org/json"
+    ss_params = {
+        "lat": lat,
+        "lng": lng,
+        "formatted": 0
+    }
+    if date == "tomorrow":
+        target_date = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
+        ss_params["date"] = target_date
+    else:
+        ss_params["date"] = datetime.utcnow().date().isoformat()
+
+    try:
+        r2 = requests.get(ss_url, params=ss_params, timeout=15)
+        r2.raise_for_status()
+        ss_data = r2.json()
+    except Exception as e:
+        return f"Sunrise API error: {e}"
+
+    if ss_data.get("status") != "OK":
+        return "Could not get sunrise/sunset times."
+
+    results = ss_data.get("results", {})
+    sunrise_utc = results.get("sunrise")
+    sunset_utc = results.get("sunset")
+
+    return f"Sunrise: {sunrise_utc} UTC | Sunset: {sunset_utc} UTC for {cleaned.title()} ({date})"
 
 # === Intent detectors ===
 def detect_hours_intent(text: str):
@@ -240,7 +298,6 @@ def sms_webhook():
     if not sender or not body:
         return "Missing fields", 400
 
-    # STOP unsubscribe
     if body.upper() == "STOP":
         if remove_from_whitelist(sender):
             if sender in WHITELIST:
@@ -248,7 +305,6 @@ def sms_webhook():
             send_sms(sender, "You have been unsubscribed and will no longer receive messages.")
         return "OK", 200
 
-    # Auto-add to whitelist + welcome
     is_new = add_to_whitelist(sender)
     if is_new:
         WHITELIST.add(sender)
@@ -260,7 +316,6 @@ def sms_webhook():
         return "Monthly message limit reached (200). Try again next month.", 403
 
     save_message(sender, "user", body)
-
     text_lower = body.lower()
 
     # Hours intent
@@ -268,48 +323,37 @@ def sms_webhook():
     if biz:
         found = web_search(f"{biz} hours")
         reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply)
-        send_sms(sender, reply)
-        return "OK", 200
+        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
     # News intent
     if detect_news_intent(body):
         found = web_search(body)
         reply = (found or "No news found.")[:300]
-        save_message(sender, "assistant", reply)
-        send_sms(sender, reply)
-        return "OK", 200
+        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
     # Sunrise/sunset intent
     if detect_sun_intent(body):
-        found = web_search(body)
-        reply = (found or "No info found.")[:300]
-        save_message(sender, "assistant", reply)
-        send_sms(sender, reply)
-        return "OK", 200
+        reply = sunrise_sunset_lookup(body)
+        reply = (reply or "No info found.")[:300]
+        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
     # Explicit search / lookup
     if text_lower.startswith("lookup ") or text_lower.startswith("search "):
         query = body.split(" ", 1)[1] if " " in body else ""
         found = web_search(query) if query else "Try: search <your query>"
         reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply)
-        send_sms(sender, reply)
-        return "OK", 200
+        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
     # Generic address/phone/website/hours for
     if any(k in text_lower for k in ["address for", "phone for", "website for", "hours for"]):
         found = web_search(body)
         reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply)
-        send_sms(sender, reply)
-        return "OK", 200
+        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
 
     # GPT fallback
     try:
         reply = ask_gpt(sender, body)
     except Exception as e:
-        print("❌ GPT error:", e)
         reply = "Sorry, I had trouble. Try again later."
 
     save_message(sender, "assistant", reply)
@@ -334,6 +378,5 @@ def debug_search():
     res = web_search(q)
     return {"query": q, "result": res}, 200
 
-# Render-compatible run
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
