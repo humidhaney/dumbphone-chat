@@ -350,6 +350,7 @@ def web_search(q, num=3, search_type="general"):
             return f"Search error (status {r.status_code})"
             
         data = r.json()
+        logger.info(f"Search response keys: {list(data.keys())}")
         
     except Exception as e:
         logger.error(f"Search error: {e}")
@@ -367,25 +368,96 @@ def web_search(q, num=3, search_type="general"):
                 result += f" — {snippet}"
             return result[:320]
     
-    # Handle local results
-    if search_type == "local" and "local_results" in data:
-        local_results = data["local_results"]
+    # Handle local/maps results - IMPROVED PARSING
+    if search_type == "local":
+        # Check multiple possible result fields
+        local_results = []
+        if "local_results" in data:
+            local_results = data["local_results"]
+        elif "places_results" in data:
+            local_results = data["places_results"]
+        elif "places" in data:
+            local_results = data["places"]
+        
+        logger.info(f"Found {len(local_results)} local results")
+        
         if local_results:
+            # Use the first result
             result_place = local_results[0]
-            name = result_place.get('title', '')
-            address = result_place.get('address', '')
-            rating = result_place.get('rating', '')
-            phone = result_place.get('phone', '')
+            logger.info(f"First result data: {result_place}")
             
-            result = name
+            # Extract available information
+            name = result_place.get('title', '') or result_place.get('name', '')
+            address = result_place.get('address', '') or result_place.get('vicinity', '')
+            rating = result_place.get('rating', '')
+            phone = result_place.get('phone', '') or result_place.get('formatted_phone_number', '')
+            
+            # Look for hours in multiple possible fields
+            hours_info = ""
+            hours_fields = ['hours', 'opening_hours', 'current_opening_hours', 'regular_opening_hours']
+            
+            for field in hours_fields:
+                if field in result_place:
+                    hours_data = result_place[field]
+                    if isinstance(hours_data, list) and hours_data:
+                        # Take first hours entry if it's a list
+                        hours_info = f" — Hours: {hours_data[0]}"
+                        break
+                    elif isinstance(hours_data, str):
+                        hours_info = f" — Hours: {hours_data}"
+                        break
+                    elif isinstance(hours_data, dict):
+                        # Look for current day or general info
+                        if 'weekday_text' in hours_data and hours_data['weekday_text']:
+                            hours_info = f" — Hours: {hours_data['weekday_text'][0]}"
+                            break
+                        elif 'periods' in hours_data:
+                            hours_info = " — Hours available"
+                            break
+            
+            # Check if there's hours info in the snippet/description
+            snippet = result_place.get('snippet', '') or result_place.get('description', '')
+            if not hours_info and snippet:
+                # Look for hours patterns in snippet
+                import re
+                hours_patterns = [
+                    r'(open|opens?)\s+(\d{1,2}:\d{2}\s*[ap]m|\d{1,2}\s*[ap]m)',
+                    r'(\d{1,2}:\d{2}\s*[ap]m|\d{1,2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m|\d{1,2}\s*[ap]m)',
+                    r'hours?:?\s*([^.]+)',
+                ]
+                for pattern in hours_patterns:
+                    match = re.search(pattern, snippet.lower())
+                    if match:
+                        hours_info = f" — {match.group(0).title()}"
+                        break
+            
+            # Build result string
+            result = name if name else "Business found"
             if rating:
                 result += f" (★{rating})"
-            if address:
+            if hours_info:
+                result += hours_info
+            elif address:
                 result += f" — {address}"
-            if phone:
+            if phone and not hours_info:
                 result += f" — {phone}"
             
+            logger.info(f"Formatted result: {result}")
             return result[:320]
+        
+        # If no local results, check if there are regular organic results
+        elif "organic_results" in data and data["organic_results"]:
+            logger.info("No local results, checking organic results")
+            org = data["organic_results"][0]
+            title = org.get("title", "")
+            snippet = org.get("snippet", "")
+            result = f"{title}"
+            if snippet:
+                result += f" — {snippet}"
+            return result[:320]
+        
+        else:
+            logger.warning(f"No local results found. Available keys: {list(data.keys())}")
     
     # Handle regular search results
     org = data.get("organic_results", [])
@@ -658,7 +730,7 @@ def sms_webhook():
                 city = e.get("city")
                 
                 if biz_name:
-                    # Try multiple search variations
+                    # Try multiple search variations with local search first
                     search_attempts = []
                     
                     # Attempt 1: Exact quoted search
@@ -683,11 +755,27 @@ def sms_webhook():
                         else:
                             logger.info(f"Search attempt {i+1} failed, trying next...")
                     
-                    # If all searches failed, try one more general search
+                    # If local search failed, try regular Google search
                     if "No results found" in reply and city:
-                        final_search = f'{biz_name} {city}'
-                        logger.info(f"Final fallback search: {final_search}")
-                        reply = web_search(final_search, search_type="local")
+                        logger.info("All local searches failed, trying regular Google search")
+                        web_searches = [
+                            f'{biz_name} {city} hours phone',
+                            f'{biz_name} restaurant {city} hours',
+                            f'{biz_name} {city} mississippi hours'  # Add state for specificity
+                        ]
+                        
+                        for i, web_query in enumerate(web_searches):
+                            logger.info(f"Web search attempt {i+1}: {web_query}")
+                            reply = web_search(web_query, search_type="general")  # Regular Google search
+                            
+                            if "No results found" not in reply:
+                                logger.info(f"Success with web search attempt {i+1}")
+                                break
+                    
+                    # Final fallback message if nothing found
+                    if "No results found" in reply:
+                        reply = f"Sorry, I couldn't find hours for {biz_name} in {city}. You might try calling them directly or checking their website/social media."
+                        
                 else:
                     reply = "Please specify a business name for hours information."
 
