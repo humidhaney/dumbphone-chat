@@ -1,5 +1,19 @@
+# Flask SMS Chatbot Requirements
+# Core web framework
 Flask==2.3.3
-requests==2.31.0
-openai==0.28.1
-python-dotenv==1.0.0
 gunicorn==21.2.0
+
+# Anthropic Claude API
+anthropic==0.34.2
+
+# HTTP requests
+requests==2.31.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Date/time utilities (included in Python standard library)
+# datetime, calendar, re, json, sqlite3, os, logging, time, functools
+
+# Optional: For enhanced logging and monitoring
+werkzeug==2.3.7
