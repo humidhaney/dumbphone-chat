@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import requests
-import openai
 import os
 import json
 import sqlite3
@@ -16,6 +15,7 @@ import urllib.parse
 import logging
 from functools import wraps
 import time
+import anthropic
 
 # Load env vars
 load_dotenv()
@@ -36,18 +36,19 @@ app = Flask(__name__)
 # === Config & API Keys ===
 CLICKSEND_USERNAME = os.getenv("CLICKSEND_USERNAME")
 CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
-# Updated OpenAI client initialization for newer versions
-try:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-except ImportError:
-    # Fallback for older OpenAI versions
-    import openai
-    openai.api_key = OPENAI_API_KEY
-    openai_client = None
+# Initialize Anthropic client
+anthropic_client = None
+if ANTHROPIC_API_KEY:
+    try:
+        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        logger.info("Anthropic client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Anthropic client: {e}")
+else:
+    logger.warning("ANTHROPIC_API_KEY not found")
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
@@ -56,7 +57,7 @@ RESET_DAYS = 30
 DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 WELCOME_MSG = (
-    "Welcome to the Dirty Coast chatbot powered by OpenAI. "
+    "Welcome to the Dirty Coast chatbot powered by Claude AI. "
     "You can ask me to search the web, check business hours, get news, find sunrise/sunset times, "
     "get directions, check movie showtimes, find restaurants, check flight status, and much more. "
     "If at anytime you wish to unsubscribe, reply with STOP."
@@ -695,54 +696,83 @@ def detect_intent(text: str) -> Optional[IntentResult]:
             return res
     return None
 
-# === Enhanced GPT Chat ===
-def ask_gpt(phone, user_msg):
-    """Enhanced GPT integration with better error handling"""
+# === Enhanced GPT Chat - Now using Claude ===
+def ask_claude(phone, user_msg):
+    """Enhanced Claude integration with better error handling"""
     start_time = time.time()
+    
+    if not anthropic_client:
+        logger.error("Anthropic client not initialized")
+        return "Sorry, the AI service is currently unavailable."
     
     try:
         history = load_history(phone, limit=8)  # Reduced for token efficiency
         
-        system_prompt = """You are a helpful SMS assistant for Dirty Coast. Keep responses under 160 characters when possible. 
-        Be concise but friendly. For medical emergencies, always advise calling 911. Don't provide medical diagnoses.
-        If asked about Dirty Coast, mention it's a New Orleans-based lifestyle brand."""
+        # Build conversation for Claude
+        messages = []
         
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(history[-6:])  # Limit history to prevent token overflow
-        messages.append({"role": "user", "content": user_msg})
+        # Convert history to Claude format
+        for msg in history[-6:]:  # Limit history to prevent token overflow
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
         
-        # Use newer OpenAI client if available
-        if openai_client:
-            resp = openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=messages,
-                max_tokens=100,
-                temperature=0.7
-            )
-            reply = resp.choices[0].message.content.strip()
-        else:
-            # Fallback for older OpenAI versions
-            resp = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=messages,
-                max_tokens=100,
-                temperature=0.7
-            )
-            reply = resp.choices[0].message.content.strip()
+        # Add current user message
+        messages.append({
+            "role": "user", 
+            "content": user_msg
+        })
+        
+        system_prompt = """You are a helpful SMS assistant for Dirty Coast, a New Orleans-based lifestyle brand. 
+
+Key guidelines:
+- Keep responses under 160 characters when possible for SMS
+- Be concise but friendly and conversational
+- For medical emergencies, always advise calling 911
+- Don't provide medical diagnoses
+- If asked about Dirty Coast, mention it's a beloved New Orleans lifestyle brand known for local pride and unique designs
+- Use local New Orleans knowledge when relevant
+- Be helpful with local recommendations (restaurants, events, etc.)
+- Keep the tone casual and friendly, like a local friend helping out"""
+        
+        # Call Claude API
+        response = anthropic_client.messages.create(
+            model="claude-3-sonnet-20240229",  # Using Claude 3 Sonnet
+            max_tokens=150,  # Limit for SMS responses
+            temperature=0.7,
+            system=system_prompt,
+            messages=messages
+        )
+        
+        reply = response.content[0].text.strip()
         
         # Ensure SMS length compliance
         if len(reply) > 320:
             reply = reply[:317] + "..."
             
         response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(phone, "gpt_chat", True, response_time)
+        log_usage_analytics(phone, "claude_chat", True, response_time)
         
+        logger.info(f"Claude response for {phone} in {response_time}ms")
         return reply
         
-    except Exception as e:
-        logger.error(f"GPT error for {phone}: {e}")
+    except anthropic.APIError as e:
+        logger.error(f"Claude API error for {phone}: {e}")
         response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(phone, "gpt_chat", False, response_time)
+        log_usage_analytics(phone, "claude_chat", False, response_time)
+        return "Sorry, I'm having trouble with the AI service right now. Please try again."
+        
+    except anthropic.RateLimitError as e:
+        logger.warning(f"Claude rate limit for {phone}: {e}")
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", False, response_time)
+        return "I'm getting a lot of requests right now. Please try again in a moment."
+        
+    except Exception as e:
+        logger.error(f"Unexpected Claude error for {phone}: {e}")
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", False, response_time)
         return "Sorry, I'm having trouble processing that right now. Please try again."
 
 # === Main SMS Route ===
@@ -917,9 +947,9 @@ def sms_webhook():
                 reply = web_search(body)
 
         else:
-            # No intent detected, use GPT
-            reply = ask_gpt(sender, body)
-            intent_type = "gpt_chat"
+            # No intent detected, use Claude
+            reply = ask_claude(sender, body)
+            intent_type = "claude_chat"
 
         # Ensure reply fits SMS limits
         if len(reply) > 300:
@@ -998,7 +1028,7 @@ def health_check():
         # Check required environment variables
         env_status = {
             "clicksend_configured": bool(CLICKSEND_USERNAME and CLICKSEND_API_KEY),
-            "openai_configured": bool(OPENAI_API_KEY),
+            "anthropic_configured": bool(ANTHROPIC_API_KEY),
             "serpapi_configured": bool(SERPAPI_API_KEY)
         }
         
@@ -1023,7 +1053,7 @@ def health_check():
         
         health_score = sum([
             env_status["clicksend_configured"],
-            env_status["openai_configured"], 
+            env_status["anthropic_configured"], 
             env_status["serpapi_configured"],
             files_status["db_exists"]
         ])
@@ -1213,7 +1243,7 @@ if __name__ == "__main__":
     missing_configs = []
     if not CLICKSEND_USERNAME: missing_configs.append("CLICKSEND_USERNAME")
     if not CLICKSEND_API_KEY: missing_configs.append("CLICKSEND_API_KEY")
-    if not OPENAI_API_KEY: missing_configs.append("OPENAI_API_KEY")
+    if not ANTHROPIC_API_KEY: missing_configs.append("ANTHROPIC_API_KEY")
     if not SERPAPI_API_KEY: missing_configs.append("SERPAPI_API_KEY")
     
     if missing_configs:
