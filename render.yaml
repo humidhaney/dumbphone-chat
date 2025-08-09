@@ -3,7 +3,7 @@ services:
     name: sms-chatbot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --workers 2 --timeout 30
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --timeout 30 --log-level info
     envVars:
       - key: CLICKSEND_USERNAME
         sync: false
