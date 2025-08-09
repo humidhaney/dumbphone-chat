@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import urllib.parse
+import re
 
 # Load env vars
 load_dotenv()
@@ -30,8 +31,8 @@ DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 WELCOME_MSG = (
     "Welcome to the Dirty Coast chatbot powered by OpenAI. "
-    "If at anytime you wish to no longer receive texts from this number please respond with STOP "
-    "and you will be removed from your subscription."
+    "You can ask me to search the web, check business hours, get news, or find sunrise/sunset times. "
+    "If at anytime you wish to unsubscribe, reply with STOP."
 )
 
 # === SQLite for message memory ===
@@ -190,6 +191,26 @@ def web_search(q, num=3):
     print("🔎 SerpAPI top line:", line)
     return line or "No results found."
 
+# === Intent detectors ===
+def detect_hours_intent(text: str):
+    patterns = [
+        r"what\s+time\s+does\s+(.+?)\s+(open|close)",
+        r"when\s+is\s+(.+?)\s+open",
+        r"hours\s+for\s+(.+)",
+        r"(.+?)\s+hours\b"
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def detect_news_intent(text: str):
+    return bool(re.search(r"(latest|current)\s+news", text, flags=re.I) or "headlines" in text.lower())
+
+def detect_sun_intent(text: str):
+    return "sunrise" in text.lower() or "sunset" in text.lower()
+
 # === GPT Chat ===
 def ask_gpt(phone, user_msg):
     history = load_history(phone, limit=10)
@@ -240,20 +261,49 @@ def sms_webhook():
 
     save_message(sender, "user", body)
 
-    text = body.lower()
+    text_lower = body.lower()
 
-    # Search / lookup commands
-    if text.startswith("lookup ") or text.startswith("search "):
+    # Hours intent
+    biz = detect_hours_intent(body)
+    if biz:
+        found = web_search(f"{biz} hours")
+        reply = (found or "No results.")[:300]
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
+
+    # News intent
+    if detect_news_intent(body):
+        found = web_search(body)
+        reply = (found or "No news found.")[:300]
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
+
+    # Sunrise/sunset intent
+    if detect_sun_intent(body):
+        found = web_search(body)
+        reply = (found or "No info found.")[:300]
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
+
+    # Explicit search / lookup
+    if text_lower.startswith("lookup ") or text_lower.startswith("search "):
         query = body.split(" ", 1)[1] if " " in body else ""
         found = web_search(query) if query else "Try: search <your query>"
         reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
 
-    # Generic address/phone/website/hours
-    if any(k in text for k in ["address for", "phone for", "website for", "hours for"]):
+    # Generic address/phone/website/hours for
+    if any(k in text_lower for k in ["address for", "phone for", "website for", "hours for"]):
         found = web_search(body)
         reply = (found or "No results.")[:300]
-        save_message(sender, "assistant", reply); send_sms(sender, reply); return "OK", 200
+        save_message(sender, "assistant", reply)
+        send_sms(sender, reply)
+        return "OK", 200
 
     # GPT fallback
     try:
@@ -276,14 +326,4 @@ def health():
         "has_serpapi": bool(SERPAPI_API_KEY),
     }, 200
 
-@app.route("/debug/search", methods=["GET"])
-def debug_search():
-    q = request.args.get("q", "")
-    if not q:
-        return {"error": "pass ?q=your+query"}, 400
-    res = web_search(q)
-    return {"query": q, "result": res}, 200
-
-# Render-compatible run
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@app.route("/debug/sear
