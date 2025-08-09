@@ -756,7 +756,7 @@ def ask_claude(phone, user_msg):
         
         prompt = "\n\n".join(conversation_parts)
         
-        # Make a direct HTTP request to Anthropic API
+        # Make a direct HTTP request to Anthropic API using Messages API
         try:
             import requests
             
@@ -766,16 +766,28 @@ def ask_claude(phone, user_msg):
                 "anthropic-version": "2023-06-01"
             }
             
+            # Convert history to messages format
+            messages = []
+            for msg in history[-4:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
             data = {
-                "model": "claude-instant-1.2",
-                "prompt": prompt,
-                "max_tokens_to_sample": 150,
+                "model": "claude-3-haiku-20240307",  # Use Claude 3 Haiku (fast and cost-effective)
+                "max_tokens": 150,
                 "temperature": 0.7,
-                "stop_sequences": ["\n\nHuman:"]
+                "system": system_context,
+                "messages": messages
             }
             
             response = requests.post(
-                "https://api.anthropic.com/v1/complete",
+                "https://api.anthropic.com/v1/messages",
                 headers=headers,
                 json=data,
                 timeout=15
@@ -783,8 +795,8 @@ def ask_claude(phone, user_msg):
             
             if response.status_code == 200:
                 result = response.json()
-                reply = result.get("completion", "").strip()
-                logger.info("Used direct HTTP API call")
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+                logger.info("Used direct HTTP Messages API call")
             else:
                 logger.error(f"HTTP API call failed: {response.status_code} - {response.text}")
                 raise Exception(f"API call failed with status {response.status_code}")
