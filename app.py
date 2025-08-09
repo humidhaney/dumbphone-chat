@@ -988,13 +988,18 @@ def sms_webhook():
                 # Build more specific search query
                 search_parts = []
                 
+                # Debug logging
+                logger.info(f"Restaurant entities: {e}")
+                
                 # If we have a specific restaurant name, prioritize that
                 if e.get("restaurant_name"):
                     search_parts.append(f'"{e["restaurant_name"]}"')
                     if not any(word in e["restaurant_name"].lower() for word in ["restaurant", "cafe", "bar", "grill"]):
                         search_parts.append("restaurant")
+                    logger.info(f"Found restaurant name: {e['restaurant_name']}")
                 else:
                     search_parts.append("restaurant")
+                    logger.info("No specific restaurant name found")
                 
                 if e.get("cuisine"): 
                     search_parts.append(e["cuisine"])
