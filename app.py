@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Version tracking
+APP_VERSION = "1.1"
+CHANGELOG = {
+    "1.1": "Enhanced fact-checking, fixed intent detection order, improved Claude context isolation",
+    "1.0": "Initial release with SMS assistant functionality"
+}
+
 # === Config & API Keys ===
 CLICKSEND_USERNAME = os.getenv("CLICKSEND_USERNAME")
 CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
@@ -109,6 +116,18 @@ def init_db():
         );
         """)
         
+        # New table for tracking hallucination incidents
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS fact_check_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            query TEXT NOT NULL,
+            response TEXT NOT NULL,
+            incident_type TEXT DEFAULT 'potential_hallucination',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
         conn.commit()
 
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
@@ -120,7 +139,7 @@ def save_message(phone, role, content, intent_type=None, response_time_ms=None):
         """, (phone, role, content, intent_type, response_time_ms))
         conn.commit()
 
-def load_history(phone, limit=10):
+def load_history(phone, limit=4):  # Reduced limit to prevent context contamination
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -140,6 +159,16 @@ def log_usage_analytics(phone, intent_type, success, response_time_ms):
             INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
             VALUES (?, ?, ?, ?)
         """, (phone, intent_type, success, response_time_ms))
+        conn.commit()
+
+def log_fact_check_incident(phone, query, response, incident_type="potential_hallucination"):
+    """Log potential hallucination or fact-checking incidents"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO fact_check_incidents (phone, query, response, incident_type)
+            VALUES (?, ?, ?, ?)
+        """, (phone, query, response, incident_type))
         conn.commit()
 
 init_db()
@@ -544,7 +573,10 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
         r'\brain\b',
         r'\bsnow\b',
         r'\bcloudy\b',
-        r'\bsunny\b'
+        r'\bsunny\b',
+        r'\bstorm\b',
+        r'\bhot\b',
+        r'\bcold\b'
     ]
     
     if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
@@ -588,10 +620,48 @@ def detect_news_intent(text: str) -> Optional[IntentResult]:
         return IntentResult("news", {"topic": topic})
     return None
 
-# Detector order - FIXED: Weather before Restaurant to prevent "eat" in "weather" matches
+def detect_fact_check_intent(text: str) -> Optional[IntentResult]:
+    """Detect queries about people, companies, or factual information that should be searched"""
+    fact_check_patterns = [
+        r'\bwho\s+is\b',
+        r'\bwho\s+(founded|created|started)\b',
+        r'\bfounder\s+of\b',
+        r'\bCEO\s+of\b',
+        r'\bco-founded?\s+by\b',
+        r'\bstarted\s+by\b',
+        r'\bowns?\b.*\bcompany\b',
+        r'\bwhen\s+was\b.*\b(founded|started|created)\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in fact_check_patterns):
+        # Extract the main entity being asked about
+        entity = None
+        
+        # Try to extract company or person name
+        patterns = [
+            r'who\s+is\s+([A-Za-z\s]+?)(?:\?|$)',
+            r'founder\s+of\s+([A-Za-z\s]+?)(?:\?|$)',
+            r'CEO\s+of\s+([A-Za-z\s]+?)(?:\?|$)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                entity = match.group(1).strip()
+                break
+        
+        return IntentResult("fact_check", {
+            "query": text,
+            "entity": entity,
+            "requires_search": True
+        })
+    return None
+
+# Detector order - FIXED: Weather before Restaurant, added fact-check
 DET_ORDER = [
     detect_hours_intent,
     detect_weather_intent,    # Moved up to check weather first
+    detect_fact_check_intent, # NEW: Catch factual queries before Claude chat
     detect_restaurant_intent, # Moved down - now uses word boundaries
     detect_news_intent,
 ]
@@ -612,9 +682,21 @@ def ask_claude(phone, user_msg):
         return "Hi! I'm Alex, your SMS assistant. AI responses are unavailable right now, but I can help you search for info!"
     
     try:
-        history = load_history(phone, limit=6)
+        history = load_history(phone, limit=4)  # Reduced from 6 to 4
         
-        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. Keep responses under 160 characters when possible for SMS. Be friendly and helpful."""
+        # ENHANCED system context with fact-checking guidance
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
+
+IMPORTANT GUIDELINES:
+- Keep responses under 160 characters when possible for SMS
+- Be friendly and helpful
+- If asked about specific people, companies, or factual information that you're not 100% certain about, respond with "Let me search for the latest info on that" instead of guessing
+- Never make up connections between people or businesses
+- If you don't know something for certain, admit it rather than hallucinating
+- For questions about founders, CEOs, or business relationships, always suggest a web search for accuracy
+- Never claim someone founded or co-founded a company unless you're absolutely certain
+
+Be conversational but accurate above all else."""
         
         # Make direct HTTP request to Anthropic API
         try:
@@ -625,7 +707,7 @@ def ask_claude(phone, user_msg):
             }
             
             messages = []
-            for msg in history[-4:]:
+            for msg in history[-3:]:  # Further reduced to prevent contamination
                 messages.append({
                     "role": msg["role"],
                     "content": msg["content"]
@@ -638,7 +720,7 @@ def ask_claude(phone, user_msg):
             data = {
                 "model": "claude-3-haiku-20240307",
                 "max_tokens": 150,
-                "temperature": 0.7,
+                "temperature": 0.2,  # Lowered from 0.7 to 0.2 for more factual accuracy
                 "system": system_context,
                 "messages": messages
             }
@@ -661,6 +743,21 @@ def ask_claude(phone, user_msg):
         
         if not reply:
             return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        
+        # Check for potential hallucination indicators
+        hallucination_indicators = [
+            r'co-founded?\s+(?:by|with)',
+            r'founded\s+in\s+\d{4}\s+by',
+            r'CEO\s+and\s+founder',
+            r'started\s+(?:by|with).*(?:in|and)'
+        ]
+        
+        if any(re.search(pattern, reply, re.I) for pattern in hallucination_indicators):
+            logger.warning(f"Potential hallucination detected in response: {reply}")
+            log_fact_check_incident(phone, user_msg, reply, "potential_hallucination")
+            # Override with search suggestion for factual queries
+            if any(keyword in user_msg.lower() for keyword in ['who is', 'founder', 'CEO', 'co-founded', 'started by']):
+                reply = "Let me search for the latest info on that to make sure I give you accurate details."
         
         if len(reply) > 320:
             reply = reply[:317] + "..."
@@ -733,7 +830,13 @@ def sms_webhook():
             intent_type = intent.type
             e = intent.entities
 
-            if intent_type == "restaurant":
+            if intent_type == "fact_check":
+                # Route factual queries to search instead of Claude
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Fact-check intent routed to search: {search_query}")
+
+            elif intent_type == "restaurant":
                 search_parts = []
                 if e.get("restaurant_name"):
                     search_parts.append(f'"{e["restaurant_name"]}"')
@@ -849,7 +952,8 @@ def index():
         "service": "Hey Alex SMS Assistant",
         "description": "SMS assistant powered by Claude AI for staying connected without staying online",
         "status": "running",
-        "version": "1.0"
+        "version": APP_VERSION,
+        "changelog": CHANGELOG
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -859,27 +963,69 @@ def health_check():
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM messages")
             message_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM fact_check_incidents")
+            incident_count = c.fetchone()[0]
         
         return jsonify({
             "status": "healthy",
+            "version": APP_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": {"connected": True, "message_count": message_count},
-            "whitelist_count": len(load_whitelist())
+            "whitelist_count": len(load_whitelist()),
+            "fact_check_incidents": incident_count
         }), 200
         
     except Exception as e:
         return jsonify({
             "status": "unhealthy", 
-            "error": str(e)
+            "error": str(e),
+            "version": APP_VERSION
         }), 500
+
+@app.route("/analytics", methods=["GET"])
+def analytics_dashboard():
+    """Basic analytics endpoint for monitoring"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Get intent type breakdown
+            c.execute("""
+                SELECT intent_type, COUNT(*) as count 
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+                GROUP BY intent_type
+                ORDER BY count DESC
+            """)
+            intent_stats = {row[0]: row[1] for row in c.fetchall()}
+            
+            # Get recent fact check incidents
+            c.execute("""
+                SELECT COUNT(*) as incidents
+                FROM fact_check_incidents 
+                WHERE timestamp > datetime('now', '-24 hours')
+            """)
+            recent_incidents = c.fetchone()[0]
+            
+            return jsonify({
+                "version": APP_VERSION,
+                "intent_breakdown_7d": intent_stats,
+                "fact_check_incidents_24h": recent_incidents,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Get port from environment
 port = int(os.getenv("PORT", 5000))
 
 if __name__ == "__main__":
-    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT 🔥")
+    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT v{} 🔥".format(APP_VERSION))
     logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
+    logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
     
     if os.getenv("RENDER"):
         logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
