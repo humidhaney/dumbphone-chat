@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 CHANGELOG = {
+    "1.3": "Updated welcome message with personality and clear examples, ready for testing",
     "1.2": "Fixed search follow-ups, enhanced context awareness, prevented search promise loops",
     "1.1": "Enhanced fact-checking, fixed intent detection order, improved Claude context isolation",
     "1.0": "Initial release with SMS assistant functionality"
@@ -67,11 +68,12 @@ USAGE_LIMIT = 200
 RESET_DAYS = 30
 DB_PATH = os.getenv("DB_PATH", "chat.db")
 
+# NEW WELCOME MESSAGE - Updated with personality and clear examples
 WELCOME_MSG = (
-    "Hey there! This is Alex, your SMS assistant powered by Claude AI. "
-    "I help you stay connected to the info you need without spending time online. "
-    "Ask me about weather, restaurants, directions, news, business hours, and more. "
-    "Reply STOP anytime to unsubscribe from these messages."
+    "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
+    "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
+    "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
+    "Try asking \"weather today\" to get started."
 )
 
 # === Error Handling Decorator ===
@@ -885,6 +887,7 @@ def sms_webhook():
     if is_new:
         WHITELIST.add(sender)
         send_sms(sender, WELCOME_MSG)
+        logger.info(f"✨ New user {sender} added to whitelist with welcome message")
 
     if sender not in WHITELIST:
         return "Number not authorized", 403
@@ -1111,11 +1114,21 @@ def analytics_dashboard():
             """)
             follow_up_count = c.fetchone()[0]
             
+            # Get new user count (first-time welcome messages)
+            c.execute("""
+                SELECT COUNT(DISTINCT phone) as new_users
+                FROM messages 
+                WHERE content LIKE '%think of me as your personal research assistant%'
+                AND timestamp > datetime('now', '-7 days')
+            """)
+            new_users = c.fetchone()[0]
+            
             return jsonify({
                 "version": APP_VERSION,
                 "intent_breakdown_7d": intent_stats,
                 "fact_check_incidents_24h": recent_incidents,
                 "follow_up_queries_7d": follow_up_count,
+                "new_users_7d": new_users,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }), 200
             
@@ -1130,6 +1143,7 @@ if __name__ == "__main__":
     logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"New Welcome Message: {WELCOME_MSG[:100]}...")
     
     if os.getenv("RENDER"):
         logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
