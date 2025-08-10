@@ -534,10 +534,33 @@ def detect_hours_intent(text: str) -> Optional[IntentResult]:
             return IntentResult("hours", {"biz": biz.strip(), "city": city, "day": day})
     return None
 
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    # Use word boundaries to match weather keywords precisely
+    weather_patterns = [
+        r'\bweather\b',
+        r'\btemperature\b',
+        r'\btemp\b',
+        r'\bforecast\b',
+        r'\brain\b',
+        r'\bsnow\b',
+        r'\bcloudy\b',
+        r'\bsunny\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        return IntentResult("weather", {"city": city, "day": day})
+    return None
+
 def detect_restaurant_intent(text: str) -> Optional[IntentResult]:
+    # Use word boundaries to avoid partial matches like "eat" in "weather"
     food_keywords = ['restaurant', 'food', 'eat', 'dining', 'menu']
     
-    if any(keyword in text.lower() for keyword in food_keywords):
+    # Create pattern with word boundaries to match whole words only
+    pattern = r'\b(?:' + '|'.join(re.escape(kw) for kw in food_keywords) + r')\b'
+    
+    if re.search(pattern, text.lower()):
         city = _extract_city(text)
         
         # Extract restaurant name
@@ -553,24 +576,23 @@ def detect_restaurant_intent(text: str) -> Optional[IntentResult]:
         })
     return None
 
-def detect_weather_intent(text: str) -> Optional[IntentResult]:
-    if re.search(r"\b(weather|temp|temperature|forecast)\b", text, re.I):
-        city = _extract_city(text)
-        day = _extract_day(text) or "today"
-        return IntentResult("weather", {"city": city, "day": day})
-    return None
-
 def detect_news_intent(text: str) -> Optional[IntentResult]:
-    if re.search(r"(latest|current)\s+news", text, re.I) or "headlines" in text.lower():
+    news_patterns = [
+        r'\b(latest|current)\s+news\b',
+        r'\bheadlines\b',
+        r'\bnews\s+(about|on)\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in news_patterns):
         topic = re.sub(r"\b(latest|current|news|headlines|on|about|the)\b", "", text, flags=re.I).strip()
         return IntentResult("news", {"topic": topic})
     return None
 
-# Detector order
+# Detector order - FIXED: Weather before Restaurant to prevent "eat" in "weather" matches
 DET_ORDER = [
     detect_hours_intent,
-    detect_restaurant_intent,
-    detect_weather_intent,
+    detect_weather_intent,    # Moved up to check weather first
+    detect_restaurant_intent, # Moved down - now uses word boundaries
     detect_news_intent,
 ]
 
@@ -578,6 +600,7 @@ def detect_intent(text: str) -> Optional[IntentResult]:
     for fn in DET_ORDER:
         res = fn(text)
         if res:
+            logger.info(f"Detected intent: {res.type} with entities: {res.entities}")
             return res
     return None
 
@@ -783,6 +806,8 @@ def sms_webhook():
                 query = "weather"
                 if e.get("city"):
                     query += f" in {e['city']}"
+                if e.get("day") and e["day"] != "today":
+                    query += f" {e['day']}"
                 reply = web_search(query)
 
             elif intent_type == "news":
