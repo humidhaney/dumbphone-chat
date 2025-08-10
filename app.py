@@ -722,7 +722,7 @@ def web_search(q, num=3, search_type="general"):
             result = f"{title}"
             if snippet:
                 result += f" — {snippet}"
-            return result[:320]
+            return result[:500]
     
     # Handle local/maps results - IMPROVED PARSING
     if search_type == "local":
@@ -853,7 +853,7 @@ def web_search(q, num=3, search_type="general"):
                 result_text += f" — {snippet}"
             
             logger.info(f"Selected quality result from: {source}")
-            return result_text[:320]
+            return result_text[:500]
         
         # If no quality results found, use the first one anyway
         top = org[0]
@@ -1566,8 +1566,8 @@ def sms_webhook():
                 reply = ask_claude(sender, body)
                 intent_type = "claude_chat"
 
-        if len(reply) > 300:
-            reply = reply[:297] + "..."
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
 
         response_time = int((time.time() - start_time) * 1000)
         save_message(sender, "assistant", reply, intent_type, response_time)
