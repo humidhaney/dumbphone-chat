@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "1.4"
+APP_VERSION = "2.1"
 CHANGELOG = {
+    "2.1": "Major upgrade: Enhanced cultural query detection, improved restaurant intent filtering, enhanced SMS debugging with ClickSend status monitoring",
     "1.4": "Fixed search capability claims - Claude now properly routes searches instead of denying search ability",
     "1.3": "Updated welcome message with personality and clear examples, ready for testing",
     "1.2": "Fixed search follow-ups, enhanced context awareness, prevented search promise loops",
@@ -69,7 +70,7 @@ USAGE_LIMIT = 200
 RESET_DAYS = 30
 DB_PATH = os.getenv("DB_PATH", "chat.db")
 
-# NEW WELCOME MESSAGE - Updated with personality and clear examples
+# WELCOME MESSAGE - Personality-driven with clear examples
 WELCOME_MSG = (
     "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
     "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
@@ -120,7 +121,7 @@ def init_db():
         );
         """)
         
-        # New table for tracking hallucination incidents
+        # Table for tracking hallucination incidents
         c.execute("""
         CREATE TABLE IF NOT EXISTS fact_check_incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +133,7 @@ def init_db():
         );
         """)
         
-        # New table for conversation context
+        # Table for conversation context
         c.execute("""
         CREATE TABLE IF NOT EXISTS conversation_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +142,19 @@ def init_db():
             context_value TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(phone, context_key)
+        );
+        """)
+        
+        # NEW: Table for SMS delivery tracking
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS sms_delivery_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            clicksend_response TEXT,
+            delivery_status TEXT,
+            message_id TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """)
         
@@ -185,6 +199,16 @@ def log_fact_check_incident(phone, query, response, incident_type="potential_hal
             INSERT INTO fact_check_incidents (phone, query, response, incident_type)
             VALUES (?, ?, ?, ?)
         """, (phone, query, response, incident_type))
+        conn.commit()
+
+def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
+    """Log SMS delivery attempts for debugging"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
         conn.commit()
 
 def set_conversation_context(phone, key, value):
@@ -355,7 +379,7 @@ def remove_from_whitelist(phone):
 
 WHITELIST = load_whitelist()
 
-# === SMS Functions ===
+# === ENHANCED SMS Functions with ClickSend Debugging ===
 def send_sms(to_number, message):
     if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
         logger.error("ClickSend credentials not configured")
@@ -375,6 +399,8 @@ def send_sms(to_number, message):
     }]}
     
     try:
+        logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}...")
+        
         resp = requests.post(
             url,
             auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
@@ -384,16 +410,69 @@ def send_sms(to_number, message):
         )
         
         result = resp.json()
+        
+        # ENHANCED LOGGING - Log the full ClickSend response
+        logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
+        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
+        
         if resp.status_code == 200:
-            logger.info(f"SMS sent successfully to {to_number}")
+            # Check if the message was actually accepted
+            if "data" in result and "messages" in result["data"]:
+                messages = result["data"]["messages"]
+                if messages:
+                    msg_status = messages[0].get("status")
+                    msg_id = messages[0].get("message_id")
+                    msg_price = messages[0].get("message_price")
+                    
+                    logger.info(f"✅ SMS queued successfully to {to_number}")
+                    logger.info(f"📊 Message ID: {msg_id}, Status: {msg_status}, Price: {msg_price}")
+                    
+                    # Log delivery details to database
+                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
+                    
+                    # Log any delivery issues
+                    if msg_status != "SUCCESS":
+                        logger.warning(f"⚠️  SMS Status Warning: {msg_status} for {to_number}")
+                else:
+                    logger.warning(f"⚠️  No message data in ClickSend response for {to_number}")
+                    log_sms_delivery(to_number, message, result, "NO_MESSAGE_DATA", None)
+            
             return result
         else:
-            logger.warning(f"SMS send failed: {result}")
+            logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
+            log_sms_delivery(to_number, message, result, f"API_ERROR_{resp.status_code}", None)
+            return {"error": f"ClickSend API error: {resp.status_code}"}
             
     except Exception as e:
-        logger.error(f"SMS error: {e}")
+        logger.error(f"💥 SMS Exception for {to_number}: {e}")
+        log_sms_delivery(to_number, message, {"error": str(e)}, "EXCEPTION", None)
+        return {"error": f"SMS send failed: {str(e)}"}
+
+def check_clicksend_account():
+    """Check ClickSend account balance and status"""
+    if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
+        return {"error": "ClickSend credentials not configured"}
     
-    return {"error": "Failed to send SMS"}
+    url = "https://rest.clicksend.com/v3/account"
+    
+    try:
+        resp = requests.get(
+            url,
+            auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
+            timeout=10
+        )
+        
+        if resp.status_code == 200:
+            account_info = resp.json()
+            logger.info(f"💰 ClickSend Account Info: {json.dumps(account_info, indent=2)}")
+            return account_info
+        else:
+            logger.error(f"❌ ClickSend Account Check Failed: {resp.status_code}")
+            return {"error": f"Account check failed: {resp.status_code}"}
+            
+    except Exception as e:
+        logger.error(f"💥 ClickSend Account Check Exception: {e}")
+        return {"error": str(e)}
 
 # === Search Function ===
 def web_search(q, num=3, search_type="general"):
@@ -578,7 +657,7 @@ class IntentResult:
     entities: Dict[str, Any]
     confidence: float = 1.0
 
-# === Intent Detectors ===
+# === ENHANCED Intent Detectors v2.1 ===
 def detect_hours_intent(text: str) -> Optional[IntentResult]:
     t = text.strip()
     day = _extract_day(t)
@@ -587,8 +666,13 @@ def detect_hours_intent(text: str) -> Optional[IntentResult]:
     patterns = [
         r"what\s+time\s+does\s+(.+?)\s+(open|close)",
         r"hours\s+for\s+(.+)$",
-        r"(.+?)\s+hours\b",
+        r"when\s+(?:does|is)\s+(.+?)\s+(?:open|close)",
+        r"(.+?)\s+hours\b"
     ]
+    
+    # Exclude cultural queries that might mention "open"
+    if re.search(r'\b(experience|describe|compare|cultural|impression)\b', t, re.I):
+        return None
     
     for p in patterns:
         m = re.search(p, t, flags=re.I)
@@ -627,20 +711,69 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
         r'\bcold\b'
     ]
     
+    # Don't match weather mentions in cultural context (like "rainy season")
+    if re.search(r'\b(experience|describe|compare|cultural|impression)\b', text, re.I):
+        return None
+    
     if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
         city = _extract_city(text)
         day = _extract_day(text) or "today"
         return IntentResult("weather", {"city": city, "day": day})
     return None
 
+def detect_cultural_query_intent(text: str) -> Optional[IntentResult]:
+    """Detect cultural, experiential, or descriptive queries that need general search"""
+    cultural_patterns = [
+        r'\bdescribe\s+how\b',
+        r'\bexperience\s+of\b',
+        r'\bhow.*(?:differ|compare|feel|experience)\b',
+        r'\bwhat.*(?:like|experience)\s+(?:to|for)\b',
+        r'\b(?:cultural|social|unspoken)\s+(?:norms|cues|customs)\b',
+        r'\b(?:first-time|lifelong|visitor|local|tourist)\b.*(?:compared?\s+to|versus|vs)\b',
+        r'\bsensory\s+impression\b',
+        r'\bduring\s+(?:the\s+)?(?:rainy\s+season|winter|summer|monsoon)\b',
+        r'\bhow\s+(?:does|do|would|might|could)\b.*\b(?:differ|compare|feel|experience)\b',
+        r'\bwhat\s+(?:is|are)\s+(?:the\s+)?(?:difference|differences)\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in cultural_patterns):
+        # This should be handled as a general search, not local business
+        logger.info(f"Cultural query detected: {text[:50]}...")
+        return IntentResult("cultural_query", {
+            "query": text,
+            "requires_search": True
+        })
+    return None
+
 def detect_restaurant_intent(text: str) -> Optional[IntentResult]:
-    # Use word boundaries to avoid partial matches like "eat" in "weather"
-    food_keywords = ['restaurant', 'food', 'eat', 'dining', 'menu']
+    """Detect restaurant search queries (specific restaurants, not cultural discussions)"""
     
-    # Create pattern with word boundaries to match whole words only
-    pattern = r'\b(?:' + '|'.join(re.escape(kw) for kw in food_keywords) + r')\b'
+    # EXCLUDE cultural/experiential queries about food
+    exclusion_patterns = [
+        r'\b(experience|describe|compare|differ|cultural|impression|norm|cue)\b',
+        r'\b(first-time|lifelong|visitor|local|tourist)\b',
+        r'\b(season|weather|atmosphere|environment)\b',
+        r'\bhow.*(?:experience|feel|differ|compare)\b',
+        r'\bwhat.*(?:like|experience|feel)\b.*(?:eating|food)\b'
+    ]
     
-    if re.search(pattern, text.lower()):
+    # If this looks like a cultural/experiential discussion, don't treat as restaurant search
+    if any(re.search(pattern, text, re.I) for pattern in exclusion_patterns):
+        logger.info(f"Excluding cultural food query from restaurant intent: {text[:50]}...")
+        return None
+    
+    # Only match direct restaurant searches, not cultural discussions
+    specific_restaurant_patterns = [
+        r'\b(find|search|locate)\b.*\brestaurant\b',
+        r'\brestaurant\s+(near|in|around)\b',
+        r'\b(best|good|top)\s+restaurant\b',
+        r'\b(pizza|burger|sushi|italian|mexican)\s+(?:restaurant|place|near)\b',
+        r'\bwhere\s+(?:can|to)\s+eat\b',
+        r'\bfood\s+(?:near|in|around)\b'
+    ]
+    
+    # Must match specific restaurant search patterns
+    if any(re.search(pattern, text, re.I) for pattern in specific_restaurant_patterns):
         city = _extract_city(text)
         
         # Extract restaurant name
@@ -715,9 +848,9 @@ def detect_follow_up_intent(text: str, phone: str) -> Optional[IntentResult]:
         r'\bother\s+(details|info)\b',
         r'\bcontinue\b',
         r'\bgo\s+on\b',
-        r'\band\?\s*$',  # NEW: Catch "And?" questions
-        r'\bsteps?\b',   # NEW: Catch recipe/tutorial requests
-        r'\bfull\b.*\b(recipe|instructions)\b'  # NEW: Full recipe requests
+        r'\band\?\s*$',  # Catch "And?" questions
+        r'\bsteps?\b',   # Catch recipe/tutorial requests
+        r'\bfull\b.*\b(recipe|instructions)\b'  # Full recipe requests
     ]
     
     if any(re.search(pattern, text, re.I) for pattern in follow_up_patterns):
@@ -767,14 +900,15 @@ def detect_recipe_intent(text: str) -> Optional[IntentResult]:
         })
     return None
 
-# Detector order - FIXED: Weather before Restaurant, added recipe intent
+# UPDATED detector order v2.1 - cultural queries before restaurant
 DET_ORDER = [
     detect_hours_intent,
-    detect_weather_intent,    # Moved up to check weather first
-    detect_recipe_intent,     # NEW: Catch recipe questions before follow-up
-    detect_follow_up_intent,  # Catch follow-up questions before fact-check
-    detect_fact_check_intent, # Catch factual queries before Claude chat
-    detect_restaurant_intent, # Moved down - now uses word boundaries
+    detect_weather_intent,
+    detect_cultural_query_intent,  # NEW: Catch cultural questions before restaurant
+    detect_recipe_intent,
+    detect_follow_up_intent,
+    detect_fact_check_intent,
+    detect_restaurant_intent,      # Now more specific
     detect_news_intent,
 ]
 
@@ -950,7 +1084,13 @@ def sms_webhook():
             intent_type = intent.type
             e = intent.entities
 
-            if intent_type == "recipe":
+            if intent_type == "cultural_query":
+                # Route cultural/experiential queries to general search
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Cultural query routed to general search: {search_query}")
+
+            elif intent_type == "recipe":
                 # Route recipe queries to search instead of Claude
                 search_query = e.get("query", body)
                 reply = web_search(search_query, search_type="general")
@@ -1006,9 +1146,9 @@ def sms_webhook():
                     # Attempt 1: Exact quoted search
                     if city:
                         search_attempts.append(f'"{biz_name}" in {city} hours')
-                        search_attempts.append(f'"{biz_name} in {city}" hours')  # Try business name WITH location
-                        search_attempts.append(f'{biz_name} {city} hours')  # No quotes
-                        search_attempts.append(f'{biz_name} restaurant {city}')  # Add restaurant context
+                        search_attempts.append(f'"{biz_name} in {city}" hours')
+                        search_attempts.append(f'{biz_name} {city} hours')
+                        search_attempts.append(f'{biz_name} restaurant {city}')
                     else:
                         search_attempts.append(f'"{biz_name}" hours')
                         search_attempts.append(f'{biz_name} restaurant hours')
@@ -1031,12 +1171,12 @@ def sms_webhook():
                         web_searches = [
                             f'{biz_name} {city} hours phone',
                             f'{biz_name} restaurant {city} hours',
-                            f'{biz_name} {city} mississippi hours'  # Add state for specificity
+                            f'{biz_name} {city} mississippi hours'
                         ]
                         
                         for i, web_query in enumerate(web_searches):
                             logger.info(f"Web search attempt {i+1}: {web_query}")
-                            reply = web_search(web_query, search_type="general")  # Regular Google search
+                            reply = web_search(web_query, search_type="general")
                             
                             if "No results found" not in reply:
                                 logger.info(f"Success with web search attempt {i+1}")
@@ -1113,6 +1253,9 @@ def health_check():
             
             c.execute("SELECT COUNT(*) FROM conversation_context WHERE timestamp > datetime('now', '-1 hour')")
             active_contexts = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM sms_delivery_log WHERE timestamp > datetime('now', '-24 hours')")
+            sms_attempts_24h = c.fetchone()[0]
         
         return jsonify({
             "status": "healthy",
@@ -1121,7 +1264,8 @@ def health_check():
             "database": {"connected": True, "message_count": message_count},
             "whitelist_count": len(load_whitelist()),
             "fact_check_incidents": incident_count,
-            "active_conversation_contexts": active_contexts
+            "active_conversation_contexts": active_contexts,
+            "sms_attempts_24h": sms_attempts_24h
         }), 200
         
     except Exception as e:
@@ -1131,9 +1275,38 @@ def health_check():
             "version": APP_VERSION
         }), 500
 
+@app.route("/clicksend-status", methods=["GET"])
+def clicksend_status():
+    """Check ClickSend account status and recent delivery reports"""
+    account_info = check_clicksend_account()
+    
+    # Get recent SMS delivery logs
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT phone, delivery_status, message_id, timestamp
+                FROM sms_delivery_log 
+                WHERE timestamp > datetime('now', '-24 hours')
+                ORDER BY timestamp DESC
+                LIMIT 20
+            """)
+            recent_deliveries = [
+                {"phone": row[0], "status": row[1], "message_id": row[2], "timestamp": row[3]}
+                for row in c.fetchall()
+            ]
+    except Exception as e:
+        recent_deliveries = {"error": str(e)}
+    
+    return jsonify({
+        "account_info": account_info,
+        "recent_deliveries": recent_deliveries,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 200
+
 @app.route("/analytics", methods=["GET"])
 def analytics_dashboard():
-    """Basic analytics endpoint for monitoring"""
+    """Enhanced analytics endpoint for monitoring v2.1"""
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
@@ -1164,6 +1337,14 @@ def analytics_dashboard():
             """)
             follow_up_count = c.fetchone()[0]
             
+            # Get cultural query count (NEW in v2.1)
+            c.execute("""
+                SELECT COUNT(*) as cultural_queries
+                FROM usage_analytics 
+                WHERE intent_type = 'cultural_query' AND timestamp > datetime('now', '-7 days')
+            """)
+            cultural_count = c.fetchone()[0]
+            
             # Get recipe query count
             c.execute("""
                 SELECT COUNT(*) as recipes
@@ -1172,7 +1353,24 @@ def analytics_dashboard():
             """)
             recipe_count = c.fetchone()[0]
             
-            # Get new user count (first-time welcome messages)
+            # Get SMS delivery success rate
+            c.execute("""
+                SELECT 
+                    COUNT(*) as total_attempts,
+                    SUM(CASE WHEN delivery_status = 'SUCCESS' THEN 1 ELSE 0 END) as successful,
+                    COUNT(DISTINCT phone) as unique_recipients
+                FROM sms_delivery_log 
+                WHERE timestamp > datetime('now', '-7 days')
+            """)
+            sms_stats = c.fetchone()
+            sms_delivery_rate = {
+                "total_attempts": sms_stats[0],
+                "successful": sms_stats[1],
+                "success_rate": round((sms_stats[1] / sms_stats[0] * 100) if sms_stats[0] > 0 else 0, 2),
+                "unique_recipients": sms_stats[2]
+            }
+            
+            # Get new user count
             c.execute("""
                 SELECT COUNT(DISTINCT phone) as new_users
                 FROM messages 
@@ -1186,7 +1384,9 @@ def analytics_dashboard():
                 "intent_breakdown_7d": intent_stats,
                 "fact_check_incidents_24h": recent_incidents,
                 "follow_up_queries_7d": follow_up_count,
+                "cultural_queries_7d": cultural_count,  # NEW
                 "recipe_queries_7d": recipe_count,
+                "sms_delivery_stats_7d": sms_delivery_rate,  # NEW
                 "new_users_7d": new_users,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }), 200
@@ -1202,7 +1402,8 @@ if __name__ == "__main__":
     logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
-    logger.info(f"🔍 Search capabilities: ENABLED and properly routed")
+    logger.info(f"🔍 Enhanced Intent Detection: Cultural queries, Restaurant filtering, SMS debugging")
+    logger.info(f"📊 Enhanced Analytics: Delivery tracking, Cultural query monitoring")
     
     if os.getenv("RENDER"):
         logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
