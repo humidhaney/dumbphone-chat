@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 CHANGELOG = {
+    "2.2": "Added comprehensive monthly SMS usage tracking with 300 message quota per 30-day period, quota management system, and usage analytics",
     "2.1": "Major upgrade: Enhanced cultural query detection, improved restaurant intent filtering, enhanced SMS debugging with ClickSend status monitoring",
     "1.4": "Fixed search capability claims - Claude now properly routes searches instead of denying search ability",
     "1.3": "Updated welcome message with personality and clear examples, ready for testing",
@@ -66,7 +67,9 @@ else:
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
-USAGE_LIMIT = 200
+MONTHLY_USAGE_FILE = "monthly_usage.json"  # NEW: Separate file for monthly tracking
+USAGE_LIMIT = 200  # Kept for backward compatibility
+MONTHLY_LIMIT = 300  # NEW: Monthly limit per number
 RESET_DAYS = 30
 DB_PATH = os.getenv("DB_PATH", "chat.db")
 
@@ -76,6 +79,18 @@ WELCOME_MSG = (
     "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
     "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
     "Try asking \"weather today\" to get started."
+)
+
+# QUOTA WARNING MESSAGES
+QUOTA_WARNING_MSG = (
+    "⚠️ Hey! You've used {count} of your 300 monthly messages. "
+    "You have {remaining} messages left this month. Your count resets every 30 days."
+)
+
+QUOTA_EXCEEDED_MSG = (
+    "🚫 You've reached your monthly limit of 300 messages. "
+    "Your quota will reset in {days_remaining} days. "
+    "Thanks for using Hey Alex! We'll be here when your quota refreshes."
 )
 
 # === Error Handling Decorator ===
@@ -145,7 +160,7 @@ def init_db():
         );
         """)
         
-        # NEW: Table for SMS delivery tracking
+        # Table for SMS delivery tracking
         c.execute("""
         CREATE TABLE IF NOT EXISTS sms_delivery_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +171,26 @@ def init_db():
             message_id TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+        """)
+        
+        # NEW: Table for monthly SMS usage tracking
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            message_count INTEGER DEFAULT 1,
+            period_start DATE NOT NULL,
+            period_end DATE NOT NULL,
+            last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            quota_warnings_sent INTEGER DEFAULT 0,
+            quota_exceeded BOOLEAN DEFAULT FALSE,
+            UNIQUE(phone, period_start)
+        );
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period 
+        ON monthly_sms_usage(phone, period_start DESC);
         """)
         
         conn.commit()
@@ -243,6 +278,161 @@ def clear_conversation_context(phone):
         """, (phone,))
         conn.commit()
 
+# === NEW: Monthly SMS Usage Tracking Functions ===
+def get_current_period_dates():
+    """Get the current 30-day period start and end dates"""
+    now = datetime.now(timezone.utc)
+    # Start from the beginning of today
+    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    period_end = period_start + timedelta(days=30)
+    return period_start.date(), period_end.date()
+
+def track_monthly_sms_usage(phone, is_outgoing=True):
+    """
+    Track monthly SMS usage for a phone number
+    Returns: (can_send: bool, usage_info: dict, warning_message: str or None)
+    """
+    if not is_outgoing:
+        return True, {}, None  # Don't count incoming messages against quota
+    
+    period_start, period_end = get_current_period_dates()
+    
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        
+        # Get or create current period usage record
+        c.execute("""
+            SELECT id, message_count, quota_warnings_sent, quota_exceeded
+            FROM monthly_sms_usage
+            WHERE phone = ? AND period_start = ?
+        """, (phone, period_start))
+        
+        result = c.fetchone()
+        
+        if result:
+            # Update existing record
+            usage_id, current_count, warnings_sent, quota_exceeded = result
+            new_count = current_count + 1
+            
+            c.execute("""
+                UPDATE monthly_sms_usage 
+                SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_count, usage_id))
+        else:
+            # Create new record for this period
+            new_count = 1
+            warnings_sent = 0
+            quota_exceeded = False
+            
+            c.execute("""
+                INSERT INTO monthly_sms_usage 
+                (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
+            
+            usage_id = c.lastrowid
+        
+        conn.commit()
+        
+        # Check quota status
+        usage_info = {
+            "phone": phone,
+            "current_count": new_count,
+            "monthly_limit": MONTHLY_LIMIT,
+            "remaining": max(0, MONTHLY_LIMIT - new_count),
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+        }
+        
+        warning_message = None
+        
+        # Check if quota exceeded
+        if new_count > MONTHLY_LIMIT:
+            if not quota_exceeded:
+                # First time exceeding quota - mark as exceeded and send message
+                c.execute("""
+                    UPDATE monthly_sms_usage 
+                    SET quota_exceeded = TRUE
+                    WHERE id = ?
+                """, (usage_id,))
+                conn.commit()
+                
+                warning_message = QUOTA_EXCEEDED_MSG.format(
+                    days_remaining=usage_info["days_remaining"]
+                )
+                logger.warning(f"📊 QUOTA EXCEEDED: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
+            
+            return False, usage_info, warning_message
+        
+        # Check for warning thresholds
+        warning_thresholds = [250, 280, 295]  # Send warnings at 250, 280, 295
+        
+        for threshold in warning_thresholds:
+            if new_count == threshold and warnings_sent < len([t for t in warning_thresholds if t <= threshold]):
+                # Send warning
+                warning_message = QUOTA_WARNING_MSG.format(
+                    count=new_count,
+                    remaining=usage_info["remaining"]
+                )
+                
+                # Update warnings sent count
+                c.execute("""
+                    UPDATE monthly_sms_usage 
+                    SET quota_warnings_sent = quota_warnings_sent + 1
+                    WHERE id = ?
+                """, (usage_id,))
+                conn.commit()
+                
+                logger.info(f"📊 QUOTA WARNING: {phone} - {new_count}/{MONTHLY_LIMIT} messages (threshold: {threshold})")
+                break
+        
+        logger.info(f"📊 Monthly usage: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
+        return True, usage_info, warning_message
+
+def get_monthly_usage_stats(phone):
+    """Get current monthly usage stats for a phone number"""
+    period_start, period_end = get_current_period_dates()
+    
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT message_count, quota_warnings_sent, quota_exceeded, last_message_date
+            FROM monthly_sms_usage
+            WHERE phone = ? AND period_start = ?
+        """, (phone, period_start))
+        
+        result = c.fetchone()
+        
+        if result:
+            count, warnings_sent, quota_exceeded, last_message = result
+            return {
+                "phone": phone,
+                "current_count": count,
+                "monthly_limit": MONTHLY_LIMIT,
+                "remaining": max(0, MONTHLY_LIMIT - count),
+                "quota_exceeded": bool(quota_exceeded),
+                "warnings_sent": warnings_sent,
+                "last_message_date": last_message,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+            }
+        else:
+            return {
+                "phone": phone,
+                "current_count": 0,
+                "monthly_limit": MONTHLY_LIMIT,
+                "remaining": MONTHLY_LIMIT,
+                "quota_exceeded": False,
+                "warnings_sent": 0,
+                "last_message_date": None,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+            }
+
 init_db()
 
 # === Content Filtering ===
@@ -282,7 +472,7 @@ class ContentFilter:
 
 content_filter = ContentFilter()
 
-# === Rate Limiting ===
+# === Rate Limiting (Legacy - kept for backward compatibility) ===
 def load_usage():
     try:
         with open(USAGE_FILE, "r") as f:
@@ -298,6 +488,7 @@ def save_usage(data):
         logger.error(f"Failed to save usage data: {e}")
 
 def can_send(sender):
+    # Legacy function - now uses monthly tracking primarily
     usage = load_usage()
     now = datetime.now(timezone.utc)
     
@@ -333,11 +524,9 @@ def can_send(sender):
         record["hourly_count"] = 0
         record["last_hour"] = current_hour.isoformat()
     
-    if record["count"] >= USAGE_LIMIT:
-        return False, "Monthly limit reached"
-    
-    if record["hourly_count"] >= 10:
-        return False, "Hourly limit reached"
+    # Check hourly limit (keep this for spam protection)
+    if record["hourly_count"] >= 15:  # Increased from 10 to 15
+        return False, "Hourly limit reached (15 messages/hour)"
     
     record["count"] += 1
     record["hourly_count"] += 1
@@ -380,7 +569,11 @@ def remove_from_whitelist(phone):
 WHITELIST = load_whitelist()
 
 # === ENHANCED SMS Functions with ClickSend Debugging ===
-def send_sms(to_number, message):
+def send_sms(to_number, message, bypass_quota=False):
+    """
+    Send SMS with quota tracking
+    bypass_quota: Set to True for system messages (warnings, quota exceeded notifications)
+    """
     if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
         logger.error("ClickSend credentials not configured")
         return {"error": "SMS service not configured"}
@@ -429,6 +622,10 @@ def send_sms(to_number, message):
                     
                     # Log delivery details to database
                     log_sms_delivery(to_number, message, result, msg_status, msg_id)
+                    
+                    # Track monthly usage (only for non-system messages)
+                    if not bypass_quota:
+                        track_monthly_sms_usage(to_number, is_outgoing=True)
                     
                     # Log any delivery issues
                     if msg_status != "SUCCESS":
@@ -657,7 +854,7 @@ class IntentResult:
     entities: Dict[str, Any]
     confidence: float = 1.0
 
-# === ENHANCED Intent Detectors v2.1 ===
+# === ENHANCED Intent Detectors v2.2 ===
 def detect_hours_intent(text: str) -> Optional[IntentResult]:
     t = text.strip()
     day = _extract_day(t)
@@ -900,11 +1097,11 @@ def detect_recipe_intent(text: str) -> Optional[IntentResult]:
         })
     return None
 
-# UPDATED detector order v2.1 - cultural queries before restaurant
+# UPDATED detector order v2.2 - cultural queries before restaurant
 DET_ORDER = [
     detect_hours_intent,
     detect_weather_intent,
-    detect_cultural_query_intent,  # NEW: Catch cultural questions before restaurant
+    detect_cultural_query_intent,  # Catch cultural questions before restaurant
     detect_recipe_intent,
     detect_follow_up_intent,
     detect_fact_check_intent,
@@ -1027,17 +1224,46 @@ You are a helpful assistant with search capabilities. Be conversational and help
 def sms_webhook():
     start_time = time.time()
     
+    # ENHANCED DEBUGGING - Log all request details
+    logger.info(f"🔍 RAW REQUEST DATA:")
+    logger.info(f"📋 Request Method: {request.method}")
+    logger.info(f"📋 Request Headers: {dict(request.headers)}")
+    logger.info(f"📋 Request Form Data: {dict(request.form)}")
+    logger.info(f"📋 Request Args: {dict(request.args)}")
+    logger.info(f"📋 Request JSON: {request.get_json(silent=True)}")
+    
     sender = request.form.get("from")
     body = (request.form.get("body") or "").strip()
     
-    logger.info(f"📱 SMS received from {sender}: {body[:50]}...")
+    logger.info(f"📱 SMS received from {sender}: {repr(body)}")  # Use repr() to see exact content
     
-    if not sender or not body:
-        return "Missing fields", 400
+    # DETAILED VALIDATION LOGGING
+    if not sender:
+        logger.error(f"❌ VALIDATION FAILED: Missing 'from' field")
+        logger.error(f"📋 Available form fields: {list(request.form.keys())}")
+        return jsonify({"error": "Missing 'from' field", "available_fields": list(request.form.keys())}), 400
+        
+    if not body:
+        logger.error(f"❌ VALIDATION FAILED: Missing 'body' field")
+        logger.error(f"📋 Raw body value: {repr(request.form.get('body'))}")
+        logger.error(f"📋 Available form fields: {list(request.form.keys())}")
+        return jsonify({"error": "Missing 'body' field", "raw_body": repr(request.form.get('body')), "available_fields": list(request.form.keys())}), 400
 
+    # CONTENT FILTER DEBUGGING
+    logger.info(f"🔍 CONTENT FILTER CHECK: Testing message: {repr(body)}")
     is_valid, filter_reason = content_filter.is_valid_query(body)
+    logger.info(f"📋 Content filter result: valid={is_valid}, reason='{filter_reason}'")
+    
     if not is_valid:
-        return jsonify({"status": "filtered", "reason": filter_reason}), 400
+        logger.error(f"❌ CONTENT FILTER FAILED: {filter_reason}")
+        logger.error(f"📋 Message length: {len(body)}")
+        logger.error(f"📋 Message content: {repr(body)}")
+        return jsonify({
+            "status": "filtered", 
+            "reason": filter_reason,
+            "message_length": len(body),
+            "message_content": repr(body)
+        }), 400
 
     # Clear old conversation context
     clear_conversation_context(sender)
@@ -1046,32 +1272,52 @@ def sms_webhook():
     if body.upper() in ["STOP", "UNSUBSCRIBE", "QUIT"]:
         if remove_from_whitelist(sender):
             WHITELIST.discard(sender)
-            send_sms(sender, "You have been unsubscribed. Text START to reactivate.")
+            send_sms(sender, "You have been unsubscribed. Text START to reactivate.", bypass_quota=True)
         return "OK", 200
 
     # Handle START
     if body.upper() == "START":
         if add_to_whitelist(sender):
             WHITELIST.add(sender)
-        send_sms(sender, "Welcome back to Hey Alex!")
+        send_sms(sender, "Welcome back to Hey Alex!", bypass_quota=True)
         return "OK", 200
 
     # Auto-add new number
     is_new = add_to_whitelist(sender)
     if is_new:
         WHITELIST.add(sender)
-        send_sms(sender, WELCOME_MSG)
+        send_sms(sender, WELCOME_MSG, bypass_quota=True)
         logger.info(f"✨ New user {sender} added to whitelist with welcome message")
 
     if sender not in WHITELIST:
-        return "Number not authorized", 403
+        logger.error(f"❌ AUTHORIZATION FAILED: {sender} not in whitelist")
+        return jsonify({"error": "Number not authorized", "phone": sender}), 403
 
-    # Rate limiting
+    # Check monthly quota FIRST (before processing) - NEW v2.2 FEATURE
+    logger.info(f"🔍 QUOTA CHECK: Checking monthly usage for {sender}")
+    can_send_monthly, usage_info, quota_warning = track_monthly_sms_usage(sender, is_outgoing=False)
+    logger.info(f"📋 Quota check result: can_send={can_send_monthly}, usage={usage_info.get('current_count', 'unknown')}/{MONTHLY_LIMIT}")
+    
+    if not can_send_monthly:
+        logger.warning(f"⚠️ QUOTA EXCEEDED: {sender} has exceeded monthly limit")
+        # Send quota exceeded message (bypass quota for system messages)
+        if quota_warning:
+            send_sms(sender, quota_warning, bypass_quota=True)
+        return jsonify({"status": "quota_exceeded", "usage": usage_info}), 429
+
+    # Legacy rate limiting (mainly for spam protection)
+    logger.info(f"🔍 RATE LIMIT CHECK: Checking legacy rate limits for {sender}")
     can_send_result, limit_reason = can_send(sender)
+    logger.info(f"📋 Rate limit result: can_send={can_send_result}, reason='{limit_reason}'")
+    
     if not can_send_result:
-        send_sms(sender, f"Rate limit exceeded: {limit_reason}")
-        return "Rate limited", 429
+        logger.warning(f"⚠️ RATE LIMITED: {sender} - {limit_reason}")
+        send_sms(sender, f"Rate limit exceeded: {limit_reason}", bypass_quota=True)
+        return jsonify({"status": "rate_limited", "reason": limit_reason}), 429
 
+    # If we get here, the request should be valid
+    logger.info(f"✅ ALL VALIDATIONS PASSED: Processing message from {sender}")
+    
     save_message(sender, "user", body)
 
     # Intent routing with phone context
@@ -1083,6 +1329,7 @@ def sms_webhook():
         if intent:
             intent_type = intent.type
             e = intent.entities
+            logger.info(f"🎯 INTENT DETECTED: {intent_type} with entities: {e}")
 
             if intent_type == "cultural_query":
                 # Route cultural/experiential queries to general search
@@ -1205,6 +1452,7 @@ def sms_webhook():
                 reply = web_search(body)
 
         else:
+            logger.info(f"🤖 NO SPECIFIC INTENT: Routing to Claude chat")
             reply = ask_claude(sender, body)
             intent_type = "claude_chat"
 
@@ -1215,20 +1463,27 @@ def sms_webhook():
         save_message(sender, "assistant", reply, intent_type, response_time)
         log_usage_analytics(sender, intent_type, True, response_time)
         
+        # Send the main response
+        logger.info(f"📤 SENDING MAIN RESPONSE: {reply[:50]}...")
         sms_result = send_sms(sender, reply)
+        
+        # Send quota warning if needed (after main response) - NEW v2.2 FEATURE
+        if quota_warning:
+            logger.info(f"📤 SENDING QUOTA WARNING: {quota_warning[:50]}...")
+            send_sms(sender, quota_warning, bypass_quota=True)
         
         if "error" in sms_result:
             logger.error(f"Failed to send SMS to {sender}: {sms_result}")
-            return "SMS send failed", 500
+            return jsonify({"error": "SMS send failed", "details": sms_result}), 500
         
-        logger.info(f"Successfully processed {intent_type} query for {sender} in {response_time}ms")
-        return "OK", 200
+        logger.info(f"✅ SUCCESS: Processed {intent_type} query for {sender} in {response_time}ms")
+        return jsonify({"status": "success", "intent": intent_type, "response_time_ms": response_time}), 200
 
     except Exception as e:
-        logger.error(f"Error processing message from {sender}: {e}", exc_info=True)
+        logger.error(f"💥 PROCESSING ERROR for {sender}: {e}", exc_info=True)
         error_msg = "Sorry, I'm experiencing technical difficulties."
-        send_sms(sender, error_msg)
-        return "OK", 200
+        send_sms(sender, error_msg, bypass_quota=True)
+        return jsonify({"error": "Processing failed", "details": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def index():
@@ -1237,7 +1492,8 @@ def index():
         "description": "SMS assistant powered by Claude AI for staying connected without staying online",
         "status": "running",
         "version": APP_VERSION,
-        "changelog": CHANGELOG
+        "changelog": CHANGELOG,
+        "monthly_limit": MONTHLY_LIMIT
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -1256,6 +1512,9 @@ def health_check():
             
             c.execute("SELECT COUNT(*) FROM sms_delivery_log WHERE timestamp > datetime('now', '-24 hours')")
             sms_attempts_24h = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM monthly_sms_usage WHERE period_start >= date('now', '-30 days')")
+            active_monthly_users = c.fetchone()[0]
         
         return jsonify({
             "status": "healthy",
@@ -1265,7 +1524,9 @@ def health_check():
             "whitelist_count": len(load_whitelist()),
             "fact_check_incidents": incident_count,
             "active_conversation_contexts": active_contexts,
-            "sms_attempts_24h": sms_attempts_24h
+            "sms_attempts_24h": sms_attempts_24h,
+            "active_monthly_users": active_monthly_users,
+            "monthly_limit": MONTHLY_LIMIT
         }), 200
         
     except Exception as e:
@@ -1274,6 +1535,12 @@ def health_check():
             "error": str(e),
             "version": APP_VERSION
         }), 500
+
+@app.route("/usage/<phone>", methods=["GET"])
+def get_user_usage(phone):
+    """Get usage statistics for a specific phone number"""
+    usage_stats = get_monthly_usage_stats(phone)
+    return jsonify(usage_stats), 200
 
 @app.route("/clicksend-status", methods=["GET"])
 def clicksend_status():
@@ -1306,7 +1573,7 @@ def clicksend_status():
 
 @app.route("/analytics", methods=["GET"])
 def analytics_dashboard():
-    """Enhanced analytics endpoint for monitoring v2.1"""
+    """Enhanced analytics endpoint for monitoring v2.2"""
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
@@ -1337,7 +1604,7 @@ def analytics_dashboard():
             """)
             follow_up_count = c.fetchone()[0]
             
-            # Get cultural query count (NEW in v2.1)
+            # Get cultural query count
             c.execute("""
                 SELECT COUNT(*) as cultural_queries
                 FROM usage_analytics 
@@ -1370,6 +1637,45 @@ def analytics_dashboard():
                 "unique_recipients": sms_stats[2]
             }
             
+            # NEW: Monthly usage analytics
+            c.execute("""
+                SELECT 
+                    COUNT(*) as active_users,
+                    SUM(message_count) as total_messages,
+                    AVG(message_count) as avg_messages_per_user,
+                    SUM(CASE WHEN quota_exceeded = 1 THEN 1 ELSE 0 END) as users_over_quota,
+                    SUM(quota_warnings_sent) as total_warnings_sent
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+            """)
+            monthly_stats = c.fetchone()
+            monthly_usage = {
+                "active_users": monthly_stats[0],
+                "total_messages": monthly_stats[1],
+                "avg_messages_per_user": round(monthly_stats[2], 1) if monthly_stats[2] else 0,
+                "users_over_quota": monthly_stats[3],
+                "total_warnings_sent": monthly_stats[4],
+                "monthly_limit": MONTHLY_LIMIT
+            }
+            
+            # Get top users by message count this month
+            c.execute("""
+                SELECT phone, message_count, quota_exceeded, quota_warnings_sent
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                ORDER BY message_count DESC
+                LIMIT 10
+            """)
+            top_users = [
+                {
+                    "phone": row[0],
+                    "message_count": row[1], 
+                    "quota_exceeded": bool(row[2]),
+                    "warnings_sent": row[3]
+                }
+                for row in c.fetchall()
+            ]
+            
             # Get new user count
             c.execute("""
                 SELECT COUNT(DISTINCT phone) as new_users
@@ -1384,11 +1690,89 @@ def analytics_dashboard():
                 "intent_breakdown_7d": intent_stats,
                 "fact_check_incidents_24h": recent_incidents,
                 "follow_up_queries_7d": follow_up_count,
-                "cultural_queries_7d": cultural_count,  # NEW
+                "cultural_queries_7d": cultural_count,
                 "recipe_queries_7d": recipe_count,
-                "sms_delivery_stats_7d": sms_delivery_rate,  # NEW
+                "sms_delivery_stats_7d": sms_delivery_rate,
+                "monthly_usage_stats": monthly_usage,  # NEW
+                "top_users_current_month": top_users,  # NEW
                 "new_users_7d": new_users,
                 "timestamp": datetime.now(timezone.utc).isoformat()
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/monthly-usage-report", methods=["GET"])
+def monthly_usage_report():
+    """Detailed monthly usage report for admin monitoring"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Get all users with their current monthly usage
+            c.execute("""
+                SELECT 
+                    phone,
+                    message_count,
+                    period_start,
+                    period_end,
+                    quota_warnings_sent,
+                    quota_exceeded,
+                    last_message_date
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                ORDER BY message_count DESC
+            """)
+            
+            users = []
+            for row in c.fetchall():
+                phone, count, start, end, warnings, exceeded, last_msg = row
+                users.append({
+                    "phone": phone,
+                    "message_count": count,
+                    "remaining": max(0, MONTHLY_LIMIT - count),
+                    "usage_percentage": round((count / MONTHLY_LIMIT) * 100, 1),
+                    "period_start": start,
+                    "period_end": end,
+                    "quota_warnings_sent": warnings,
+                    "quota_exceeded": bool(exceeded),
+                    "last_message_date": last_msg,
+                    "days_remaining": (datetime.strptime(end, '%Y-%m-%d').date() - datetime.now(timezone.utc).date()).days
+                })
+            
+            # Get usage distribution
+            c.execute("""
+                SELECT 
+                    CASE 
+                        WHEN message_count <= 50 THEN '0-50'
+                        WHEN message_count <= 100 THEN '51-100'
+                        WHEN message_count <= 150 THEN '101-150'
+                        WHEN message_count <= 200 THEN '151-200'
+                        WHEN message_count <= 250 THEN '201-250'
+                        WHEN message_count <= 300 THEN '251-300'
+                        ELSE '300+'
+                    END as usage_bracket,
+                    COUNT(*) as user_count
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                GROUP BY usage_bracket
+                ORDER BY usage_bracket
+            """)
+            
+            usage_distribution = {row[0]: row[1] for row in c.fetchall()}
+            
+            return jsonify({
+                "report_date": datetime.now(timezone.utc).isoformat(),
+                "monthly_limit": MONTHLY_LIMIT,
+                "total_users": len(users),
+                "users": users,
+                "usage_distribution": usage_distribution,
+                "summary": {
+                    "users_over_quota": sum(1 for u in users if u["quota_exceeded"]),
+                    "users_near_quota": sum(1 for u in users if u["message_count"] >= 250 and not u["quota_exceeded"]),
+                    "total_messages_sent": sum(u["message_count"] for u in users),
+                    "avg_usage_percentage": round(sum(u["usage_percentage"] for u in users) / len(users), 1) if users else 0
+                }
             }), 200
             
     except Exception as e:
@@ -1402,8 +1786,9 @@ if __name__ == "__main__":
     logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"📊 Monthly SMS Limit: {MONTHLY_LIMIT} messages per 30 days")
     logger.info(f"🔍 Enhanced Intent Detection: Cultural queries, Restaurant filtering, SMS debugging")
-    logger.info(f"📊 Enhanced Analytics: Delivery tracking, Cultural query monitoring")
+    logger.info(f"📈 Enhanced Analytics: Delivery tracking, Cultural query monitoring, Monthly usage tracking")
     
     if os.getenv("RENDER"):
         logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
