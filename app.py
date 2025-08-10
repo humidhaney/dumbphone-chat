@@ -1504,4 +1504,801 @@ def sms_webhook():
     if not sender:
         logger.error(f"❌ VALIDATION FAILED: Missing 'from' field")
         logger.error(f"📋 Available form fields: {list(request.form.keys())}")
-        return jsonify({"error": "Missing 'from' field",
+        return jsonify({"error": "Missing 'from' field", "available_fields": list(request.form.keys())}), 400
+        
+    if not body:
+        logger.error(f"❌ VALIDATION FAILED: Missing 'body' field")
+        logger.error(f"📋 Raw body value: {repr(request.form.get('body'))}")
+        logger.error(f"📋 Available form fields: {list(request.form.keys())}")
+        return jsonify({"error": "Missing 'body' field", "raw_body": repr(request.form.get('body')), "available_fields": list(request.form.keys())}), 400
+
+    logger.info(f"🔍 CONTENT FILTER CHECK: Testing message: {repr(body)}")
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    logger.info(f"📋 Content filter result: valid={is_valid}, reason='{filter_reason}'")
+    
+    if not is_valid:
+        logger.error(f"❌ CONTENT FILTER FAILED: {filter_reason}")
+        logger.error(f"📋 Message length: {len(body)}")
+        logger.error(f"📋 Message content: {repr(body)}")
+        return jsonify({
+            "status": "filtered", 
+            "reason": filter_reason,
+            "message_length": len(body),
+            "message_content": repr(body)
+        }), 400
+
+    clear_conversation_context(sender)
+
+    if body.upper() in ["STOP", "UNSUBSCRIBE", "QUIT"]:
+        if remove_from_whitelist(sender):
+            WHITELIST.discard(sender)
+            send_sms(sender, "You have been unsubscribed. Text START to reactivate.", bypass_quota=True)
+        return "OK", 200
+
+    if body.upper() == "START":
+        if add_to_whitelist(sender):
+            WHITELIST.add(sender)
+        send_sms(sender, "Welcome back to Hey Alex!", bypass_quota=True)
+        return "OK", 200
+
+    is_new = add_to_whitelist(sender)
+    if is_new:
+        WHITELIST.add(sender)
+        send_sms(sender, WELCOME_MSG, bypass_quota=True)
+        logger.info(f"✨ New user {sender} added to whitelist with welcome message")
+
+    if sender not in WHITELIST:
+        logger.error(f"❌ AUTHORIZATION FAILED: {sender} not in whitelist")
+        return jsonify({"error": "Number not authorized", "phone": sender}), 403
+
+    logger.info(f"🔍 QUOTA CHECK: Checking monthly usage for {sender}")
+    can_send_monthly, usage_info, quota_warning = track_monthly_sms_usage(sender, is_outgoing=False)
+    logger.info(f"📋 Quota check result: can_send={can_send_monthly}, usage={usage_info.get('current_count', 'unknown')}/{MONTHLY_LIMIT}")
+    
+    if not can_send_monthly:
+        logger.warning(f"⚠️ QUOTA EXCEEDED: {sender} has exceeded monthly limit")
+        if quota_warning:
+            send_sms(sender, quota_warning, bypass_quota=True)
+        return jsonify({"status": "quota_exceeded", "usage": usage_info}), 429
+
+    logger.info(f"🔍 RATE LIMIT CHECK: Checking legacy rate limits for {sender}")
+    can_send_result, limit_reason = can_send(sender)
+    logger.info(f"📋 Rate limit result: can_send={can_send_result}, reason='{limit_reason}'")
+    
+    if not can_send_result:
+        logger.warning(f"⚠️ RATE LIMITED: {sender} - {limit_reason}")
+        send_sms(sender, f"Rate limit exceeded: {limit_reason}", bypass_quota=True)
+        return jsonify({"status": "rate_limited", "reason": limit_reason}), 429
+
+    logger.info(f"✅ ALL VALIDATIONS PASSED: Processing message from {sender}")
+    
+    save_message(sender, "user", body)
+
+    intent = detect_intent(body, sender)
+    reply = ""
+    intent_type = "general"
+    
+    try:
+        if intent:
+            intent_type = intent.type
+            e = intent.entities
+            logger.info(f"🎯 INTENT DETECTED: {intent_type} with entities: {e}")
+
+            if intent_type == "cultural_query":
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Cultural query routed to general search: {search_query}")
+
+            elif intent_type == "recipe":
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Recipe intent routed to search: {search_query}")
+                
+                if e.get("food_item"):
+                    set_conversation_context(sender, "last_searched_entity", e["food_item"])
+
+            elif intent_type == "fact_check":
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Fact-check intent routed to search: {search_query}")
+                
+                if e.get("entity"):
+                    set_conversation_context(sender, "last_searched_entity", e["entity"])
+
+            elif intent_type == "follow_up":
+                entity = e.get("entity")
+                if entity:
+                    base_query = body
+                    context_entity = entity
+                    
+                    if "do they" in body.lower():
+                        search_query = f"do {context_entity} {body.lower().replace('do they', '').strip()}"
+                    elif "can they" in body.lower():
+                        search_query = f"can {context_entity} {body.lower().replace('can they', '').strip()}"
+                    elif "are they" in body.lower():
+                        search_query = f"are {context_entity} {body.lower().replace('are they', '').strip()}"
+                    else:
+                        search_query = f"{body} {context_entity}"
+                    
+                    search_query = re.sub(r'\s+', ' ', search_query).strip()
+                    
+                    reply = web_search(search_query, search_type="general")
+                    logger.info(f"Follow-up intent routed to search: '{body}' + '{context_entity}' → '{search_query}'")
+                else:
+                    reply = "What would you like to know more about? Please be specific."
+
+            elif intent_type == "restaurant":
+                search_parts = []
+                if e.get("restaurant_name"):
+                    search_parts.append(f'"{e["restaurant_name"]}"')
+                    search_parts.append("restaurant")
+                else:
+                    search_parts.append("restaurant")
+                
+                if e.get("city"):
+                    search_parts.append(f"in {e['city']}")
+                
+                search_query = " ".join(search_parts)
+                reply = web_search(search_query, search_type="local")
+
+            elif intent_type == "hours":
+                biz_name = e["biz"]
+                city = e.get("city")
+                
+                if biz_name:
+                    search_attempts = []
+                    
+                    if city:
+                        search_attempts.append(f'"{biz_name}" in {city} hours')
+                        search_attempts.append(f'"{biz_name} in {city}" hours')
+                        search_attempts.append(f'{biz_name} {city} hours')
+                        search_attempts.append(f'{biz_name} restaurant {city}')
+                    else:
+                        search_attempts.append(f'"{biz_name}" hours')
+                        search_attempts.append(f'{biz_name} restaurant hours')
+                    
+                    reply = "No results found"
+                    for i, search_query in enumerate(search_attempts):
+                        logger.info(f"Hours search attempt {i+1}: {search_query}")
+                        reply = web_search(search_query, search_type="local")
+                        
+                        if "No results found" not in reply:
+                            logger.info(f"Success with search attempt {i+1}")
+                            break
+                        else:
+                            logger.info(f"Search attempt {i+1} failed, trying next...")
+                    
+                    if "No results found" in reply and city:
+                        logger.info("All local searches failed, trying regular Google search")
+                        web_searches = [
+                            f'{biz_name} {city} hours phone',
+                            f'{biz_name} restaurant {city} hours',
+                            f'{biz_name} {city} mississippi hours'
+                        ]
+                        
+                        for i, web_query in enumerate(web_searches):
+                            logger.info(f"Web search attempt {i+1}: {web_query}")
+                            reply = web_search(web_query, search_type="general")
+                            
+                            if "No results found" not in reply:
+                                logger.info(f"Success with web search attempt {i+1}")
+                                break
+                    
+                    if "No results found" in reply:
+                        reply = f"Sorry, I couldn't find hours for {biz_name} in {city}. You might try calling them directly or checking their website/social media."
+                        
+                else:
+                    reply = "Please specify a business name for hours information."
+
+            elif intent_type == "weather":
+                query = "weather"
+                if e.get("city"):
+                    query += f" in {e['city']}"
+                if e.get("day") and e["day"] != "today":
+                    query += f" {e['day']}"
+                reply = web_search(query)
+
+            elif intent_type == "news":
+                query = e["topic"] or "news headlines"
+                reply = web_search(query, search_type="news")
+
+            else:
+                search_query = body
+                
+                if "?" in search_query:
+                    question_patterns = [
+                        (r'\bdoes\s+(.+?)\s+freeze\?', r'\1 freezing point temperature'),
+                        (r'\bwhat\s+is\s+(.+?)\?', r'\1 definition explanation'),
+                        (r'\bhow\s+to\s+(.+?)\?', r'\1 guide tutorial'),
+                        (r'\bwhy\s+does\s+(.+?)\?', r'\1 explanation reason'),
+                        (r'\bwhen\s+does\s+(.+?)\?', r'\1 timing schedule'),
+                        (r'\bwhere\s+is\s+(.+?)\?', r'\1 location')
+                    ]
+                    
+                    for pattern, replacement in question_patterns:
+                        match = re.search(pattern, search_query, re.I)
+                        if match:
+                            search_query = re.sub(pattern, replacement, search_query, flags=re.I)
+                            logger.info(f"Enhanced search query: '{body}' → '{search_query}'")
+                            break
+                
+                reply = web_search(search_query)
+
+        else:
+            logger.info(f"🤖 NO SPECIFIC INTENT: Checking if Claude can handle this directly")
+            
+            simple_question_patterns = [
+                r'\bdoes\s+\w+\s+freeze\?',
+                r'\bwhat\s+is\s+\w+\?',
+                r'\bhow\s+much\s+does\s+\w+\s+cost\?',
+                r'\bwhen\s+did\s+\w+\s+happen\?'
+            ]
+            
+            is_simple_question = any(re.search(pattern, body, re.I) for pattern in simple_question_patterns)
+            
+            if is_simple_question and len(body.split()) <= 5:
+                logger.info(f"🎯 SIMPLE QUESTION: Trying Claude first")
+                reply = ask_claude(sender, body)
+                intent_type = "claude_chat"
+                
+                generic_responses = [
+                    "let me search", "i'd recommend searching", "search for", 
+                    "i don't have", "i'm not sure", "i don't know"
+                ]
+                
+                if any(phrase in reply.lower() for phrase in generic_responses):
+                    logger.info(f"🔄 CLAUDE FALLBACK: Claude couldn't answer, trying search")
+                    search_query = body
+                    if "?" in search_query:
+                        question_patterns = [
+                            (r'\bdoes\s+(.+?)\s+freeze\?', r'\1 freezing point temperature'),
+                            (r'\bwhat\s+is\s+(.+?)\?', r'\1 definition explanation'),
+                            (r'\bhow\s+to\s+(.+?)\?', r'\1 guide tutorial'),
+                            (r'\bwhy\s+does\s+(.+?)\?', r'\1 explanation reason'),
+                        ]
+                        
+                        for pattern, replacement in question_patterns:
+                            match = re.search(pattern, search_query, re.I)
+                            if match:
+                                search_query = re.sub(pattern, replacement, search_query, flags=re.I)
+                                logger.info(f"Enhanced search query: '{body}' → '{search_query}'")
+                                break
+                    
+                    reply = web_search(search_query, search_type="general")
+                    intent_type = "enhanced_search"
+            else:
+                logger.info(f"🔍 COMPLEX QUERY: Routing to search")
+                reply = ask_claude(sender, body)
+                intent_type = "claude_chat"
+
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
+
+        response_time = int((time.time() - start_time) * 1000)
+        save_message(sender, "assistant", reply, intent_type, response_time)
+        log_usage_analytics(sender, intent_type, True, response_time)
+        
+        logger.info(f"📤 SENDING MAIN RESPONSE: {reply[:50]}...")
+        sms_result = send_sms(sender, reply)
+        
+        if quota_warning:
+            logger.info(f"📤 SENDING QUOTA WARNING: {quota_warning[:50]}...")
+            send_sms(sender, quota_warning, bypass_quota=True)
+        
+        if "error" in sms_result:
+            logger.error(f"Failed to send SMS to {sender}: {sms_result}")
+            return jsonify({"error": "SMS send failed", "details": sms_result}), 500
+        
+        logger.info(f"✅ SUCCESS: Processed {intent_type} query for {sender} in {response_time}ms")
+        return jsonify({"status": "success", "intent": intent_type, "response_time_ms": response_time}), 200
+
+    except Exception as e:
+        logger.error(f"💥 PROCESSING ERROR for {sender}: {e}", exc_info=True)
+        error_msg = "Sorry, I'm experiencing technical difficulties."
+        send_sms(sender, error_msg, bypass_quota=True)
+        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+
+@app.route("/broadcast", methods=["POST"])
+@handle_errors
+def broadcast_message():
+    api_key = request.headers.get("X-API-Key") or request.json.get("api_key")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    if not data or not data.get("message"):
+        return jsonify({"error": "Message required"}), 400
+    
+    message = data["message"]
+    bypass_quota = data.get("bypass_quota", True)
+    
+    whitelist = load_whitelist()
+    
+    if not whitelist:
+        return jsonify({"error": "No numbers in whitelist"}), 400
+    
+    results = []
+    success_count = 0
+    error_count = 0
+    
+    logger.info(f"📢 BROADCAST: Sending to {len(whitelist)} numbers: {message[:50]}...")
+    
+    for phone in whitelist:
+        try:
+            result = send_sms(phone, message, bypass_quota=bypass_quota)
+            
+            if "error" in result:
+                logger.error(f"❌ Broadcast failed for {phone}: {result}")
+                results.append({"phone": phone, "status": "error", "details": result})
+                error_count += 1
+            else:
+                logger.info(f"✅ Broadcast sent to {phone}")
+                results.append({"phone": phone, "status": "success"})
+                success_count += 1
+                
+        except Exception as e:
+            logger.error(f"💥 Broadcast exception for {phone}: {e}")
+            results.append({"phone": phone, "status": "error", "details": str(e)})
+            error_count += 1
+    
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+                VALUES (?, ?, ?, ?, ?)
+            """, ("BROADCAST", "assistant", f"Broadcast to {len(whitelist)} numbers: {message}", "broadcast", 0))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to log broadcast: {e}")
+    
+    logger.info(f"📊 BROADCAST COMPLETE: {success_count} success, {error_count} errors")
+    
+    return jsonify({
+        "status": "completed",
+        "message": message,
+        "total_recipients": len(whitelist),
+        "successful": success_count,
+        "failed": error_count,
+        "results": results
+    }), 200
+
+@app.route("/broadcast/preview", methods=["GET"])
+@handle_errors  
+def broadcast_preview():
+    api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    whitelist = load_whitelist()
+    
+    recipient_stats = []
+    for phone in whitelist:
+        stats = get_monthly_usage_stats(phone)
+        recipient_stats.append({
+            "phone": phone,
+            "current_usage": stats["current_count"],
+            "remaining": stats["remaining"],
+            "quota_exceeded": stats["quota_exceeded"]
+        })
+    
+    return jsonify({
+        "total_recipients": len(whitelist),
+        "recipients": recipient_stats,
+        "active_users": len([r for r in recipient_stats if r["current_usage"] > 0]),
+        "over_quota": len([r for r in recipient_stats if r["quota_exceeded"]])
+    }), 200
+
+@app.route("/clicksend/sync", methods=["POST"])
+@handle_errors
+def sync_to_clicksend():
+    api_key = request.headers.get("X-API-Key") or request.json.get("api_key", "")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json() or {}
+    list_name = data.get("list_name", "Hey Alex Subscribers")
+    list_id = data.get("list_id")
+    
+    result = sync_whitelist_to_clicksend(list_id=list_id, list_name=list_name)
+    
+    if "error" in result:
+        return jsonify(result), 400
+    
+    return jsonify(result), 200
+
+@app.route("/clicksend/lists", methods=["GET"])
+@handle_errors
+def get_clicksend_lists():
+    api_key = request.headers.get("X-API-Key") or request.args.get("api_key", "")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    result = get_clicksend_contact_lists()
+    
+    if "error" in result:
+        return jsonify(result), 400
+    
+    return jsonify(result), 200
+
+@app.route("/clicksend/broadcast", methods=["POST"])
+@handle_errors
+def clicksend_broadcast():
+    api_key = request.headers.get("X-API-Key") or request.json.get("api_key", "")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    if not data or not data.get("message"):
+        return jsonify({"error": "Message required"}), 400
+    
+    list_id = data.get("list_id")
+    if not list_id:
+        return jsonify({"error": "list_id required"}), 400
+    
+    message = data["message"]
+    
+    result = broadcast_via_clicksend_list(list_id, message)
+    
+    if "error" in result:
+        return jsonify(result), 400
+    
+    return jsonify(result), 200
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "Hey Alex SMS Assistant",
+        "description": "SMS assistant powered by Claude AI for staying connected without staying online",
+        "status": "running",
+        "version": APP_VERSION,
+        "changelog": CHANGELOG,
+        "monthly_limit": MONTHLY_LIMIT
+    }), 200
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM fact_check_incidents")
+            incident_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM conversation_context WHERE timestamp > datetime('now', '-1 hour')")
+            active_contexts = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM sms_delivery_log WHERE timestamp > datetime('now', '-24 hours')")
+            sms_attempts_24h = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM monthly_sms_usage WHERE period_start >= date('now', '-30 days')")
+            active_monthly_users = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM clicksend_sync_log")
+            sync_attempts = c.fetchone()[0]
+        
+        return jsonify({
+            "status": "healthy",
+            "version": APP_VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": {"connected": True, "message_count": message_count},
+            "whitelist_count": len(load_whitelist()),
+            "fact_check_incidents": incident_count,
+            "active_conversation_contexts": active_contexts,
+            "sms_attempts_24h": sms_attempts_24h,
+            "active_monthly_users": active_monthly_users,
+            "clicksend_sync_attempts": sync_attempts,
+            "monthly_limit": MONTHLY_LIMIT
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy", 
+            "error": str(e),
+            "version": APP_VERSION
+        }), 500
+
+@app.route("/usage/<phone>", methods=["GET"])
+def get_user_usage(phone):
+    usage_stats = get_monthly_usage_stats(phone)
+    return jsonify(usage_stats), 200
+
+@app.route("/clicksend-status", methods=["GET"])
+def clicksend_status():
+    account_info = check_clicksend_account()
+    
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT phone, delivery_status, message_id, timestamp
+                FROM sms_delivery_log 
+                WHERE timestamp > datetime('now', '-24 hours')
+                ORDER BY timestamp DESC
+                LIMIT 20
+            """)
+            recent_deliveries = [
+                {"phone": row[0], "status": row[1], "message_id": row[2], "timestamp": row[3]}
+                for row in c.fetchall()
+            ]
+            
+            c.execute("""
+                SELECT list_id, list_name, contacts_synced, sync_status, timestamp
+                FROM clicksend_sync_log 
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """)
+            recent_syncs = [
+                {
+                    "list_id": row[0], 
+                    "list_name": row[1], 
+                    "contacts_synced": row[2], 
+                    "sync_status": row[3], 
+                    "timestamp": row[4]
+                }
+                for row in c.fetchall()
+            ]
+            
+    except Exception as e:
+        recent_deliveries = {"error": str(e)}
+        recent_syncs = {"error": str(e)}
+    
+    return jsonify({
+        "account_info": account_info,
+        "recent_deliveries": recent_deliveries,
+        "recent_syncs": recent_syncs,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 200
+
+@app.route("/analytics", methods=["GET"])
+def analytics_dashboard():
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            c.execute("""
+                SELECT intent_type, COUNT(*) as count 
+                FROM usage_analytics 
+                WHERE timestamp > datetime('now', '-7 days')
+                GROUP BY intent_type
+                ORDER BY count DESC
+            """)
+            intent_stats = {row[0]: row[1] for row in c.fetchall()}
+            
+            c.execute("""
+                SELECT COUNT(*) as incidents
+                FROM fact_check_incidents 
+                WHERE timestamp > datetime('now', '-24 hours')
+            """)
+            recent_incidents = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT COUNT(*) as follow_ups
+                FROM usage_analytics 
+                WHERE intent_type = 'follow_up' AND timestamp > datetime('now', '-7 days')
+            """)
+            follow_up_count = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT COUNT(*) as cultural_queries
+                FROM usage_analytics 
+                WHERE intent_type = 'cultural_query' AND timestamp > datetime('now', '-7 days')
+            """)
+            cultural_count = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT COUNT(*) as recipes
+                FROM usage_analytics 
+                WHERE intent_type = 'recipe' AND timestamp > datetime('now', '-7 days')
+            """)
+            recipe_count = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT COUNT(*) as broadcasts
+                FROM usage_analytics 
+                WHERE intent_type = 'broadcast' AND timestamp > datetime('now', '-7 days')
+            """)
+            broadcast_count = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT 
+                    COUNT(*) as total_attempts,
+                    SUM(CASE WHEN delivery_status = 'SUCCESS' THEN 1 ELSE 0 END) as successful,
+                    COUNT(DISTINCT phone) as unique_recipients
+                FROM sms_delivery_log 
+                WHERE timestamp > datetime('now', '-7 days')
+            """)
+            sms_stats = c.fetchone()
+            sms_delivery_rate = {
+                "total_attempts": sms_stats[0],
+                "successful": sms_stats[1],
+                "success_rate": round((sms_stats[1] / sms_stats[0] * 100) if sms_stats[0] > 0 else 0, 2),
+                "unique_recipients": sms_stats[2]
+            }
+            
+            c.execute("""
+                SELECT 
+                    COUNT(*) as active_users,
+                    SUM(message_count) as total_messages,
+                    AVG(message_count) as avg_messages_per_user,
+                    SUM(CASE WHEN quota_exceeded = 1 THEN 1 ELSE 0 END) as users_over_quota,
+                    SUM(quota_warnings_sent) as total_warnings_sent
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+            """)
+            monthly_stats = c.fetchone()
+            monthly_usage = {
+                "active_users": monthly_stats[0],
+                "total_messages": monthly_stats[1],
+                "avg_messages_per_user": round(monthly_stats[2], 1) if monthly_stats[2] else 0,
+                "users_over_quota": monthly_stats[3],
+                "total_warnings_sent": monthly_stats[4],
+                "monthly_limit": MONTHLY_LIMIT
+            }
+            
+            c.execute("""
+                SELECT phone, message_count, quota_exceeded, quota_warnings_sent
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                ORDER BY message_count DESC
+                LIMIT 10
+            """)
+            top_users = [
+                {
+                    "phone": row[0],
+                    "message_count": row[1], 
+                    "quota_exceeded": bool(row[2]),
+                    "warnings_sent": row[3]
+                }
+                for row in c.fetchall()
+            ]
+            
+            c.execute("""
+                SELECT COUNT(DISTINCT phone) as new_users
+                FROM messages 
+                WHERE content LIKE '%think of me as your personal research assistant%'
+                AND timestamp > datetime('now', '-7 days')
+            """)
+            new_users = c.fetchone()[0]
+            
+            c.execute("""
+                SELECT 
+                    COUNT(*) as total_syncs,
+                    SUM(contacts_synced) as total_contacts_synced,
+                    COUNT(CASE WHEN sync_status = 'success' THEN 1 END) as successful_syncs
+                FROM clicksend_sync_log 
+                WHERE timestamp > datetime('now', '-7 days')
+            """)
+            sync_stats = c.fetchone()
+            clicksend_sync = {
+                "total_syncs": sync_stats[0],
+                "total_contacts_synced": sync_stats[1] or 0,
+                "successful_syncs": sync_stats[2],
+                "success_rate": round((sync_stats[2] / sync_stats[0] * 100) if sync_stats[0] > 0 else 0, 2)
+            }
+            
+            return jsonify({
+                "version": APP_VERSION,
+                "intent_breakdown_7d": intent_stats,
+                "fact_check_incidents_24h": recent_incidents,
+                "follow_up_queries_7d": follow_up_count,
+                "cultural_queries_7d": cultural_count,
+                "recipe_queries_7d": recipe_count,
+                "broadcast_count_7d": broadcast_count,
+                "sms_delivery_stats_7d": sms_delivery_rate,
+                "monthly_usage_stats": monthly_usage,
+                "top_users_current_month": top_users,
+                "new_users_7d": new_users,
+                "clicksend_sync_stats_7d": clicksend_sync,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/monthly-usage-report", methods=["GET"])
+def monthly_usage_report():
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            c.execute("""
+                SELECT 
+                    phone,
+                    message_count,
+                    period_start,
+                    period_end,
+                    quota_warnings_sent,
+                    quota_exceeded,
+                    last_message_date
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                ORDER BY message_count DESC
+            """)
+            
+            users = []
+            for row in c.fetchall():
+                phone, count, start, end, warnings, exceeded, last_msg = row
+                users.append({
+                    "phone": phone,
+                    "message_count": count,
+                    "remaining": max(0, MONTHLY_LIMIT - count),
+                    "usage_percentage": round((count / MONTHLY_LIMIT) * 100, 1),
+                    "period_start": start,
+                    "period_end": end,
+                    "quota_warnings_sent": warnings,
+                    "quota_exceeded": bool(exceeded),
+                    "last_message_date": last_msg,
+                    "days_remaining": (datetime.strptime(end, '%Y-%m-%d').date() - datetime.now(timezone.utc).date()).days
+                })
+            
+            c.execute("""
+                SELECT 
+                    CASE 
+                        WHEN message_count <= 50 THEN '0-50'
+                        WHEN message_count <= 100 THEN '51-100'
+                        WHEN message_count <= 150 THEN '101-150'
+                        WHEN message_count <= 200 THEN '151-200'
+                        WHEN message_count <= 250 THEN '201-250'
+                        WHEN message_count <= 300 THEN '251-300'
+                        ELSE '300+'
+                    END as usage_bracket,
+                    COUNT(*) as user_count
+                FROM monthly_sms_usage 
+                WHERE period_start >= date('now', '-30 days')
+                GROUP BY usage_bracket
+                ORDER BY usage_bracket
+            """)
+            
+            usage_distribution = {row[0]: row[1] for row in c.fetchall()}
+            
+            return jsonify({
+                "report_date": datetime.now(timezone.utc).isoformat(),
+                "monthly_limit": MONTHLY_LIMIT,
+                "total_users": len(users),
+                "users": users,
+                "usage_distribution": usage_distribution,
+                "summary": {
+                    "users_over_quota": sum(1 for u in users if u["quota_exceeded"]),
+                    "users_near_quota": sum(1 for u in users if u["message_count"] >= 250 and not u["quota_exceeded"]),
+                    "total_messages_sent": sum(u["message_count"] for u in users),
+                    "avg_usage_percentage": round(sum(u["usage_percentage"] for u in users) / len(users), 1) if users else 0
+                }
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+port = int(os.getenv("PORT", 5000))
+
+if __name__ == "__main__":
+    logger.info("🔥 STARTING HEY ALEX SMS ASSISTANT v{} 🔥".format(APP_VERSION))
+    logger.info("📱 Helping people stay connected without staying online")
+    logger.info(f"Whitelist: {len(WHITELIST)} numbers")
+    logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"📊 Monthly SMS Limit: {MONTHLY_LIMIT} messages per 30 days")
+    logger.info(f"🔍 Enhanced Intent Detection: Cultural queries, Restaurant filtering, SMS debugging")
+    logger.info(f"📈 Enhanced Analytics: Delivery tracking, Cultural query monitoring, Monthly usage tracking")
+    logger.info(f"📋 NEW: ClickSend contact list sync and broadcasting capabilities")
+    
+    if os.getenv("RENDER") or os.getenv("PRODUCTION"):
+        logger.info("🚀 PRODUCTION MODE DETECTED 🚀")
+        logger.info("Use: gunicorn -c gunicorn_config.py app:app")
+        logger.info("This message appears because you're running app.py directly.")
+        logger.info("In production, Render should use the gunicorn command instead.")
+        app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+    else:
+        logger.info("🔧 DEVELOPMENT MODE")
+        app.run(debug=True, host="0.0.0.0", port=port)
