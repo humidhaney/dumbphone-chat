@@ -815,9 +815,47 @@ def web_search(q, num=3, search_type="general"):
         else:
             logger.warning(f"No local results found. Available keys: {list(data.keys())}")
     
-    # Handle regular search results
+    # Handle regular search results with quality filtering
     org = data.get("organic_results", [])
     if org:
+        # Try to find the best quality result
+        for result in org[:3]:  # Check top 3 results
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            source = result.get("source", "")
+            
+            # Skip low-quality sources
+            low_quality_indicators = [
+                'reddit.com/r/', 'yahoo.answers', 'quora.com', 
+                'answers.com', 'ask.com', '/forums/', 
+                'discussion', 'forum', 'thread'
+            ]
+            
+            # Skip if source looks low quality
+            if any(indicator in source.lower() or indicator in title.lower() 
+                   for indicator in low_quality_indicators):
+                logger.info(f"Skipping low-quality source: {source}")
+                continue
+            
+            # Skip if snippet looks like forum content
+            forum_indicators = [
+                'r/', 'subreddit', 'posted by', 'forum', 'discussion',
+                'thread', 'reply', 'comment', 'user:', 'member since'
+            ]
+            
+            if any(indicator in snippet.lower() for indicator in forum_indicators):
+                logger.info(f"Skipping forum-like content: {snippet[:50]}...")
+                continue
+            
+            # This looks like a good result
+            result_text = f"{title}"
+            if snippet:
+                result_text += f" — {snippet}"
+            
+            logger.info(f"Selected quality result from: {source}")
+            return result_text[:320]
+        
+        # If no quality results found, use the first one anyway
         top = org[0]
         title = top.get("title", "")
         snippet = top.get("snippet", "")
@@ -1452,12 +1490,81 @@ def sms_webhook():
                 reply = web_search(query, search_type="news")
 
             else:
-                reply = web_search(body)
+                # For general queries, improve search query formation
+                search_query = body
+                
+                # Enhance search queries for better results
+                if "?" in search_query:
+                    # Convert questions to better search terms
+                    question_patterns = [
+                        (r'\bdoes\s+(.+?)\s+freeze\?', r'\1 freezing point temperature'),
+                        (r'\bwhat\s+is\s+(.+?)\?', r'\1 definition explanation'),
+                        (r'\bhow\s+to\s+(.+?)\?', r'\1 guide tutorial'),
+                        (r'\bwhy\s+does\s+(.+?)\?', r'\1 explanation reason'),
+                        (r'\bwhen\s+does\s+(.+?)\?', r'\1 timing schedule'),
+                        (r'\bwhere\s+is\s+(.+?)\?', r'\1 location')
+                    ]
+                    
+                    for pattern, replacement in question_patterns:
+                        match = re.search(pattern, search_query, re.I)
+                        if match:
+                            search_query = re.sub(pattern, replacement, search_query, flags=re.I)
+                            logger.info(f"Enhanced search query: '{body}' → '{search_query}'")
+                            break
+                
+                reply = web_search(search_query)
 
         else:
-            logger.info(f"🤖 NO SPECIFIC INTENT: Routing to Claude chat")
-            reply = ask_claude(sender, body)
-            intent_type = "claude_chat"
+            logger.info(f"🤖 NO SPECIFIC INTENT: Checking if Claude can handle this directly")
+            
+            # For simple factual questions, try Claude first before search
+            simple_question_patterns = [
+                r'\bdoes\s+\w+\s+freeze\?',
+                r'\bwhat\s+is\s+\w+\?',
+                r'\bhow\s+much\s+does\s+\w+\s+cost\?',
+                r'\bwhen\s+did\s+\w+\s+happen\?'
+            ]
+            
+            is_simple_question = any(re.search(pattern, body, re.I) for pattern in simple_question_patterns)
+            
+            if is_simple_question and len(body.split()) <= 5:
+                # Try Claude first for simple questions
+                logger.info(f"🎯 SIMPLE QUESTION: Trying Claude first")
+                reply = ask_claude(sender, body)
+                intent_type = "claude_chat"
+                
+                # If Claude gives a generic "I don't know" response, fall back to search
+                generic_responses = [
+                    "let me search", "i'd recommend searching", "search for", 
+                    "i don't have", "i'm not sure", "i don't know"
+                ]
+                
+                if any(phrase in reply.lower() for phrase in generic_responses):
+                    logger.info(f"🔄 CLAUDE FALLBACK: Claude couldn't answer, trying search")
+                    # Enhanced search query for better results
+                    search_query = body
+                    if "?" in search_query:
+                        question_patterns = [
+                            (r'\bdoes\s+(.+?)\s+freeze\?', r'\1 freezing point temperature'),
+                            (r'\bwhat\s+is\s+(.+?)\?', r'\1 definition explanation'),
+                            (r'\bhow\s+to\s+(.+?)\?', r'\1 guide tutorial'),
+                            (r'\bwhy\s+does\s+(.+?)\?', r'\1 explanation reason'),
+                        ]
+                        
+                        for pattern, replacement in question_patterns:
+                            match = re.search(pattern, search_query, re.I)
+                            if match:
+                                search_query = re.sub(pattern, replacement, search_query, flags=re.I)
+                                logger.info(f"Enhanced search query: '{body}' → '{search_query}'")
+                                break
+                    
+                    reply = web_search(search_query, search_type="general")
+                    intent_type = "enhanced_search"
+            else:
+                # For complex queries, go straight to search
+                logger.info(f"🔍 COMPLEX QUERY: Routing to search")
+                reply = ask_claude(sender, body)
+                intent_type = "claude_chat"
 
         if len(reply) > 300:
             reply = reply[:297] + "..."
