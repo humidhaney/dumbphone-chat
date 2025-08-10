@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 CHANGELOG = {
+    "1.4": "Fixed search capability claims - Claude now properly routes searches instead of denying search ability",
     "1.3": "Updated welcome message with personality and clear examples, ready for testing",
     "1.2": "Fixed search follow-ups, enhanced context awareness, prevented search promise loops",
     "1.1": "Enhanced fact-checking, fixed intent detection order, improved Claude context isolation",
@@ -713,7 +714,10 @@ def detect_follow_up_intent(text: str, phone: str) -> Optional[IntentResult]:
         r'\bwhat\s+else\b',
         r'\bother\s+(details|info)\b',
         r'\bcontinue\b',
-        r'\bgo\s+on\b'
+        r'\bgo\s+on\b',
+        r'\band\?\s*$',  # NEW: Catch "And?" questions
+        r'\bsteps?\b',   # NEW: Catch recipe/tutorial requests
+        r'\bfull\b.*\b(recipe|instructions)\b'  # NEW: Full recipe requests
     ]
     
     if any(re.search(pattern, text, re.I) for pattern in follow_up_patterns):
@@ -730,12 +734,46 @@ def detect_follow_up_intent(text: str, phone: str) -> Optional[IntentResult]:
     
     return None
 
-# Detector order - FIXED: Weather before Restaurant, added fact-check and follow-up
+def detect_recipe_intent(text: str) -> Optional[IntentResult]:
+    """Detect recipe and how-to questions that should be searched"""
+    recipe_patterns = [
+        r'\bhow\s+to\s+make\b',
+        r'\bhow\s+do\s+you\s+make\b',
+        r'\brecipe\s+for\b',
+        r'\bmake\s+.+\s+(in|at|with)\b',
+        r'\bhow\s+to\s+(cook|bake|prepare)\b',
+        r'\bsteps\s+to\s+make\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in recipe_patterns):
+        # Extract what they want to make
+        food_item = None
+        patterns = [
+            r'how\s+to\s+make\s+(.+?)(?:\s+in|\s+at|\s+with|\?|$)',
+            r'recipe\s+for\s+(.+?)(?:\?|$)',
+            r'make\s+(.+?)\s+(?:in|at|with)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                food_item = match.group(1).strip()
+                break
+        
+        return IntentResult("recipe", {
+            "query": text,
+            "food_item": food_item,
+            "requires_search": True
+        })
+    return None
+
+# Detector order - FIXED: Weather before Restaurant, added recipe intent
 DET_ORDER = [
     detect_hours_intent,
     detect_weather_intent,    # Moved up to check weather first
-    detect_follow_up_intent,  # NEW: Catch follow-up questions before fact-check
-    detect_fact_check_intent, # NEW: Catch factual queries before Claude chat
+    detect_recipe_intent,     # NEW: Catch recipe questions before follow-up
+    detect_follow_up_intent,  # Catch follow-up questions before fact-check
+    detect_fact_check_intent, # Catch factual queries before Claude chat
     detect_restaurant_intent, # Moved down - now uses word boundaries
     detect_news_intent,
 ]
@@ -759,21 +797,21 @@ def ask_claude(phone, user_msg):
         return "Hi! I'm Alex, your SMS assistant. AI responses are unavailable right now, but I can help you search for info!"
     
     try:
-        history = load_history(phone, limit=4)  # Reduced from 6 to 4
+        history = load_history(phone, limit=4)
         
-        # ENHANCED system context with fact-checking guidance and NO search promises
+        # CORRECTED system context - Alex CAN search and should route appropriately
         system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
 - Keep responses under 160 characters when possible for SMS
 - Be friendly and helpful
-- NEVER say "Let me search" or promise to search - you cannot actually search
-- If asked about specific people, companies, or factual information, respond with "I'd recommend searching for [topic] to get the most current info"
-- Never make up connections between people or businesses
-- If you don't know something for certain, admit it rather than guessing
-- For questions about founders, CEOs, or business relationships, suggest the user search for it themselves
+- You DO have access to web search capabilities through your routing system
+- For specific information requests (recipes, current info, business details), suggest that you can search for that information
+- If someone asks for detailed information that would benefit from a search, respond with "Let me search for [specific topic]" 
+- Never make up detailed information - always offer to search for accurate, current details
+- Be honest about your capabilities - you can search for current information
 
-Be conversational but accurate. Never promise actions you cannot perform."""
+You are a helpful assistant with search capabilities. Be conversational and helpful."""
         
         # Make direct HTTP request to Anthropic API
         try:
@@ -784,7 +822,7 @@ Be conversational but accurate. Never promise actions you cannot perform."""
             }
             
             messages = []
-            for msg in history[-3:]:  # Further reduced to prevent contamination
+            for msg in history[-3:]:
                 messages.append({
                     "role": msg["role"],
                     "content": msg["content"]
@@ -797,7 +835,7 @@ Be conversational but accurate. Never promise actions you cannot perform."""
             data = {
                 "model": "claude-3-haiku-20240307",
                 "max_tokens": 150,
-                "temperature": 0.2,  # Lowered from 0.7 to 0.2 for more factual accuracy
+                "temperature": 0.3,  # Slightly higher for more natural responses
                 "system": system_context,
                 "messages": messages
             }
@@ -821,19 +859,21 @@ Be conversational but accurate. Never promise actions you cannot perform."""
         if not reply:
             return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
         
-        # Check for search promises that should be blocked
-        search_promise_patterns = [
-            r'let me search',
-            r'i\'ll search',
-            r'give me a moment',
-            r'look that up'
+        # Check if Claude suggests searching - and if so, route to actual search
+        search_suggestion_patterns = [
+            r'let me search for (.+?)(?:\.|$)',
+            r'i can search for (.+?)(?:\.|$)',
+            r'search for (.+?)(?:\.|$)'
         ]
         
-        if any(re.search(pattern, reply, re.I) for pattern in search_promise_patterns):
-            logger.warning(f"Blocked search promise in Claude response: {reply}")
-            log_fact_check_incident(phone, user_msg, reply, "search_promise_blocked")
-            # Override with honest response
-            reply = "I'd recommend searching for that to get the most current info. I can't actually perform searches myself."
+        for pattern in search_suggestion_patterns:
+            match = re.search(pattern, reply, re.I)
+            if match:
+                search_term = match.group(1).strip()
+                logger.info(f"Claude suggested search for: {search_term}, executing actual search")
+                # Route to actual search instead of just suggesting
+                search_result = web_search(search_term, search_type="general")
+                return search_result
         
         if len(reply) > 320:
             reply = reply[:317] + "..."
@@ -910,7 +950,17 @@ def sms_webhook():
             intent_type = intent.type
             e = intent.entities
 
-            if intent_type == "fact_check":
+            if intent_type == "recipe":
+                # Route recipe queries to search instead of Claude
+                search_query = e.get("query", body)
+                reply = web_search(search_query, search_type="general")
+                logger.info(f"Recipe intent routed to search: {search_query}")
+                
+                # Store the food item for follow-up questions
+                if e.get("food_item"):
+                    set_conversation_context(sender, "last_searched_entity", e["food_item"])
+
+            elif intent_type == "fact_check":
                 # Route factual queries to search instead of Claude
                 search_query = e.get("query", body)
                 reply = web_search(search_query, search_type="general")
@@ -1114,6 +1164,14 @@ def analytics_dashboard():
             """)
             follow_up_count = c.fetchone()[0]
             
+            # Get recipe query count
+            c.execute("""
+                SELECT COUNT(*) as recipes
+                FROM usage_analytics 
+                WHERE intent_type = 'recipe' AND timestamp > datetime('now', '-7 days')
+            """)
+            recipe_count = c.fetchone()[0]
+            
             # Get new user count (first-time welcome messages)
             c.execute("""
                 SELECT COUNT(DISTINCT phone) as new_users
@@ -1128,6 +1186,7 @@ def analytics_dashboard():
                 "intent_breakdown_7d": intent_stats,
                 "fact_check_incidents_24h": recent_incidents,
                 "follow_up_queries_7d": follow_up_count,
+                "recipe_queries_7d": recipe_count,
                 "new_users_7d": new_users,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }), 200
@@ -1143,7 +1202,7 @@ if __name__ == "__main__":
     logger.info("📱 Helping people stay connected without staying online")
     logger.info(f"Whitelist: {len(WHITELIST)} numbers")
     logger.info(f"Version {APP_VERSION}: {CHANGELOG[APP_VERSION]}")
-    logger.info(f"New Welcome Message: {WELCOME_MSG[:100]}...")
+    logger.info(f"🔍 Search capabilities: ENABLED and properly routed")
     
     if os.getenv("RENDER"):
         logger.info("🚀 RUNNING HEY ALEX IN PRODUCTION 🚀")
