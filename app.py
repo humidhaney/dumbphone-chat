@@ -449,7 +449,10 @@ class ContentFilter:
         text_lower = text.lower()
         for category, keywords in self.spam_keywords.items():
             for keyword in keywords:
-                if keyword in text_lower:
+                # FIX: Use word boundaries to prevent "free" matching "freeze"
+                import re
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+                if re.search(pattern, text_lower):
                     return True, f"Spam detected: {category}"
         return False, ""
     
