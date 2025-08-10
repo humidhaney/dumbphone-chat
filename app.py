@@ -442,6 +442,217 @@ def get_monthly_usage_stats(phone):
 
 init_db()
 
+# Daily Cost Tracking Configuration
+DAILY_COSTS_FILE = "daily_costs.csv"
+DAILY_COSTS_DB_TABLE = "daily_cost_summary"
+
+def ensure_daily_costs_file():
+    """Create CSV file with headers if it doesn't exist"""
+    if not os.path.exists(DAILY_COSTS_FILE):
+        with open(DAILY_COSTS_FILE, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Date', 'Total_Messages', 'Total_Users', 'Total_Cost', 'Avg_Cost_Per_Message', 'Avg_Cost_Per_User'])
+        logger.info(f"📊 Created daily costs tracking file: {DAILY_COSTS_FILE}")
+
+def init_daily_costs_table():
+    """Create database table for daily cost summaries"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_cost_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date DATE UNIQUE NOT NULL,
+            total_messages INTEGER DEFAULT 0,
+            total_users INTEGER DEFAULT 0,
+            total_cost REAL DEFAULT 0.0,
+            avg_cost_per_message REAL DEFAULT 0.0,
+            avg_cost_per_user REAL DEFAULT 0.0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_daily_cost_date 
+        ON daily_cost_summary(date DESC);
+        """)
+        
+        conn.commit()
+        logger.info("✅ Daily cost summary table initialized")
+
+def calculate_daily_totals(target_date=None):
+    """Calculate daily totals for a specific date (defaults to yesterday)"""
+    if target_date is None:
+        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        
+        # Get daily SMS statistics
+        c.execute("""
+            SELECT 
+                COUNT(*) as total_messages,
+                COUNT(DISTINCT phone) as total_users,
+                COALESCE(SUM(message_price), 0) as total_cost,
+                COALESCE(AVG(message_price), 0) as avg_cost_per_message
+            FROM sms_delivery_log 
+            WHERE DATE(timestamp) = ?
+            AND delivery_status = 'SUCCESS'
+            AND message_price > 0
+        """, (target_date,))
+        
+        result = c.fetchone()
+        
+        if result and result[0] > 0:  # If we have messages for this day
+            total_messages, total_users, total_cost, avg_cost_per_message = result
+            avg_cost_per_user = total_cost / total_users if total_users > 0 else 0
+            
+            return {
+                'date': target_date,
+                'total_messages': total_messages,
+                'total_users': total_users,
+                'total_cost': round(total_cost, 4),
+                'avg_cost_per_message': round(avg_cost_per_message, 4),
+                'avg_cost_per_user': round(avg_cost_per_user, 4)
+            }
+        else:
+            return None
+
+def save_daily_summary(daily_data):
+    """Save daily summary to both CSV and database"""
+    if not daily_data:
+        return False
+    
+    # Save to CSV
+    ensure_daily_costs_file()
+    
+    # Check if date already exists in CSV
+    existing_dates = set()
+    try:
+        with open(DAILY_COSTS_FILE, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            existing_dates = {row['Date'] for row in reader}
+    except FileNotFoundError:
+        pass
+    
+    date_str = daily_data['date'].isoformat()
+    
+    if date_str not in existing_dates:
+        with open(DAILY_COSTS_FILE, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                date_str,
+                daily_data['total_messages'],
+                daily_data['total_users'],
+                daily_data['total_cost'],
+                daily_data['avg_cost_per_message'],
+                daily_data['avg_cost_per_user']
+            ])
+        logger.info(f"📊 Saved daily summary to CSV: {date_str}")
+    
+    # Save to database
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO daily_cost_summary 
+            (date, total_messages, total_users, total_cost, avg_cost_per_message, avg_cost_per_user, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            daily_data['date'],
+            daily_data['total_messages'],
+            daily_data['total_users'],
+            daily_data['total_cost'],
+            daily_data['avg_cost_per_message'],
+            daily_data['avg_cost_per_user']
+        ))
+        conn.commit()
+        logger.info(f"📊 Saved daily summary to database: {date_str}")
+    
+    return True
+
+def generate_daily_summaries_backfill():
+    """Generate daily summaries for all past dates with SMS data"""
+    logger.info("🔄 Generating historical daily summaries...")
+    
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        
+        # Get all unique dates with SMS data
+        c.execute("""
+            SELECT DISTINCT DATE(timestamp) as date
+            FROM sms_delivery_log 
+            WHERE delivery_status = 'SUCCESS'
+            AND message_price > 0
+            ORDER BY date
+        """)
+        
+        dates = [datetime.strptime(row[0], '%Y-%m-%d').date() for row in c.fetchall()]
+        
+        processed = 0
+        for date in dates:
+            daily_data = calculate_daily_totals(date)
+            if daily_data:
+                save_daily_summary(daily_data)
+                processed += 1
+        
+        logger.info(f"✅ Processed {processed} daily summaries")
+        return processed
+
+def get_cost_trends(days=30):
+    """Get cost trends for the last N days"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT date, total_messages, total_users, total_cost, avg_cost_per_message, avg_cost_per_user
+            FROM daily_cost_summary 
+            WHERE date >= date('now', '-{} days')
+            ORDER BY date DESC
+        """.format(days))
+        
+        return [
+            {
+                'date': row[0],
+                'total_messages': row[1],
+                'total_users': row[2],
+                'total_cost': row[3],
+                'avg_cost_per_message': row[4],
+                'avg_cost_per_user': row[5]
+            }
+            for row in c.fetchall()
+        ]
+
+def daily_summary_cron_job():
+    """Cron job function to run daily summary calculation"""
+    logger.info("🕐 Running daily summary cron job...")
+    
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    daily_data = calculate_daily_totals(yesterday)
+    
+    if daily_data:
+        save_daily_summary(daily_data)
+        logger.info(f"✅ Daily summary completed for {yesterday}")
+        return True
+    else:
+        logger.info(f"ℹ️  No SMS data found for {yesterday}")
+        return False
+
+def initialize_cost_tracking():
+    """Initialize all cost tracking components"""
+    ensure_daily_costs_file()
+    init_daily_costs_table()
+    
+    # Update existing sms_delivery_log table to include cost columns
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        try:
+            c.execute("ALTER TABLE sms_delivery_log ADD COLUMN message_price REAL DEFAULT 0")
+            c.execute("ALTER TABLE sms_delivery_log ADD COLUMN total_price REAL DEFAULT 0")
+            logger.info("✅ Added cost columns to sms_delivery_log")
+        except sqlite3.OperationalError:
+            logger.info("✅ Cost columns already exist in sms_delivery_log")
+        
+        conn.commit()
+
 class ContentFilter:
     def __init__(self):
         # Actual promotional/spam keywords - much more specific
@@ -652,7 +863,6 @@ def send_sms(to_number, message, bypass_quota=False):
         result = resp.json()
         
         logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
-        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
         
         if resp.status_code == 200:
             if "data" in result and "messages" in result["data"]:
@@ -660,12 +870,31 @@ def send_sms(to_number, message, bypass_quota=False):
                 if messages:
                     msg_status = messages[0].get("status")
                     msg_id = messages[0].get("message_id")
-                    msg_price = messages[0].get("message_price")
+                    msg_price = float(messages[0].get("message_price", 0))
+                    total_price = float(messages[0].get("total_price", 0))
                     
                     logger.info(f"✅ SMS queued successfully to {to_number}")
-                    logger.info(f"📊 Message ID: {msg_id}, Status: {msg_status}, Price: {msg_price}")
+                    logger.info(f"📊 Message ID: {msg_id}, Status: {msg_status}")
+                    logger.info(f"💰 Cost: ${msg_price:.4f} (Total: ${total_price:.4f})")
                     
-                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
+                    # Enhanced logging with cost data
+                    with closing(sqlite3.connect(DB_PATH)) as conn:
+                        c = conn.cursor()
+                        c.execute("""
+                            INSERT INTO sms_delivery_log (
+                                phone, message_content, clicksend_response, delivery_status, 
+                                message_id, message_price, total_price, timestamp
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (
+                            to_number, 
+                            message, 
+                            json.dumps(result), 
+                            msg_status, 
+                            msg_id,
+                            msg_price,
+                            total_price
+                        ))
+                        conn.commit()
                     
                     if not bypass_quota:
                         track_monthly_sms_usage(to_number, is_outgoing=True)
@@ -674,16 +903,19 @@ def send_sms(to_number, message, bypass_quota=False):
                         logger.warning(f"⚠️  SMS Status Warning: {msg_status} for {to_number}")
                 else:
                     logger.warning(f"⚠️  No message data in ClickSend response for {to_number}")
+                    # Legacy log_sms_delivery call for compatibility
                     log_sms_delivery(to_number, message, result, "NO_MESSAGE_DATA", None)
             
             return result
         else:
             logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
+            # Legacy log_sms_delivery call for compatibility
             log_sms_delivery(to_number, message, result, f"API_ERROR_{resp.status_code}", None)
             return {"error": f"ClickSend API error: {resp.status_code}"}
             
     except Exception as e:
         logger.error(f"💥 SMS Exception for {to_number}: {e}")
+        # Legacy log_sms_delivery call for compatibility
         log_sms_delivery(to_number, message, {"error": str(e)}, "EXCEPTION", None)
         return {"error": f"SMS send failed: {str(e)}"}
 
@@ -1955,6 +2187,80 @@ def clicksend_broadcast():
     
     return jsonify(result), 200
 
+@app.route("/daily-costs", methods=["GET"])
+@handle_errors
+def daily_costs_endpoint():
+    """API endpoint to view daily cost data"""
+    days = int(request.args.get('days', 30))
+    format_type = request.args.get('format', 'json')  # json or csv
+    
+    trends = get_cost_trends(days)
+    
+    if format_type == 'csv':
+        # Return CSV download
+        def generate_csv():
+            yield 'Date,Total_Messages,Total_Users,Total_Cost,Avg_Cost_Per_Message,Avg_Cost_Per_User\n'
+            for row in trends:
+                yield f"{row['date']},{row['total_messages']},{row['total_users']},{row['total_cost']},{row['avg_cost_per_message']},{row['avg_cost_per_user']}\n"
+        
+        return app.response_class(
+            generate_csv(),
+            mimetype='text/csv',
+            headers={"Content-Disposition": f"attachment; filename=daily_costs_{days}days.csv"}
+        )
+    
+    # Calculate summary statistics
+    if trends:
+        total_cost = sum(day['total_cost'] for day in trends)
+        total_messages = sum(day['total_messages'] for day in trends)
+        unique_users = len(set(day['total_users'] for day in trends if day['total_users'] > 0))
+        avg_daily_cost = total_cost / len(trends) if trends else 0
+        avg_cost_per_msg = total_cost / total_messages if total_messages > 0 else 0
+        
+        summary = {
+            'period_days': days,
+            'total_cost': round(total_cost, 4),
+            'total_messages': total_messages,
+            'peak_users': max((day['total_users'] for day in trends), default=0),
+            'avg_daily_cost': round(avg_daily_cost, 4),
+            'avg_cost_per_message': round(avg_cost_per_msg, 4),
+            'projection_monthly': round(avg_daily_cost * 30, 2)
+        }
+    else:
+        summary = {
+            'period_days': days,
+            'total_cost': 0,
+            'total_messages': 0,
+            'peak_users': 0,
+            'avg_daily_cost': 0,
+            'avg_cost_per_message': 0,
+            'projection_monthly': 0
+        }
+    
+    return jsonify({
+        'summary': summary,
+        'daily_data': trends,
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }), 200
+
+@app.route("/generate-daily-summaries", methods=["POST"])
+@handle_errors  
+def generate_summaries_endpoint():
+    """API endpoint to generate daily summaries"""
+    api_key = request.headers.get("X-API-Key") or request.json.get("api_key", "")
+    expected_key = os.getenv("BROADCAST_API_KEY", "your-secret-key-here")
+    
+    if api_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    processed = generate_daily_summaries_backfill()
+    
+    return jsonify({
+        "status": "completed",
+        "processed_days": processed,
+        "message": f"Generated daily summaries for {processed} days"
+    }), 200
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
@@ -2292,6 +2598,14 @@ if __name__ == "__main__":
     logger.info(f"🔍 Enhanced Intent Detection: Cultural queries, Restaurant filtering, SMS debugging")
     logger.info(f"📈 Enhanced Analytics: Delivery tracking, Cultural query monitoring, Monthly usage tracking")
     logger.info(f"📋 NEW: ClickSend contact list sync and broadcasting capabilities")
+    
+    # Initialize cost tracking
+    initialize_cost_tracking()
+    logger.info("📊 Daily cost tracking initialized")
+    logger.info("🔗 New endpoints available:")
+    logger.info("   GET  /daily-costs?days=30&format=json")
+    logger.info("   GET  /daily-costs?format=csv")  
+    logger.info("   POST /generate-daily-summaries")
     
     if os.getenv("RENDER") or os.getenv("PRODUCTION"):
         logger.info("🚀 PRODUCTION MODE DETECTED 🚀")
