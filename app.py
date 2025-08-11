@@ -948,11 +948,368 @@ def init_db():
         
         conn.commit()
 
-# === Basic SMS Webhook (placeholder) ===
+# === Content Filter ===
+class ContentFilter:
+    def __init__(self):
+        # Actual promotional/spam keywords - much more specific
+        self.spam_keywords = {
+            'promotional': [
+                'free money', 'win cash', 'winner selected', 'claim prize', 
+                'congratulations you won', 'act now', 'limited time offer',
+                'click here to claim', 'urgent response required'
+            ],
+            'suspicious': [
+                'send bitcoin', 'crypto investment', 'guaranteed returns',
+                'double your money', 'wire transfer', 'western union'
+            ],
+            'inappropriate': [
+                'adult content', 'dating site', 'hookup tonight',
+                'xxx', 'porn', 'sexy singles'
+            ],
+            'phishing': [
+                'verify your account now', 'account suspended click',
+                'confirm identity', 'update payment info',
+                'account will be closed'
+            ]
+        }
+        
+        # Whitelist for legitimate questions that might trigger false positives
+        self.question_patterns = [
+            r'\b(what|who|when|where|why|how|do|does|is|are|can|will|would|should)\b.*\?',
+            r'\b(free will|philosophy|philosophical|ethics|moral|meaning)\b',
+            r'\b(illusion|reality|consciousness|existence|purpose)\b'
+        ]
+    
+    def is_spam(self, text: str) -> tuple[bool, str]:
+        text_lower = text.lower().strip()
+        
+        # First check if it's a legitimate question
+        for pattern in self.question_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                logger.info(f"Legitimate question pattern detected: {pattern}")
+                return False, ""
+        
+        # Check for actual spam - require exact phrase matches or clear promotional language
+        for category, keywords in self.spam_keywords.items():
+            for keyword in keywords:
+                # Use word boundaries and require more context for single words
+                if len(keyword.split()) == 1:
+                    # Single words need to be part of clearly promotional context
+                    pattern = r'\b' + re.escape(keyword) + r'\b.*\b(now|today|click|call|text)\b'
+                    if re.search(pattern, text_lower):
+                        return True, f"Spam detected: {category}"
+                else:
+                    # Multi-word phrases can be direct matches
+                    if keyword in text_lower:
+                        return True, f"Spam detected: {category}"
+        
+        # Additional check for obvious promotional patterns
+        promotional_patterns = [
+            r'\b(free|win|winner)\b.*\b(money|cash|prize|gift)\b.*\b(now|today|claim)\b',
+            r'\bcongratulations\b.*\b(won|selected|winner)\b.*\b(claim|call|text)\b',
+            r'\b(urgent|immediate)\b.*\b(action|response)\b.*\b(required|needed)\b'
+        ]
+        
+        for pattern in promotional_patterns:
+            if re.search(pattern, text_lower):
+                return True, "Spam detected: promotional pattern"
+        
+        return False, ""
+    
+    def is_valid_query(self, text: str) -> tuple[bool, str]:
+        text = text.strip()
+        if len(text) < 2:
+            return False, "Query too short"
+        if len(text) > 500:
+            return False, "Query too long"
+        
+        # Allow common short messages
+        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks', 'stop', 'start']
+        if text.lower() in short_allowed:
+            return True, ""
+        
+        # Check for spam
+        is_spam, spam_reason = self.is_spam(text)
+        if is_spam:
+            return False, spam_reason
+        
+        return True, ""
+
+content_filter = ContentFilter()
+
+# === Intent Detection ===
+@dataclass
+class IntentResult:
+    type: str
+    entities: Dict[str, Any]
+    confidence: float = 1.0
+
+def _extract_city(text: str) -> Optional[str]:
+    patterns = [
+        r"\bin\s+([A-Z][\w''\-]*(?:\s+[A-Z][\w''\-]*){0,4})",
+        r"\bnear\s+([A-Z][\w''\-]*(?:\s+[A-Z][\w''\-]*){0,4})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def _extract_day(text: str) -> Optional[str]:
+    t = text.lower()
+    if "today" in t: return "today"
+    if "tomorrow" in t: return "tomorrow"
+    for name in calendar.day_name:
+        if name.lower() in t:
+            return name
+    return None
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    weather_patterns = [
+        r'\bweather\b',
+        r'\btemperature\b',
+        r'\btemp\b',
+        r'\bforecast\b',
+        r'\brain\b',
+        r'\bsnow\b',
+        r'\bcloudy\b',
+        r'\bsunny\b',
+        r'\bstorm\b',
+        r'\bhot\b',
+        r'\bcold\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
+        city = _extract_city(text)
+        day = _extract_day(text) or "today"
+        return IntentResult("weather", {"city": city, "day": day})
+    return None
+
+def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
+    # For now, just detect weather - you can add more intent detection here
+    return detect_weather_intent(text)
+
+# === Web Search ===
+def web_search(q, num=3, search_type="general"):
+    if not SERPAPI_API_KEY:
+        return "Search unavailable - service not configured."
+    
+    q = q.strip()
+    if len(q) < 2:
+        return "Search query too short."
+    
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google",
+        "q": q,
+        "num": min(num, 5),
+        "api_key": SERPAPI_API_KEY,
+        "hl": "en",
+        "gl": "us",
+    }
+    
+    if search_type == "news":
+        params["tbm"] = "nws"
+    elif search_type == "local":
+        params["engine"] = "google_maps"
+    
+    try:
+        logger.info(f"Searching: {q} (type: {search_type})")
+        r = requests.get(url, params=params, timeout=15)
+        
+        if r.status_code != 200:
+            return f"Search error (status {r.status_code})"
+            
+        data = r.json()
+        logger.info(f"Search response keys: {list(data.keys())}")
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return "Search service temporarily unavailable."
+
+    org = data.get("organic_results", [])
+    if org:
+        for result in org[:3]:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            source = result.get("source", "")
+            
+            low_quality_indicators = [
+                'reddit.com/r/', 'yahoo.answers', 'quora.com', 
+                'answers.com', 'ask.com', '/forums/', 
+                'discussion', 'forum', 'thread'
+            ]
+            
+            if any(indicator in source.lower() or indicator in title.lower() 
+                   for indicator in low_quality_indicators):
+                logger.info(f"Skipping low-quality source: {source}")
+                continue
+            
+            forum_indicators = [
+                'r/', 'subreddit', 'posted by', 'forum', 'discussion',
+                'thread', 'reply', 'comment', 'user:', 'member since'
+            ]
+            
+            if any(indicator in snippet.lower() for indicator in forum_indicators):
+                logger.info(f"Skipping forum-like content: {snippet[:50]}...")
+                continue
+            
+            result_text = f"{title}"
+            if snippet:
+                result_text += f" — {snippet}"
+            
+            logger.info(f"Selected quality result from: {source}")
+            return result_text[:500]
+        
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result = f"{title}"
+        if snippet:
+            result += f" — {snippet}"
+        return result[:500]
+    
+    return f"No results found for '{q}'."
+
+# === Claude Integration ===
+def ask_claude(phone, user_msg):
+    start_time = time.time()
+    
+    if not anthropic_client:
+        return "Hi! I'm Alex, your SMS assistant. AI responses are unavailable right now, but I can help you search for info!"
+    
+    try:
+        history = load_history(phone, limit=4)
+        
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
+
+IMPORTANT GUIDELINES:
+- Keep responses under 500 characters when possible for SMS (expanded from 160)
+- Be friendly and helpful
+- You DO have access to web search capabilities through your routing system
+- For specific information requests (recipes, current info, business details), suggest that you can search for that information
+- If someone asks for detailed information that would benefit from a search, respond with "Let me search for [specific topic]" 
+- Never make up detailed information - always offer to search for accurate, current details
+- Be honest about your capabilities - you can search for current information
+
+You are a helpful assistant with search capabilities. Be conversational and helpful."""
+        
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            messages = []
+            for msg in history[-3:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
+            data = {
+                "model": "claude-3-haiku-20240307",
+                "max_tokens": 150,
+                "temperature": 0.3,
+                "system": system_context,
+                "messages": messages
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+            else:
+                raise Exception(f"API call failed with status {response.status_code}")
+                
+        except Exception:
+            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        
+        if not reply:
+            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        
+        search_suggestion_patterns = [
+            r'let me search for (.+?)(?:\.|$)',
+            r'i can search for (.+?)(?:\.|$)',
+            r'search for (.+?)(?:\.|$)'
+        ]
+        
+        for pattern in search_suggestion_patterns:
+            match = re.search(pattern, reply, re.I)
+            if match:
+                search_term = match.group(1).strip()
+                logger.info(f"Claude suggested search for: {search_term}, executing actual search")
+                search_result = web_search(search_term, search_type="general")
+                return search_result
+        
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
+            
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", True, response_time)
+        
+        return reply
+        
+    except Exception as e:
+        logger.error(f"Claude error for {phone}: {e}")
+        return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+
+def save_message(phone, role, content, intent_type=None, response_time_ms=None):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (phone, role, content, intent_type, response_time_ms))
+        conn.commit()
+
+def load_history(phone, limit=4):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE phone = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (phone, limit))
+        rows = c.fetchall()
+    return [{"role": r, "content": t} for (r, t) in reversed(rows)]
+
+def log_usage_analytics(phone, intent_type, success, response_time_ms):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
+            VALUES (?, ?, ?, ?)
+        """, (phone, intent_type, success, response_time_ms))
+        conn.commit()
+
+# === Main SMS Webhook ===
 @app.route("/sms", methods=["POST"])
 @handle_errors  
 def sms_webhook():
-    """Basic SMS webhook - you'll need to add your full SMS handling logic here"""
+    start_time = time.time()
+    
+    logger.info(f"🔍 RAW REQUEST DATA:")
+    logger.info(f"📋 Request Method: {request.method}")
+    logger.info(f"📋 Request Headers: {dict(request.headers)}")
+    logger.info(f"📋 Request Form Data: {dict(request.form)}")
+    logger.info(f"📋 Request Args: {dict(request.args)}")
+    logger.info(f"📋 Request JSON: {request.get_json(silent=True)}")
+    
     sender = request.form.get("from")
     body = (request.form.get("body") or "").strip()
     
@@ -960,31 +1317,193 @@ def sms_webhook():
     
     if not sender:
         logger.error(f"❌ VALIDATION FAILED: Missing 'from' field")
+        logger.error(f"📋 Available form fields: {list(request.form.keys())}")
         return jsonify({"error": "Missing 'from' field"}), 400
     
-    # Check if sender is in whitelist
+    if not body:
+        logger.warning(f"⚠️ Empty message body from {sender}")
+        return jsonify({"message": "Empty message received"}), 200
+    
+    # Check monthly quota first
+    can_send_sms, usage_info, warning_msg = track_monthly_sms_usage(sender, is_outgoing=False)
+    if not can_send_sms:
+        logger.warning(f"🚫 QUOTA EXCEEDED: {sender} - {usage_info['current_count']}/{usage_info['monthly_limit']} messages")
+        if warning_msg:
+            try:
+                send_sms(sender, warning_msg, bypass_quota=True)
+            except Exception as e:
+                logger.error(f"Failed to send quota exceeded message: {e}")
+        return jsonify({"message": "Monthly quota exceeded"}), 429
+    
+    # Check rate limits
+    can_send, rate_msg = can_send(sender)
+    if not can_send:
+        logger.warning(f"🚫 RATE LIMITED: {sender} - {rate_msg}")
+        return jsonify({"message": rate_msg}), 429
+    
+    # Check whitelist
     whitelist = load_whitelist()
     if sender not in whitelist:
         logger.warning(f"🚫 Unauthorized sender: {sender}")
         return jsonify({"message": "Unauthorized sender"}), 403
     
-    # Basic response for now
-    response_msg = "Hey! I received your message. The full SMS assistant functionality will be added here."
+    # Content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        logger.warning(f"🚫 Content filtered for {sender}: {filter_reason}")
+        return jsonify({"message": "Content filtered"}), 400
+    
+    # Clear old context
+    clear_conversation_context(sender)
+    
+    # Save user message
+    save_message(sender, "user", body)
+    
+    # Handle special commands
+    if body.lower() in ['stop', 'quit', 'unsubscribe']:
+        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
+        try:
+            send_sms(sender, response_msg, bypass_quota=True)
+            return jsonify({"message": "Unsubscribe processed"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send unsubscribe message: {e}")
+            return jsonify({"error": "Failed to process unsubscribe"}), 500
+    
+    if body.lower() in ['start', 'subscribe', 'resume']:
+        response_msg = WELCOME_MSG
+        try:
+            send_sms(sender, response_msg, bypass_quota=True)
+            return jsonify({"message": "Welcome message sent"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send welcome message: {e}")
+            return jsonify({"error": "Failed to send welcome"}), 500
+    
+    # Detect intent
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
     
     try:
-        # Send response
+        # Process based on intent
+        if intent and intent.type == "weather":
+            city = intent.entities.get("city", "your area")
+            query = f"weather forecast {city}" if city != "your area" else "weather forecast"
+            response_msg = web_search(query, search_type="general")
+        else:
+            # Use Claude for general queries
+            response_msg = ask_claude(sender, body)
+            
+            # If Claude suggests a search, perform it
+            if "Let me search for" in response_msg:
+                search_term = body  # Use original query
+                response_msg = web_search(search_term, search_type="general")
+        
+        # Ensure response is not too long for SMS
+        if len(response_msg) > 1600:
+            response_msg = response_msg[:1597] + "..."
+        
+        # Save assistant response
+        response_time = int((time.time() - start_time) * 1000)
+        save_message(sender, "assistant", response_msg, intent_type, response_time)
+        
+        # Send quota warning if needed
+        if warning_msg:
+            try:
+                send_sms(sender, warning_msg, bypass_quota=True)
+                time.sleep(2)  # Brief delay between messages
+            except Exception as e:
+                logger.error(f"Failed to send quota warning: {e}")
+        
+        # Send main response
         result = send_sms(sender, response_msg)
         
         if "error" not in result:
-            logger.info(f"✅ Response sent to {sender}")
+            log_usage_analytics(sender, intent_type, True, response_time)
+            logger.info(f"✅ Response sent to {sender} in {response_time}ms")
             return jsonify({"message": "Response sent successfully"}), 200
         else:
+            log_usage_analytics(sender, intent_type, False, response_time)
             logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
             return jsonify({"error": "Failed to send response"}), 500
             
     except Exception as e:
-        logger.error(f"💥 SMS webhook error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        logger.error(f"💥 Processing error for {sender}: {e}")
+        
+        # Send fallback response
+        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
+        try:
+            send_sms(sender, fallback_msg, bypass_quota=True)
+            return jsonify({"message": "Fallback response sent"}), 200
+        except Exception as fallback_error:
+            logger.error(f"Failed to send fallback message: {fallback_error}")
+            return jsonify({"error": "Processing failed"}), 500
+
+def can_send(sender):
+    usage = load_usage()
+    now = datetime.now(timezone.utc)
+    
+    record = usage.get(sender, {})
+    
+    if "count" not in record:
+        record["count"] = 0
+    if "last_reset" not in record:
+        record["last_reset"] = now.isoformat()
+    if "hourly_count" not in record:
+        record["hourly_count"] = 0
+    if "last_hour" not in record:
+        record["last_hour"] = now.replace(minute=0, second=0, microsecond=0).isoformat()
+    
+    try:
+        last_reset = datetime.fromisoformat(record["last_reset"]).replace(tzinfo=timezone.utc)
+        last_hour = datetime.fromisoformat(record["last_hour"]).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        record["last_reset"] = now.isoformat()
+        record["last_hour"] = now.replace(minute=0, second=0, microsecond=0).isoformat()
+        last_reset = now
+        last_hour = now.replace(minute=0, second=0, microsecond=0)
+    
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    
+    if now - last_reset > timedelta(days=RESET_DAYS):
+        record["count"] = 0
+        record["last_reset"] = now.isoformat()
+    
+    if current_hour > last_hour:
+        record["hourly_count"] = 0
+        record["last_hour"] = current_hour.isoformat()
+    
+    if record["hourly_count"] >= 15:
+        return False, "Hourly limit reached (15 messages/hour)"
+    
+    record["count"] += 1
+    record["hourly_count"] += 1
+    usage[sender] = record
+    save_usage(usage)
+    return True, ""
+
+def load_usage():
+    try:
+        with open(USAGE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_usage(data):
+    try:
+        with open(USAGE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save usage data: {e}")
+
+def clear_conversation_context(phone):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM conversation_context
+            WHERE phone = ? AND timestamp < datetime('now', '-10 minutes')
+        """, (phone,))
+        conn.commit()
 
 # Initialize database on startup
 init_db()
