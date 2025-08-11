@@ -1336,8 +1336,8 @@ def sms_webhook():
         return jsonify({"message": "Monthly quota exceeded"}), 429
     
     # Check rate limits
-    can_send, rate_msg = can_send(sender)
-    if not can_send:
+    can_send_msg, rate_msg = can_send(sender)
+    if not can_send_msg:
         logger.warning(f"🚫 RATE LIMITED: {sender} - {rate_msg}")
         return jsonify({"message": rate_msg}), 429
     
