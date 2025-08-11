@@ -1,18 +1,7 @@
-# Hey Alex SMS Assistant Requirements
-# SMS assistant powered by Claude AI for staying connected without staying online
-
-# Core web framework
 Flask==2.3.3
-gunicorn==21.2.0
-
-# Anthropic Claude API - using compatible version
-anthropic==0.28.1
-
-# HTTP requests
 requests==2.31.0
-
-# Environment variables
 python-dotenv==1.0.0
-
-# Optional: For enhanced logging and monitoring
-werkzeug==2.3.7
+anthropic==0.28.1
+gunicorn==21.2.0
+stripe==7.5.0
+sqlite3
