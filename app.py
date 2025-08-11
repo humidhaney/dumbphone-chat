@@ -112,6 +112,118 @@ QUOTA_EXCEEDED_MSG = (
     "Thanks for using Hey Alex! We'll be here when your quota refreshes."
 )
 
+# === Error Handling Decorator ===
+def handle_errors(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {f.__name__}: {str(e)}", exc_info=True)
+            return {"error": "Internal server error"}, 500
+    return decorated_function
+
+# === Stripe Test Endpoints ===
+@app.route('/test/stripe', methods=['GET'])
+def test_stripe_connection():
+    """Test Stripe API connection"""
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "STRIPE_SECRET_KEY not configured"}), 400
+    
+    try:
+        # Test API connection by retrieving account info
+        account = stripe.Account.retrieve()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Stripe API connection successful",
+            "account_id": account.id,
+            "business_profile": account.business_profile.name if account.business_profile else "Not set",
+            "country": account.country,
+            "currency": account.default_currency,
+            "charges_enabled": account.charges_enabled,
+            "payouts_enabled": account.payouts_enabled
+        })
+        
+    except stripe.error.AuthenticationError as e:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid Stripe API key",
+            "error": str(e)
+        }), 401
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "message": "Stripe connection failed",
+            "error": str(e)
+        }), 500
+
+@app.route('/test/webhook', methods=['POST'])
+def test_webhook():
+    """Test webhook without Stripe signature verification"""
+    try:
+        payload = request.get_json()
+        
+        logger.info(f"🧪 Test webhook received: {json.dumps(payload, indent=2)}")
+        
+        # Simulate different event types
+        event_type = payload.get('type', 'test_event')
+        
+        if event_type == 'checkout.session.completed':
+            test_session = {
+                'id': 'cs_test_123',
+                'customer': 'cus_test_123',
+                'customer_details': {
+                    'phone': '+15551234567'
+                }
+            }
+            handle_subscription_created(test_session)
+            
+        return jsonify({
+            "status": "success",
+            "message": f"Test webhook processed: {event_type}",
+            "received_data": payload
+        })
+        
+    except Exception as e:
+        logger.error(f"Test webhook error: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+@app.route('/test/logs', methods=['GET'])
+def get_recent_logs():
+    """Get recent subscription events for testing"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT event_type, phone, email, timestamp
+                FROM subscription_events
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """)
+            
+            events = []
+            for row in c.fetchall():
+                events.append({
+                    'event_type': row[0],
+                    'phone': row[1], 
+                    'email': row[2],
+                    'timestamp': row[3]
+                })
+            
+            return jsonify({
+                "recent_events": events,
+                "whitelist_count": len(load_whitelist()),
+                "app_version": APP_VERSION
+            })
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # === Stripe Webhook Handlers ===
 @app.route('/stripe/webhook', methods=['POST'])
 def stripe_webhook():
@@ -456,6 +568,13 @@ def remove_from_whitelist(phone):
         return True
     return False
 
+def load_whitelist():
+    try:
+        with open(WHITELIST_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
 # === API Endpoints ===
 @app.route('/stripe/create-checkout-session', methods=['POST'])
 def create_checkout_session():
@@ -516,16 +635,179 @@ def get_subscribers():
         logger.error(f"Error getting subscribers: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Error Handling Decorator ===
-def handle_errors(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Error in {f.__name__}: {str(e)}", exc_info=True)
-            return {"error": "Internal server error"}, 500
-    return decorated_function
+# === SMS Functions ===
+def send_sms(to_number, message, bypass_quota=False):
+    if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
+        logger.error("ClickSend credentials not configured")
+        return {"error": "SMS service not configured"}
+    
+    url = "https://rest.clicksend.com/v3/sms/send"
+    headers = {"Content-Type": "application/json"}
+    
+    if len(message) > 1600:
+        message = message[:1597] + "..."
+    
+    payload = {"messages": [{
+        "source": "python",
+        "body": message,
+        "to": to_number,
+        "custom_string": "alex_reply"
+    }]}
+    
+    try:
+        logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}...")
+        
+        resp = requests.post(
+            url,
+            auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        
+        result = resp.json()
+        
+        logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
+        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
+        
+        if resp.status_code == 200:
+            if "data" in result and "messages" in result["data"]:
+                messages = result["data"]["messages"]
+                if messages:
+                    msg_status = messages[0].get("status")
+                    msg_id = messages[0].get("message_id")
+                    msg_price = messages[0].get("message_price")
+                    
+                    logger.info(f"✅ SMS queued successfully to {to_number}")
+                    logger.info(f"📊 Message ID: {msg_id}, Status: {msg_status}, Price: {msg_price}")
+                    
+                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
+                    
+                    if not bypass_quota:
+                        track_monthly_sms_usage(to_number, is_outgoing=True)
+                    
+                    if msg_status != "SUCCESS":
+                        logger.warning(f"⚠️  SMS Status Warning: {msg_status} for {to_number}")
+                else:
+                    logger.warning(f"⚠️  No message data in ClickSend response for {to_number}")
+                    log_sms_delivery(to_number, message, result, "NO_MESSAGE_DATA", None)
+            
+            return result
+        else:
+            logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
+            log_sms_delivery(to_number, message, result, f"API_ERROR_{resp.status_code}", None)
+            return {"error": f"ClickSend API error: {resp.status_code}"}
+            
+    except Exception as e:
+        logger.error(f"💥 SMS Exception for {to_number}: {e}")
+        log_sms_delivery(to_number, message, {"error": str(e)}, "EXCEPTION", None)
+        return {"error": f"SMS send failed: {str(e)}"}
+
+def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
+        conn.commit()
+
+def get_current_period_dates():
+    now = datetime.now(timezone.utc)
+    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    period_end = period_start + timedelta(days=30)
+    return period_start.date(), period_end.date()
+
+def track_monthly_sms_usage(phone, is_outgoing=True):
+    if not is_outgoing:
+        return True, {}, None
+    
+    period_start, period_end = get_current_period_dates()
+    
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        
+        c.execute("""
+            SELECT id, message_count, quota_warnings_sent, quota_exceeded
+            FROM monthly_sms_usage
+            WHERE phone = ? AND period_start = ?
+        """, (phone, period_start))
+        
+        result = c.fetchone()
+        
+        if result:
+            usage_id, current_count, warnings_sent, quota_exceeded = result
+            new_count = current_count + 1
+            
+            c.execute("""
+                UPDATE monthly_sms_usage 
+                SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_count, usage_id))
+        else:
+            new_count = 1
+            warnings_sent = 0
+            quota_exceeded = False
+            
+            c.execute("""
+                INSERT INTO monthly_sms_usage 
+                (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
+            
+            usage_id = c.lastrowid
+        
+        conn.commit()
+        
+        usage_info = {
+            "phone": phone,
+            "current_count": new_count,
+            "monthly_limit": MONTHLY_LIMIT,
+            "remaining": max(0, MONTHLY_LIMIT - new_count),
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+        }
+        
+        warning_message = None
+        
+        if new_count > MONTHLY_LIMIT:
+            if not quota_exceeded:
+                c.execute("""
+                    UPDATE monthly_sms_usage 
+                    SET quota_exceeded = TRUE
+                    WHERE id = ?
+                """, (usage_id,))
+                conn.commit()
+                
+                warning_message = QUOTA_EXCEEDED_MSG.format(
+                    days_remaining=usage_info["days_remaining"]
+                )
+                logger.warning(f"📊 QUOTA EXCEEDED: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
+            
+            return False, usage_info, warning_message
+        
+        warning_thresholds = [250, 280, 295]
+        
+        for threshold in warning_thresholds:
+            if new_count == threshold and warnings_sent < len([t for t in warning_thresholds if t <= threshold]):
+                warning_message = QUOTA_WARNING_MSG.format(
+                    count=new_count,
+                    remaining=usage_info["remaining"]
+                )
+                
+                c.execute("""
+                    UPDATE monthly_sms_usage 
+                    SET quota_warnings_sent = quota_warnings_sent + 1
+                    WHERE id = ?
+                """, (usage_id,))
+                conn.commit()
+                
+                logger.info(f"📊 QUOTA WARNING: {phone} - {new_count}/{MONTHLY_LIMIT} messages (threshold: {threshold})")
+                break
+        
+        logger.info(f"📊 Monthly usage: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
+        return True, usage_info, warning_message
 
 # === SQLite for message memory ===
 def init_db():
@@ -666,246 +948,43 @@ def init_db():
         
         conn.commit()
 
-# [REST OF YOUR EXISTING CODE CONTINUES HERE...]
-# Including all your existing functions:
-# - save_message, load_history, log_usage_analytics, etc.
-# - track_monthly_sms_usage, get_monthly_usage_stats
-# - ContentFilter class
-# - SMS sending functions
-# - Web search functions
-# - Intent detection functions
-# - Claude integration
-# - Main SMS webhook endpoint
-
-# [Insert all your existing code here - I'm focusing on the new Stripe parts]
-
-def save_message(phone, role, content, intent_type=None, response_time_ms=None):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, role, content, intent_type, response_time_ms))
-        conn.commit()
+# === Basic SMS Webhook (placeholder) ===
+@app.route("/sms", methods=["POST"])
+@handle_errors  
+def sms_webhook():
+    """Basic SMS webhook - you'll need to add your full SMS handling logic here"""
+    sender = request.form.get("from")
+    body = (request.form.get("body") or "").strip()
     
-    if role == "assistant" and content:
-        content_lower = content.lower()
-        key_topics = {
-            'smartphone': ['smartphone', 'phone', 'mobile device'],
-            'technology': ['technology', 'tech', 'digital'],
-            'health': ['health', 'mental health', 'physical health'],
-            'social media': ['social media', 'facebook', 'instagram', 'twitter'],
-            'privacy': ['privacy', 'data', 'personal information'],
-            'addiction': ['addiction', 'addictive', 'dependency']
-        }
-        
-        for topic, keywords in key_topics.items():
-            if any(keyword in content_lower for keyword in keywords):
-                set_conversation_context(phone, "last_searched_entity", topic)
-                logger.info(f"Stored conversation context: {topic}")
-                break
-
-def load_history(phone, limit=4):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE phone = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (phone, limit))
-        rows = c.fetchall()
-    return [{"role": r, "content": t} for (r, t) in reversed(rows)]
-
-def load_whitelist():
-    try:
-        with open(WHITELIST_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return set()
-
-def send_sms(to_number, message, bypass_quota=False):
-    if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
-        logger.error("ClickSend credentials not configured")
-        return {"error": "SMS service not configured"}
+    logger.info(f"📱 SMS received from {sender}: {repr(body)}")
     
-    url = "https://rest.clicksend.com/v3/sms/send"
-    headers = {"Content-Type": "application/json"}
+    if not sender:
+        logger.error(f"❌ VALIDATION FAILED: Missing 'from' field")
+        return jsonify({"error": "Missing 'from' field"}), 400
     
-    if len(message) > 1600:
-        message = message[:1597] + "..."
+    # Check if sender is in whitelist
+    whitelist = load_whitelist()
+    if sender not in whitelist:
+        logger.warning(f"🚫 Unauthorized sender: {sender}")
+        return jsonify({"message": "Unauthorized sender"}), 403
     
-    payload = {"messages": [{
-        "source": "python",
-        "body": message,
-        "to": to_number,
-        "custom_string": "alex_reply"
-    }]}
+    # Basic response for now
+    response_msg = "Hey! I received your message. The full SMS assistant functionality will be added here."
     
     try:
-        logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}...")
+        # Send response
+        result = send_sms(sender, response_msg)
         
-        resp = requests.post(
-            url,
-            auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        
-        result = resp.json()
-        
-        logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
-        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
-        
-        if resp.status_code == 200:
-            if "data" in result and "messages" in result["data"]:
-                messages = result["data"]["messages"]
-                if messages:
-                    msg_status = messages[0].get("status")
-                    msg_id = messages[0].get("message_id")
-                    msg_price = messages[0].get("message_price")
-                    
-                    logger.info(f"✅ SMS queued successfully to {to_number}")
-                    logger.info(f"📊 Message ID: {msg_id}, Status: {msg_status}, Price: {msg_price}")
-                    
-                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
-                    
-                    if not bypass_quota:
-                        track_monthly_sms_usage(to_number, is_outgoing=True)
-                    
-                    if msg_status != "SUCCESS":
-                        logger.warning(f"⚠️  SMS Status Warning: {msg_status} for {to_number}")
-                else:
-                    logger.warning(f"⚠️  No message data in ClickSend response for {to_number}")
-                    log_sms_delivery(to_number, message, result, "NO_MESSAGE_DATA", None)
-            
-            return result
+        if "error" not in result:
+            logger.info(f"✅ Response sent to {sender}")
+            return jsonify({"message": "Response sent successfully"}), 200
         else:
-            logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
-            log_sms_delivery(to_number, message, result, f"API_ERROR_{resp.status_code}", None)
-            return {"error": f"ClickSend API error: {resp.status_code}"}
+            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
+            return jsonify({"error": "Failed to send response"}), 500
             
     except Exception as e:
-        logger.error(f"💥 SMS Exception for {to_number}: {e}")
-        log_sms_delivery(to_number, message, {"error": str(e)}, "EXCEPTION", None)
-        return {"error": f"SMS send failed: {str(e)}"}
-
-def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
-        conn.commit()
-
-def set_conversation_context(phone, key, value):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT OR REPLACE INTO conversation_context (phone, context_key, context_value, timestamp)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        """, (phone, key, value))
-        conn.commit()
-
-def get_current_period_dates():
-    now = datetime.now(timezone.utc)
-    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    period_end = period_start + timedelta(days=30)
-    return period_start.date(), period_end.date()
-
-def track_monthly_sms_usage(phone, is_outgoing=True):
-    if not is_outgoing:
-        return True, {}, None
-    
-    period_start, period_end = get_current_period_dates()
-    
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        
-        c.execute("""
-            SELECT id, message_count, quota_warnings_sent, quota_exceeded
-            FROM monthly_sms_usage
-            WHERE phone = ? AND period_start = ?
-        """, (phone, period_start))
-        
-        result = c.fetchone()
-        
-        if result:
-            usage_id, current_count, warnings_sent, quota_exceeded = result
-            new_count = current_count + 1
-            
-            c.execute("""
-                UPDATE monthly_sms_usage 
-                SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (new_count, usage_id))
-        else:
-            new_count = 1
-            warnings_sent = 0
-            quota_exceeded = False
-            
-            c.execute("""
-                INSERT INTO monthly_sms_usage 
-                (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
-            
-            usage_id = c.lastrowid
-        
-        conn.commit()
-        
-        usage_info = {
-            "phone": phone,
-            "current_count": new_count,
-            "monthly_limit": MONTHLY_LIMIT,
-            "remaining": max(0, MONTHLY_LIMIT - new_count),
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
-        }
-        
-        warning_message = None
-        
-        if new_count > MONTHLY_LIMIT:
-            if not quota_exceeded:
-                c.execute("""
-                    UPDATE monthly_sms_usage 
-                    SET quota_exceeded = TRUE
-                    WHERE id = ?
-                """, (usage_id,))
-                conn.commit()
-                
-                warning_message = QUOTA_EXCEEDED_MSG.format(
-                    days_remaining=usage_info["days_remaining"]
-                )
-                logger.warning(f"📊 QUOTA EXCEEDED: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
-            
-            return False, usage_info, warning_message
-        
-        warning_thresholds = [250, 280, 295]
-        
-        for threshold in warning_thresholds:
-            if new_count == threshold and warnings_sent < len([t for t in warning_thresholds if t <= threshold]):
-                warning_message = QUOTA_WARNING_MSG.format(
-                    count=new_count,
-                    remaining=usage_info["remaining"]
-                )
-                
-                c.execute("""
-                    UPDATE monthly_sms_usage 
-                    SET quota_warnings_sent = quota_warnings_sent + 1
-                    WHERE id = ?
-                """, (usage_id,))
-                conn.commit()
-                
-                logger.info(f"📊 QUOTA WARNING: {phone} - {new_count}/{MONTHLY_LIMIT} messages (threshold: {threshold})")
-                break
-        
-        logger.info(f"📊 Monthly usage: {phone} - {new_count}/{MONTHLY_LIMIT} messages")
-        return True, usage_info, warning_message
+        logger.error(f"💥 SMS webhook error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 # Initialize database on startup
 init_db()
