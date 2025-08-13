@@ -811,17 +811,217 @@ def web_search(q, num=3, search_type="general"):
     if not SERPAPI_API_KEY:
         return "Search unavailable - service not configured."
     
-    # Simplified search response for demo
-    return f"Search results for '{q}' - Weather information would appear here."
+    q = q.strip()
+    if len(q) < 2:
+        return "Search query too short."
+    
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google",
+        "q": q,
+        "num": min(num, 5),
+        "api_key": SERPAPI_API_KEY,
+        "hl": "en",
+        "gl": "us",
+    }
+    
+    if search_type == "news":
+        params["tbm"] = "nws"
+    elif search_type == "local":
+        params["engine"] = "google_maps"
+    
+    try:
+        logger.info(f"Searching: {q} (type: {search_type})")
+        r = requests.get(url, params=params, timeout=15)
+        
+        if r.status_code != 200:
+            return f"Search error (status {r.status_code})"
+            
+        data = r.json()
+        logger.info(f"Search response keys: {list(data.keys())}")
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return "Search service temporarily unavailable."
+
+    if search_type == "news" and "news_results" in data:
+        news = data["news_results"]
+        if news:
+            top = news[0]
+            title = top.get('title', '')
+            snippet = top.get('snippet', '')
+            result = f"{title}"
+            if snippet:
+                result += f" — {snippet}"
+            return result[:500]
+    
+    if search_type == "local":
+        local_results = []
+        if "local_results" in data:
+            local_results = data["local_results"]
+        elif "places_results" in data:
+            local_results = data["places_results"]
+        elif "places" in data:
+            local_results = data["places"]
+        
+        logger.info(f"Found {len(local_results)} local results")
+        
+        if local_results:
+            result_place = local_results[0]
+            logger.info(f"First result data: {result_place}")
+            
+            name = result_place.get('title', '') or result_place.get('name', '')
+            address = result_place.get('address', '') or result_place.get('vicinity', '')
+            rating = result_place.get('rating', '')
+            phone = result_place.get('phone', '') or result_place.get('formatted_phone_number', '')
+            
+            result = name if name else "Business found"
+            if rating:
+                result += f" (★{rating})"
+            if address:
+                result += f" — {address}"
+            if phone:
+                result += f" — {phone}"
+            
+            logger.info(f"Formatted result: {result}")
+            return result[:500]
+    
+    org = data.get("organic_results", [])
+    if org:
+        for result in org[:3]:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            source = result.get("source", "")
+            
+            low_quality_indicators = [
+                'reddit.com/r/', 'yahoo.answers', 'quora.com', 
+                'answers.com', 'ask.com', '/forums/', 
+                'discussion', 'forum', 'thread'
+            ]
+            
+            if any(indicator in source.lower() or indicator in title.lower() 
+                   for indicator in low_quality_indicators):
+                logger.info(f"Skipping low-quality source: {source}")
+                continue
+            
+            forum_indicators = [
+                'r/', 'subreddit', 'posted by', 'forum', 'discussion',
+                'thread', 'reply', 'comment', 'user:', 'member since'
+            ]
+            
+            if any(indicator in snippet.lower() for indicator in forum_indicators):
+                logger.info(f"Skipping forum-like content: {snippet[:50]}...")
+                continue
+            
+            result_text = f"{title}"
+            if snippet:
+                result_text += f" — {snippet}"
+            
+            logger.info(f"Selected quality result from: {source}")
+            return result_text[:500]
+        
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result = f"{title}"
+        if snippet:
+            result += f" — {snippet}"
+        return result[:500]
+    
+    return f"No results found for '{q}'."
 
 # === Claude Integration ===
 def ask_claude(phone, user_msg):
+    start_time = time.time()
+    
     if not anthropic_client:
         return "Hi! I'm Alex, your SMS assistant. AI responses are unavailable right now, but I can help you search for info!"
     
     try:
-        # Simplified Claude response for demo
-        return "Hi! I'm Alex. I can help you with weather, restaurants, and general questions. What would you like to know?"
+        history = load_history(phone, limit=4)
+        
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
+
+IMPORTANT GUIDELINES:
+- Keep responses under 500 characters when possible for SMS (expanded from 160)
+- Be friendly and helpful
+- You DO have access to web search capabilities through your routing system
+- For specific information requests (recipes, current info, business details), suggest that you can search for that information
+- If someone asks for detailed information that would benefit from a search, respond with "Let me search for [specific topic]" 
+- Never make up detailed information - always offer to search for accurate, current details
+- Be honest about your capabilities - you can search for current information
+
+You are a helpful assistant with search capabilities. Be conversational and helpful."""
+        
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            messages = []
+            for msg in history[-3:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
+            data = {
+                "model": "claude-3-haiku-20240307",
+                "max_tokens": 150,
+                "temperature": 0.3,
+                "system": system_context,
+                "messages": messages
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+            else:
+                raise Exception(f"API call failed with status {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
+            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        
+        if not reply:
+            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        
+        search_suggestion_patterns = [
+            r'let me search for (.+?)(?:\.|$)',
+            r'i can search for (.+?)(?:\.|$)',
+            r'search for (.+?)(?:\.|$)'
+        ]
+        
+        for pattern in search_suggestion_patterns:
+            match = re.search(pattern, reply, re.I)
+            if match:
+                search_term = match.group(1).strip()
+                logger.info(f"Claude suggested search for: {search_term}, executing actual search")
+                search_result = web_search(search_term, search_type="general")
+                return search_result
+        
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
+            
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(phone, "claude_chat", True, response_time)
+        
+        return reply
+        
     except Exception as e:
         logger.error(f"Claude error for {phone}: {e}")
         return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
