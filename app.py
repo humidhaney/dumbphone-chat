@@ -60,6 +60,13 @@ CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
+# Debug API key availability
+logger.info(f"🔑 API Keys Status:")
+logger.info(f"  CLICKSEND_USERNAME: {'✅ Set' if CLICKSEND_USERNAME else '❌ Missing'}")
+logger.info(f"  CLICKSEND_API_KEY: {'✅ Set' if CLICKSEND_API_KEY else '❌ Missing'}")
+logger.info(f"  ANTHROPIC_API_KEY: {'✅ Set' if ANTHROPIC_API_KEY else '❌ Missing'}")
+logger.info(f"  SERPAPI_API_KEY: {'✅ Set' if SERPAPI_API_KEY else '❌ Missing'}")
+
 # Stripe Configuration
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -809,7 +816,8 @@ def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
 # === Web Search ===
 def web_search(q, num=3, search_type="general"):
     if not SERPAPI_API_KEY:
-        return "Search unavailable - service not configured."
+        logger.warning("❌ SERPAPI_API_KEY not configured - search unavailable")
+        return "I'd love to search for that information, but my search service isn't configured right now. Please contact support."
     
     q = q.strip()
     if len(q) < 2:
@@ -831,18 +839,24 @@ def web_search(q, num=3, search_type="general"):
         params["engine"] = "google_maps"
     
     try:
-        logger.info(f"Searching: {q} (type: {search_type})")
+        logger.info(f"🔍 Searching: {q} (type: {search_type})")
         r = requests.get(url, params=params, timeout=15)
         
         if r.status_code != 200:
-            return f"Search error (status {r.status_code})"
+            logger.error(f"❌ Search API error: {r.status_code}")
+            return f"Search temporarily unavailable (error {r.status_code}). Try again later."
             
         data = r.json()
-        logger.info(f"Search response keys: {list(data.keys())}")
+        logger.info(f"✅ Search response keys: {list(data.keys())}")
+        
+        # Check for API errors in response
+        if 'error' in data:
+            logger.error(f"❌ SerpAPI error: {data['error']}")
+            return "Search service error. Please try again later."
         
     except Exception as e:
-        logger.error(f"Search error: {e}")
-        return "Search service temporarily unavailable."
+        logger.error(f"💥 Search exception: {e}")
+        return "Search service temporarily unavailable. Try again later."
 
     if search_type == "news" and "news_results" in data:
         news = data["news_results"]
@@ -917,7 +931,7 @@ def web_search(q, num=3, search_type="general"):
             if snippet:
                 result_text += f" — {snippet}"
             
-            logger.info(f"Selected quality result from: {source}")
+            logger.info(f"✅ Selected quality result from: {source}")
             return result_text[:500]
         
         top = org[0]
@@ -936,7 +950,8 @@ def ask_claude(phone, user_msg):
     start_time = time.time()
     
     if not anthropic_client:
-        return "Hi! I'm Alex, your SMS assistant. AI responses are unavailable right now, but I can help you search for info!"
+        logger.warning("❌ ANTHROPIC_API_KEY not configured - Claude unavailable")
+        return "I'd love to help with that question, but my AI service isn't configured right now. Let me try to search for that information instead."
     
     try:
         history = load_history(phone, limit=4)
@@ -980,6 +995,8 @@ You are a helpful assistant with search capabilities. Be conversational and help
                 "messages": messages
             }
             
+            logger.info(f"🤖 Calling Claude API for: {user_msg[:50]}...")
+            
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
@@ -987,18 +1004,23 @@ You are a helpful assistant with search capabilities. Be conversational and help
                 timeout=15
             )
             
+            logger.info(f"📡 Claude API response status: {response.status_code}")
+            
             if response.status_code == 200:
                 result = response.json()
                 reply = result.get("content", [{}])[0].get("text", "").strip()
+                logger.info(f"✅ Claude responded: {reply[:100]}...")
             else:
+                logger.error(f"❌ Claude API error: {response.status_code} - {response.text}")
                 raise Exception(f"API call failed with status {response.status_code}")
                 
         except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+            logger.error(f"💥 Claude API exception: {e}")
+            return "I'm having trouble with my AI service right now. Let me try to search for that information instead."
         
         if not reply:
-            return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+            logger.warning("⚠️ Claude returned empty response")
+            return "I'm having trouble processing that question. Let me try to search for that information instead."
         
         search_suggestion_patterns = [
             r'let me search for (.+?)(?:\.|$)',
@@ -1010,7 +1032,7 @@ You are a helpful assistant with search capabilities. Be conversational and help
             match = re.search(pattern, reply, re.I)
             if match:
                 search_term = match.group(1).strip()
-                logger.info(f"Claude suggested search for: {search_term}, executing actual search")
+                logger.info(f"🔍 Claude suggested search for: {search_term}, executing actual search")
                 search_result = web_search(search_term, search_type="general")
                 return search_result
         
@@ -1023,8 +1045,8 @@ You are a helpful assistant with search capabilities. Be conversational and help
         return reply
         
     except Exception as e:
-        logger.error(f"Claude error for {phone}: {e}")
-        return "Hi! I'm Alex. I'm having trouble with AI responses, but I can help you search for info!"
+        logger.error(f"💥 Claude integration error for {phone}: {e}")
+        return "I'm having trouble processing that question. Let me try to search for that information instead."
 
 # === Rate Limiting ===
 def can_send(sender):
@@ -1171,6 +1193,14 @@ def sms_webhook():
                 response_msg = ask_claude(sender, personalized_msg)
             else:
                 response_msg = ask_claude(sender, body)
+            
+            # If Claude suggests a search, perform it
+            if "Let me search for" in response_msg:
+                search_term = body
+                # Add location context to search if available
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
         
         # Ensure response is not too long for SMS
         if len(response_msg) > 1600:
