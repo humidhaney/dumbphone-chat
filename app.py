@@ -183,7 +183,21 @@ def create_user_profile(phone):
                 (phone, onboarding_step, onboarding_completed)
                 VALUES (?, 1, FALSE)
             """, (phone,))
-            conn.commit()
+            # Pending cancellations table
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS pending_cancellations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_cancellations_phone 
+        ON pending_cancellations(phone);
+        """)
+        
+        conn.commit()
             logger.info(f"📝 Created user profile for {phone}")
             return True
     except Exception as e:
@@ -1508,22 +1522,25 @@ def sms_webhook():
             return jsonify({"error": "Failed to send start message"}), 500
     
     # Check if user needs to complete onboarding
-    if not is_user_onboarded(sender):
-        logger.info(f"🚀 User {sender} is in onboarding process")
+    profile = get_user_profile(sender)
+    logger.info(f"👤 User profile for {sender}: {profile}")
+    
+    if not profile:
+        # No profile exists - create one and start onboarding
+        logger.info(f"📝 No profile found for {sender}, creating new profile")
+        create_user_profile(sender)
         
-        # Create profile if it doesn't exist (for existing whitelist users)
-        profile = get_user_profile(sender)
-        if not profile:
-            logger.info(f"📝 Creating missing profile for existing user {sender}")
-            create_user_profile(sender)
-            # Send initial onboarding message
-            try:
-                send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
-                save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-                return jsonify({"message": "Onboarding started for existing user"}), 200
-            except Exception as e:
-                logger.error(f"Failed to send onboarding start message: {e}")
-                return jsonify({"error": "Failed to start onboarding"}), 500
+        try:
+            send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
+            save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+            return jsonify({"message": "Onboarding started for new user"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send onboarding start message: {e}")
+            return jsonify({"error": "Failed to start onboarding"}), 500
+    
+    elif not profile['onboarding_completed']:
+        # Profile exists but onboarding not complete
+        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
         
         try:
             response_msg = handle_onboarding_response(sender, body)
@@ -1547,6 +1564,9 @@ def sms_webhook():
             except Exception as fallback_error:
                 logger.error(f"Failed to send onboarding fallback: {fallback_error}")
                 return jsonify({"error": "Onboarding failed"}), 500
+    
+    # User is fully onboarded - continue to normal processing
+    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
     
     # User is onboarded, process normal queries
     intent = detect_intent(body, sender)
@@ -1618,7 +1638,78 @@ def sms_webhook():
             logger.error(f"Failed to send fallback message: {fallback_error}")
             return jsonify({"error": "Processing failed"}), 500
 
-# === Admin Endpoints ===
+# === API Endpoints ===
+@app.route('/stripe/create-checkout-session', methods=['POST'])
+def create_checkout_session():
+    """Create Stripe checkout session with phone collection"""
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 500
+    
+    try:
+        data = request.get_json()
+        
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='subscription',
+            line_items=[{
+                'price': data.get('price_id', 'price_1234567890abcdef'),  # Replace with actual price ID
+                'quantity': 1,
+            }],
+            phone_number_collection={'enabled': True},
+            success_url=data.get('success_url', 'https://heyalex.co/success'),
+            cancel_url=data.get('cancel_url', 'https://heyalex.co'),
+            metadata={
+                'source': 'hey_alex_landing'
+            }
+        )
+        
+        return jsonify({"id": session.id})
+        
+    except Exception as e:
+        logger.error(f"Error creating checkout session: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/subscription/<phone>/status', methods=['GET'])
+def get_subscription_status_admin(phone):
+    """Admin endpoint to check subscription status"""
+    try:
+        phone = normalize_phone_number(phone)
+        status = get_customer_subscription_status(phone)
+        
+        if not status:
+            return jsonify({"error": "No subscription found"}), 404
+        
+        return jsonify({"subscription_status": status})
+        
+    except Exception as e:
+        logger.error(f"Error getting subscription status for {phone}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/subscription/<phone>/cancel', methods=['POST'])
+def cancel_subscription_admin(phone):
+    """Admin endpoint to cancel subscription"""
+    try:
+        phone = normalize_phone_number(phone)
+        
+        success, message = cancel_stripe_subscription(phone)
+        
+        if success:
+            # Also remove from whitelist
+            remove_from_whitelist(phone, send_goodbye=True)
+            
+            return jsonify({
+                "success": True,
+                "message": f"Cancelled subscription for {phone}: {message}"
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": message
+            }), 400
+            
+    except Exception as e:
+        logger.error(f"Error cancelling subscription for {phone}: {e}")
+        return jsonify({"error": str(e)}), 500
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
