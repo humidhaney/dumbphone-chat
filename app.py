@@ -425,7 +425,306 @@ def load_whitelist():
     except FileNotFoundError:
         return set()
 
-# === Helper Functions ===
+# === Stripe Webhook Handlers ===
+@app.route('/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    payload = request.get_data(as_text=True)
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("STRIPE_WEBHOOK_SECRET not configured")
+        return "Webhook secret not configured", 400
+    
+    try:
+        # Verify webhook signature
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError as e:
+        logger.error(f"Invalid payload: {e}")
+        return "Invalid payload", 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Invalid signature: {e}")
+        return "Invalid signature", 400
+    
+    logger.info(f"🔔 Stripe webhook received: {event['type']}")
+    
+    # Handle the event
+    try:
+        if event['type'] == 'checkout.session.completed':
+            handle_subscription_created(event['data']['object'])
+        elif event['type'] == 'customer.subscription.deleted':
+            handle_subscription_cancelled(event['data']['object'])
+        elif event['type'] == 'invoice.payment_failed':
+            handle_payment_failed(event['data']['object'])
+        elif event['type'] == 'customer.subscription.updated':
+            handle_subscription_updated(event['data']['object'])
+        else:
+            logger.info(f"Unhandled event type: {event['type']}")
+    except Exception as e:
+        logger.error(f"Error processing webhook {event['type']}: {e}")
+        return f"Error processing webhook: {str(e)}", 500
+    
+    return "Success", 200
+
+def handle_subscription_created(session):
+    """Add customer to whitelist when subscription is created"""
+    try:
+        logger.info(f"📝 Processing subscription created: {session.get('id')}")
+        
+        # Get customer details from Stripe
+        customer_id = session.get('customer')
+        if not customer_id:
+            logger.error("No customer ID in checkout session")
+            return
+            
+        customer = stripe.Customer.retrieve(customer_id)
+        
+        email = customer.email
+        phone = customer.phone or extract_phone_from_session(session)
+        
+        if not phone:
+            logger.error(f"No phone number found for customer {customer_id} ({email})")
+            return
+        
+        # Normalize phone number
+        phone = normalize_phone_number(phone)
+        
+        # Add to whitelist with automatic welcome message and onboarding
+        if add_to_whitelist(phone, send_welcome=True):
+            # Store customer relationship
+            store_customer_data(phone, email, customer_id, 'active')
+            
+            # Log the subscription
+            log_subscription_event(phone, email, customer_id, "subscription_created")
+            
+            logger.info(f"✅ Added {phone} ({email}) to whitelist - subscription created with onboarding")
+        else:
+            logger.warning(f"Failed to add {phone} to whitelist")
+        
+    except Exception as e:
+        logger.error(f"Error handling subscription created: {e}")
+
+def handle_subscription_cancelled(subscription):
+    """Remove customer from whitelist when subscription is cancelled"""
+    try:
+        logger.info(f"❌ Processing subscription cancelled: {subscription.get('id')}")
+        
+        customer_id = subscription.get('customer')
+        if not customer_id:
+            logger.error("No customer ID in subscription")
+            return
+            
+        customer = stripe.Customer.retrieve(customer_id)
+        
+        email = customer.email
+        phone = get_phone_from_customer_id(customer_id) or customer.phone
+        
+        if not phone:
+            logger.error(f"No phone number found for cancelled customer {customer_id} ({email})")
+            return
+        
+        phone = normalize_phone_number(phone)
+        
+        # Remove from whitelist with goodbye message
+        if remove_from_whitelist(phone, send_goodbye=True):
+            # Update customer status
+            store_customer_data(phone, email, customer_id, 'cancelled')
+            
+            # Log the cancellation
+            log_subscription_event(phone, email, customer_id, "subscription_cancelled")
+            
+            logger.info(f"❌ Removed {phone} ({email}) from whitelist - subscription cancelled")
+        else:
+            logger.warning(f"Failed to remove {phone} from whitelist")
+        
+    except Exception as e:
+        logger.error(f"Error handling subscription cancelled: {e}")
+
+def handle_subscription_updated(subscription):
+    """Handle subscription updates (e.g., plan changes, renewals)"""
+    try:
+        logger.info(f"🔄 Processing subscription updated: {subscription.get('id')}")
+        
+        customer_id = subscription.get('customer')
+        status = subscription.get('status')
+        
+        if not customer_id:
+            logger.error("No customer ID in subscription update")
+            return
+            
+        customer = stripe.Customer.retrieve(customer_id)
+        email = customer.email
+        phone = get_phone_from_customer_id(customer_id) or customer.phone
+        
+        if not phone:
+            logger.error(f"No phone number found for customer {customer_id} ({email})")
+            return
+        
+        phone = normalize_phone_number(phone)
+        
+        # Handle different status changes
+        if status == 'active':
+            # Reactivate if needed
+            add_to_whitelist(phone, send_welcome=False)  # Don't send welcome again
+            store_customer_data(phone, email, customer_id, 'active')
+            log_subscription_event(phone, email, customer_id, "subscription_reactivated")
+            logger.info(f"✅ Reactivated subscription for {phone}")
+            
+        elif status in ['canceled', 'unpaid', 'past_due']:
+            # Deactivate
+            remove_from_whitelist(phone, send_goodbye=True)
+            store_customer_data(phone, email, customer_id, status)
+            log_subscription_event(phone, email, customer_id, f"subscription_{status}")
+            logger.info(f"❌ Deactivated subscription for {phone} (status: {status})")
+        
+    except Exception as e:
+        logger.error(f"Error handling subscription updated: {e}")
+
+def handle_payment_failed(invoice):
+    """Handle failed payments"""
+    try:
+        logger.info(f"💳 Processing payment failed: {invoice.get('id')}")
+        
+        customer_id = invoice.get('customer')
+        if not customer_id:
+            logger.error("No customer ID in failed invoice")
+            return
+            
+        customer = stripe.Customer.retrieve(customer_id)
+        email = customer.email
+        phone = get_phone_from_customer_id(customer_id) or customer.phone
+        
+        if not phone:
+            logger.error(f"No phone number found for customer {customer_id} ({email})")
+            return
+        
+        phone = normalize_phone_number(phone)
+        
+        # Log the payment failure
+        log_subscription_event(phone, email, customer_id, "payment_failed")
+        
+        # Send payment failed notification
+        failed_msg = "⚠️ Hey Alex payment failed. Please update your payment method at heyalex.co to continue service."
+        try:
+            send_sms(phone, failed_msg, bypass_quota=True)
+            logger.info(f"📱 Payment failed SMS sent to {phone}")
+        except Exception as sms_error:
+            logger.error(f"Failed to send payment failed SMS to {phone}: {sms_error}")
+        
+        logger.warning(f"💳 Payment failed notification sent to {phone} ({email})")
+        
+    except Exception as e:
+        logger.error(f"Error handling payment failed: {e}")
+
+# === Subscription Management Functions ===
+def cancel_stripe_subscription(phone):
+    """Cancel Stripe subscription for a given phone number"""
+    try:
+        # Get customer data from database
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT stripe_customer_id, email 
+                FROM subscribers 
+                WHERE phone = ? AND status = 'active'
+                ORDER BY last_updated DESC 
+                LIMIT 1
+            """, (phone,))
+            result = c.fetchone()
+            
+            if not result:
+                logger.warning(f"No active subscription found for {phone}")
+                return False, "No active subscription found"
+            
+            customer_id, email = result
+        
+        # Get active subscriptions for this customer
+        subscriptions = stripe.Subscription.list(
+            customer=customer_id,
+            status='active',
+            limit=10
+        )
+        
+        if not subscriptions.data:
+            logger.warning(f"No active subscriptions found for customer {customer_id}")
+            return False, "No active subscriptions found"
+        
+        # Cancel all active subscriptions
+        cancelled_count = 0
+        for subscription in subscriptions.data:
+            try:
+                cancelled_sub = stripe.Subscription.cancel(subscription.id)
+                cancelled_count += 1
+                logger.info(f"✅ Cancelled subscription {subscription.id} for {phone}")
+                
+                # Log the cancellation
+                log_subscription_event(phone, email, customer_id, "subscription_cancelled_by_sms")
+                
+            except Exception as e:
+                logger.error(f"Failed to cancel subscription {subscription.id}: {e}")
+        
+        if cancelled_count > 0:
+            # Update customer status in database
+            store_customer_data(phone, email, customer_id, 'cancelled')
+            return True, f"Cancelled {cancelled_count} subscription(s)"
+        else:
+            return False, "Failed to cancel subscriptions"
+            
+    except Exception as e:
+        logger.error(f"Error cancelling subscription for {phone}: {e}")
+        return False, f"Error: {str(e)}"
+
+def get_customer_subscription_status(phone):
+    """Get subscription status for a phone number"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT stripe_customer_id, email, status, last_updated
+                FROM subscribers 
+                WHERE phone = ?
+                ORDER BY last_updated DESC 
+                LIMIT 1
+            """, (phone,))
+            result = c.fetchone()
+            
+            if not result:
+                return None
+            
+            customer_id, email, status, last_updated = result
+            
+            # Check current Stripe subscription status
+            try:
+                subscriptions = stripe.Subscription.list(
+                    customer=customer_id,
+                    limit=5
+                )
+                
+                active_subs = [sub for sub in subscriptions.data if sub.status == 'active']
+                
+                return {
+                    'customer_id': customer_id,
+                    'email': email,
+                    'local_status': status,
+                    'stripe_active_subscriptions': len(active_subs),
+                    'last_updated': last_updated,
+                    'has_active_subscription': len(active_subs) > 0
+                }
+                
+            except Exception as e:
+                logger.error(f"Error checking Stripe status for {customer_id}: {e}")
+                return {
+                    'customer_id': customer_id,
+                    'email': email,
+                    'local_status': status,
+                    'last_updated': last_updated,
+                    'stripe_error': str(e)
+                }
+                
+    except Exception as e:
+        logger.error(f"Error getting subscription status for {phone}: {e}")
+        return None
 def normalize_phone_number(phone):
     """Normalize phone number to consistent format"""
     if not phone:
@@ -1100,13 +1399,96 @@ def sms_webhook():
     
     # Handle special commands
     if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
-        try:
+        # Check if user has an active subscription
+        subscription_status = get_customer_subscription_status(sender)
+        
+        if subscription_status and subscription_status.get('has_active_subscription'):
+            # User has active subscription - ask for confirmation
+            confirmation_msg = (
+                "⚠️ You have an active Hey Alex subscription. Replying STOP will:\n"
+                "• Cancel your subscription\n"
+                "• Remove you from the service\n"
+                "• Stop all billing\n\n"
+                "Reply 'CANCEL SUBSCRIPTION' to confirm, or 'NEVERMIND' to keep your subscription."
+            )
+            
+            # Store pending cancellation state
+            store_pending_cancellation(sender)
+            
+            try:
+                send_sms(sender, confirmation_msg, bypass_quota=True)
+                save_message(sender, "assistant", confirmation_msg, "cancellation_confirmation", 0)
+                return jsonify({"message": "Cancellation confirmation sent"}), 200
+            except Exception as e:
+                logger.error(f"Failed to send cancellation confirmation: {e}")
+                return jsonify({"error": "Failed to send confirmation"}), 500
+        else:
+            # No active subscription - just unsubscribe from SMS
+            response_msg = "You've been unsubscribed from Hey Alex SMS. Text START to resume service."
+            try:
+                remove_from_whitelist(sender, send_goodbye=False)
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "Unsubscribe processed"}), 200
+            except Exception as e:
+                logger.error(f"Failed to send unsubscribe message: {e}")
+                return jsonify({"error": "Failed to process unsubscribe"}), 500
+    
+    # Handle subscription cancellation confirmation
+    if body.lower() in ['cancel subscription', 'yes cancel', 'confirm cancel']:
+        if is_pending_cancellation(sender):
+            try:
+                # Cancel Stripe subscription
+                success, message = cancel_stripe_subscription(sender)
+                
+                if success:
+                    # Remove from whitelist
+                    remove_from_whitelist(sender, send_goodbye=False)
+                    
+                    # Clear pending cancellation
+                    clear_pending_cancellation(sender)
+                    
+                    # Send confirmation
+                    cancel_msg = (
+                        "✅ Your Hey Alex subscription has been cancelled. "
+                        "You won't be charged again and have been removed from the service. "
+                        "Thanks for using Hey Alex!"
+                    )
+                    send_sms(sender, cancel_msg, bypass_quota=True)
+                    save_message(sender, "assistant", cancel_msg, "subscription_cancelled", 0)
+                    
+                    logger.info(f"📋 Successfully cancelled subscription for {sender}")
+                    return jsonify({"message": "Subscription cancelled successfully"}), 200
+                else:
+                    error_msg = f"Sorry, there was an error cancelling your subscription: {message}. Please contact support."
+                    send_sms(sender, error_msg, bypass_quota=True)
+                    return jsonify({"error": "Subscription cancellation failed"}), 500
+                    
+            except Exception as e:
+                logger.error(f"Error processing subscription cancellation for {sender}: {e}")
+                error_msg = "Sorry, there was an error processing your cancellation. Please contact support."
+                send_sms(sender, error_msg, bypass_quota=True)
+                return jsonify({"error": "Cancellation processing failed"}), 500
+        else:
+            # No pending cancellation
+            response_msg = "No pending cancellation found. Text STOP if you want to unsubscribe."
             send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Unsubscribe processed"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send unsubscribe message: {e}")
-            return jsonify({"error": "Failed to process unsubscribe"}), 500
+            return jsonify({"message": "No pending cancellation"}), 200
+    
+    # Handle cancellation declined
+    if body.lower() in ['nevermind', 'never mind', 'no', 'keep subscription', 'keep']:
+        if is_pending_cancellation(sender):
+            clear_pending_cancellation(sender)
+            response_msg = "👍 Great! Your subscription remains active. What can I help you with?"
+            try:
+                send_sms(sender, response_msg, bypass_quota=True)
+                save_message(sender, "assistant", response_msg, "cancellation_declined", 0)
+                return jsonify({"message": "Cancellation declined"}), 200
+            except Exception as e:
+                logger.error(f"Failed to send cancellation declined message: {e}")
+                return jsonify({"error": "Failed to process response"}), 500
+        else:
+            # No pending cancellation - treat as normal message
+            pass  # Continue to normal processing
     
     if body.lower() in ['start', 'subscribe', 'resume']:
         # Check if user is already onboarded
