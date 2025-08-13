@@ -101,10 +101,25 @@ WELCOME_MSG = (
     "Try asking \"weather today\" to get started."
 )
 
-# NEW USER WELCOME MESSAGE
+# NEW USER WELCOME MESSAGE - Start of onboarding
 NEW_USER_WELCOME_MSG = (
     "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant. "
-    "Ask me about weather, restaurants, news, or anything else you need to know. "
+    "Before we start, I need to get to know you better. What's your first name?"
+)
+
+# ONBOARDING MESSAGES
+ONBOARDING_NAME_MSG = (
+    "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant. "
+    "Before we start, I need to get to know you better. What's your first name?"
+)
+
+ONBOARDING_LOCATION_MSG = (
+    "Nice to meet you, {name}! 👋 Now, what's your city or zip code? "
+    "This helps me give you local weather, restaurants, and business info."
+)
+
+ONBOARDING_COMPLETE_MSG = (
+    "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
     "You get 300 messages per month. Try asking \"weather today\" to start!"
 )
 
@@ -153,17 +168,55 @@ def add_to_whitelist(phone, send_welcome=True):
             
             logger.info(f"📱 Added new user {phone} to whitelist")
             
-            # Send welcome message for new users
+def log_whitelist_event(phone, action):
+    """Log whitelist addition/removal events"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO whitelist_events (phone, action, timestamp)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, (phone, action))
+            conn.commit()
+            logger.info(f"📋 Logged whitelist event: {action} for {phone}")
+    except Exception as e:
+        logger.error(f"Error logging whitelist event: {e}")
+
+def add_to_whitelist(phone, send_welcome=True):
+    """Enhanced whitelist addition with automatic welcome message and onboarding"""
+    if not phone:
+        return False
+        
+    phone = normalize_phone_number(phone)
+    wl = load_whitelist()
+    
+    # Check if this is a new user
+    is_new_user = phone not in wl
+    
+    if is_new_user:
+        try:
+            with open(WHITELIST_FILE, "a") as f:
+                f.write(phone + "\n")
+            
+            # Log the new user addition
+            log_whitelist_event(phone, "added")
+            
+            logger.info(f"📱 Added new user {phone} to whitelist")
+            
+            # Create user profile for onboarding
+            create_user_profile(phone)
+            
+            # Send welcome message to start onboarding for new users
             if send_welcome:
                 try:
-                    send_sms(phone, NEW_USER_WELCOME_MSG, bypass_quota=True)
-                    logger.info(f"🎉 Welcome message sent to new user {phone}")
+                    send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+                    logger.info(f"🎉 Onboarding started for new user {phone}")
                     
                     # Log the welcome message
-                    save_message(phone, "assistant", NEW_USER_WELCOME_MSG, "welcome", 0)
+                    save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
                     
                 except Exception as sms_error:
-                    logger.error(f"Failed to send welcome SMS to {phone}: {sms_error}")
+                    logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
             
             return True
         except Exception as e:
@@ -217,7 +270,180 @@ def load_whitelist():
     except FileNotFoundError:
         return set()
 
-def log_whitelist_event(phone, action):
+# === Onboarding System ===
+def get_user_profile(phone):
+    """Get user profile and onboarding status"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT first_name, location, onboarding_step, onboarding_completed
+                FROM user_profiles
+                WHERE phone = ?
+            """, (phone,))
+            result = c.fetchone()
+            
+            if result:
+                return {
+                    'first_name': result[0],
+                    'location': result[1],
+                    'onboarding_step': result[2],
+                    'onboarding_completed': bool(result[3])
+                }
+            else:
+                return None
+    except Exception as e:
+        logger.error(f"Error getting user profile for {phone}: {e}")
+        return None
+
+def create_user_profile(phone):
+    """Create new user profile for onboarding"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT OR IGNORE INTO user_profiles 
+                (phone, onboarding_step, onboarding_completed)
+                VALUES (?, 1, FALSE)
+            """, (phone,))
+            conn.commit()
+            logger.info(f"📝 Created user profile for {phone}")
+            return True
+    except Exception as e:
+        logger.error(f"Error creating user profile for {phone}: {e}")
+        return False
+
+def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, onboarding_completed=None):
+    """Update user profile information"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Build dynamic update query
+            update_parts = []
+            params = []
+            
+            if first_name is not None:
+                update_parts.append("first_name = ?")
+                params.append(first_name)
+            
+            if location is not None:
+                update_parts.append("location = ?")
+                params.append(location)
+            
+            if onboarding_step is not None:
+                update_parts.append("onboarding_step = ?")
+                params.append(onboarding_step)
+            
+            if onboarding_completed is not None:
+                update_parts.append("onboarding_completed = ?")
+                params.append(onboarding_completed)
+            
+            update_parts.append("updated_date = CURRENT_TIMESTAMP")
+            params.append(phone)
+            
+            query = f"""
+                UPDATE user_profiles 
+                SET {', '.join(update_parts)}
+                WHERE phone = ?
+            """
+            
+            c.execute(query, params)
+            conn.commit()
+            logger.info(f"📝 Updated user profile for {phone}")
+            return True
+    except Exception as e:
+        logger.error(f"Error updating user profile for {phone}: {e}")
+        return False
+
+def log_onboarding_step(phone, step, response):
+    """Log onboarding step response"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO onboarding_log (phone, step, response)
+                VALUES (?, ?, ?)
+            """, (phone, step, response))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging onboarding step: {e}")
+
+def handle_onboarding_response(phone, message):
+    """Handle user responses during onboarding process"""
+    profile = get_user_profile(phone)
+    
+    if not profile:
+        logger.error(f"No profile found for {phone} during onboarding")
+        return "Sorry, there was an error with your profile. Please contact support."
+    
+    current_step = profile['onboarding_step']
+    
+    if current_step == 1:
+        # Collecting first name
+        first_name = message.strip().title()
+        
+        # Basic validation for first name
+        if len(first_name) < 1 or len(first_name) > 50:
+            return "Please enter a valid first name."
+        
+        # Remove any non-alphabetic characters except spaces, hyphens, apostrophes
+        clean_name = re.sub(r"[^a-zA-Z\s\-']", "", first_name)
+        if not clean_name:
+            return "Please enter a valid first name using only letters."
+        
+        # Update profile with first name and move to step 2
+        update_user_profile(phone, first_name=clean_name, onboarding_step=2)
+        log_onboarding_step(phone, 1, clean_name)
+        
+        response = ONBOARDING_LOCATION_MSG.format(name=clean_name)
+        save_message(phone, "assistant", response, "onboarding_location", 0)
+        
+        logger.info(f"👤 Collected name '{clean_name}' for {phone}, asking for location")
+        return response
+        
+    elif current_step == 2:
+        # Collecting location (city or zip code)
+        location = message.strip().title()
+        
+        # Basic validation for location
+        if len(location) < 2 or len(location) > 100:
+            return "Please enter a valid city name or zip code."
+        
+        # Update profile and complete onboarding
+        update_user_profile(phone, location=location, onboarding_step=3, onboarding_completed=True)
+        log_onboarding_step(phone, 2, location)
+        
+        # Get the user's name for the completion message
+        updated_profile = get_user_profile(phone)
+        first_name = updated_profile['first_name'] if updated_profile else "there"
+        
+        response = ONBOARDING_COMPLETE_MSG.format(name=first_name)
+        save_message(phone, "assistant", response, "onboarding_complete", 0)
+        
+        logger.info(f"🎉 Completed onboarding for {phone}: {first_name} in {location}")
+        return response
+    
+    else:
+        # Shouldn't happen, but handle gracefully
+        logger.warning(f"Unexpected onboarding step {current_step} for {phone}")
+        return "There was an error with your setup. You can now ask me questions!"
+
+def is_user_onboarded(phone):
+    """Check if user has completed onboarding"""
+    profile = get_user_profile(phone)
+    return profile and profile['onboarding_completed']
+
+def get_user_context_for_queries(phone):
+    """Get user context to personalize responses"""
+    profile = get_user_profile(phone)
+    if profile and profile['onboarding_completed']:
+        return {
+            'first_name': profile['first_name'],
+            'location': profile['location'],
+            'personalized': True
+        }
+    return {'personalized': False}
     """Log whitelist addition/removal events"""
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -231,7 +457,148 @@ def log_whitelist_event(phone, action):
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
 
-# === Manual Whitelist Management Endpoints ===
+# === Admin API Endpoints (Updated) ===
+@app.route('/admin/users', methods=['GET'])
+def get_all_users():
+    """Admin endpoint to view all users with their profiles and onboarding status"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    up.phone, 
+                    up.first_name, 
+                    up.location, 
+                    up.onboarding_step,
+                    up.onboarding_completed,
+                    up.created_date,
+                    up.updated_date,
+                    COALESCE(mu.message_count, 0) as usage_count,
+                    COALESCE(mu.quota_exceeded, 0) as quota_exceeded,
+                    MAX(m.ts) as last_message_date
+                FROM user_profiles up
+                LEFT JOIN monthly_sms_usage mu ON up.phone = mu.phone 
+                    AND mu.period_start = (
+                        SELECT MAX(period_start) FROM monthly_sms_usage mu2 
+                        WHERE mu2.phone = up.phone
+                    )
+                LEFT JOIN messages m ON up.phone = m.phone
+                GROUP BY up.phone
+                ORDER BY up.created_date DESC
+            """)
+            
+            users = []
+            for row in c.fetchall():
+                users.append({
+                    'phone': row[0],
+                    'first_name': row[1],
+                    'location': row[2],
+                    'onboarding_step': row[3],
+                    'onboarding_completed': bool(row[4]),
+                    'created_date': row[5],
+                    'updated_date': row[6],
+                    'usage_count': row[7],
+                    'quota_exceeded': bool(row[8]),
+                    'last_message_date': row[9]
+                })
+            
+            return jsonify({
+                'total_users': len(users),
+                'users': users
+            })
+            
+    except Exception as e:
+        logger.error(f"Error getting all users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/user/<phone>/profile', methods=['GET'])
+def get_user_profile_admin(phone):
+    """Admin endpoint to get specific user profile"""
+    try:
+        phone = normalize_phone_number(phone)
+        profile = get_user_profile(phone)
+        
+        if not profile:
+            return jsonify({"error": "User not found"}), 404
+            
+        # Get additional info
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Get onboarding log
+            c.execute("""
+                SELECT step, response, timestamp
+                FROM onboarding_log
+                WHERE phone = ?
+                ORDER BY timestamp ASC
+            """, (phone,))
+            
+            onboarding_history = []
+            for row in c.fetchall():
+                onboarding_history.append({
+                    'step': row[0],
+                    'response': row[1],
+                    'timestamp': row[2]
+                })
+            
+            # Get message history
+            c.execute("""
+                SELECT role, content, intent_type, ts
+                FROM messages
+                WHERE phone = ?
+                ORDER BY ts DESC
+                LIMIT 10
+            """, (phone,))
+            
+            recent_messages = []
+            for row in c.fetchall():
+                recent_messages.append({
+                    'role': row[0],
+                    'content': row[1],
+                    'intent_type': row[2],
+                    'timestamp': row[3]
+                })
+        
+        return jsonify({
+            'profile': profile,
+            'onboarding_history': onboarding_history,
+            'recent_messages': recent_messages
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting user profile for {phone}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/user/<phone>/reset-onboarding', methods=['POST'])
+def reset_user_onboarding(phone):
+    """Admin endpoint to reset user onboarding"""
+    try:
+        phone = normalize_phone_number(phone)
+        
+        # Reset onboarding status
+        success = update_user_profile(
+            phone, 
+            first_name=None, 
+            location=None, 
+            onboarding_step=1, 
+            onboarding_completed=False
+        )
+        
+        if success:
+            # Send onboarding start message
+            send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+            save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_reset", 0)
+            
+            return jsonify({
+                "success": True,
+                "message": f"Reset onboarding for {phone} and sent start message"
+            })
+        else:
+            return jsonify({"error": "Failed to reset onboarding"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error resetting onboarding for {phone}: {e}")
+        return jsonify({"error": str(e)}), 500
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
@@ -563,6 +930,46 @@ def init_db():
             event_type TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+        """)
+        
+        # New tables for onboarding and user profiles
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE NOT NULL,
+            first_name TEXT,
+            location TEXT,
+            onboarding_step INTEGER DEFAULT 0,
+            onboarding_completed BOOLEAN DEFAULT FALSE,
+            created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
+        ON user_profiles(phone);
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_profiles_onboarding 
+        ON user_profiles(phone, onboarding_step);
+        """)
+        
+        # New table for tracking onboarding progress
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS onboarding_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            response TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_onboarding_log_phone 
+        ON onboarding_log(phone, timestamp DESC);
         """)
         
         # NEW TABLE: Whitelist events for tracking additions/removals
