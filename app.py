@@ -907,6 +907,20 @@ def sms_webhook():
     if not is_user_onboarded(sender):
         logger.info(f"🚀 User {sender} is in onboarding process")
         
+        # Create profile if it doesn't exist (for existing whitelist users)
+        profile = get_user_profile(sender)
+        if not profile:
+            logger.info(f"📝 Creating missing profile for existing user {sender}")
+            create_user_profile(sender)
+            # Send initial onboarding message
+            try:
+                send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
+                save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+                return jsonify({"message": "Onboarding started for existing user"}), 200
+            except Exception as e:
+                logger.error(f"Failed to send onboarding start message: {e}")
+                return jsonify({"error": "Failed to start onboarding"}), 500
+        
         try:
             response_msg = handle_onboarding_response(sender, body)
             
