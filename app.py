@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 CHANGELOG = {
+    "2.8": "Enhanced search capabilities for sports schedules and business hours, improved query specificity",
     "2.7": "Fixed user onboarding persistence logic, enhanced whitelist/profile coordination",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
     "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
@@ -1246,12 +1247,58 @@ class ContentFilter:
 
 content_filter = ContentFilter()
 
-# === Intent Detection ===
+# === Enhanced Intent Detection ===
 @dataclass
 class IntentResult:
     type: str
     entities: Dict[str, Any]
     confidence: float = 1.0
+
+def detect_sports_schedule_intent(text: str) -> Optional[IntentResult]:
+    """Detect when user is asking about sports schedules"""
+    sports_schedule_patterns = [
+        r'\b(when|what time)\s+(?:is|are)\s+(?:the\s+)?(?:next|upcoming)\s+(.+?)\s+(game|match)\b',
+        r'\bnext\s+(.+?)\s+(game|match)\b',
+        r'\b(.+?)\s+(schedule|game time|next game)\b',
+        r'\bwhen\s+(?:do|does)\s+(?:the\s+)?(.+?)\s+play\b'
+    ]
+    
+    for pattern in sports_schedule_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            # Extract team name
+            team_parts = match.groups()
+            team = None
+            for part in team_parts:
+                if part and part.lower() not in ['game', 'match', 'schedule', 'next', 'time']:
+                    team = part.strip()
+                    break
+            
+            return IntentResult("sports_schedule", {
+                "team": team,
+                "query": text
+            })
+    
+    return None
+
+def detect_business_hours_intent(text: str) -> Optional[IntentResult]:
+    """Detect when user is asking about business hours"""
+    hours_patterns = [
+        r'\b(?:what\s+time|when)\s+(?:does|do|is|are)\s+(.+?)\s+(?:open|close|hours)\b',
+        r'\b(.+?)\s+(?:hours|open|close)\b',
+        r'\bis\s+(.+?)\s+open\b'
+    ]
+    
+    for pattern in hours_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            business = match.group(1).strip()
+            return IntentResult("business_hours", {
+                "business": business,
+                "query": text
+            })
+    
+    return None
 
 def detect_weather_intent(text: str) -> Optional[IntentResult]:
     weather_patterns = [
@@ -1268,30 +1315,62 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
     return None
 
 def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
-    return detect_weather_intent(text)
+    """Enhanced intent detection with sports and business queries"""
+    
+    # Check for sports schedule queries first
+    sports_intent = detect_sports_schedule_intent(text)
+    if sports_intent:
+        return sports_intent
+    
+    # Check for business hours
+    hours_intent = detect_business_hours_intent(text)
+    if hours_intent:
+        return hours_intent
+    
+    # Check for weather
+    weather_intent = detect_weather_intent(text)
+    if weather_intent:
+        return weather_intent
+    
+    return None
 
-# === Web Search ===
-def web_search(q, num=3, search_type="general"):
+# === Enhanced Web Search Functions ===
+def enhanced_web_search(query, search_type="general", user_location=None):
+    """Enhanced search with better query construction for specific types"""
+    
     if not SERPAPI_API_KEY:
         logger.warning("❌ SERPAPI_API_KEY not configured - search unavailable")
         return "I'd love to search for that information, but my search service isn't configured right now. Please contact support."
     
-    q = q.strip()
-    if len(q) < 2:
-        return "Search query too short."
+    # Enhance the query based on search type
+    if search_type == "sports_schedule":
+        # For sports, we want current season schedule with dates
+        current_year = datetime.now().year
+        enhanced_query = f"{query} {current_year} schedule next game date time"
+        
+    elif search_type == "business_hours":
+        # For business hours, add location context
+        if user_location:
+            enhanced_query = f"{query} hours {user_location}"
+        else:
+            enhanced_query = f"{query} hours open close times"
+            
+    else:
+        enhanced_query = query
+    
+    logger.info(f"🔍 Enhanced search query: {enhanced_query}")
     
     url = "https://serpapi.com/search.json"
     params = {
         "engine": "google",
-        "q": q,
-        "num": min(num, 5),
+        "q": enhanced_query,
+        "num": 5,  # Get more results to find better info
         "api_key": SERPAPI_API_KEY,
         "hl": "en",
         "gl": "us",
     }
     
     try:
-        logger.info(f"🔍 Searching: {q}")
         r = requests.get(url, params=params, timeout=15)
         
         if r.status_code != 200:
@@ -1301,7 +1380,6 @@ def web_search(q, num=3, search_type="general"):
         data = r.json()
         logger.info(f"✅ Search response received")
         
-        # Check for API errors in response
         if 'error' in data:
             logger.error(f"❌ SerpAPI error: {data['error']}")
             return "Search service error. Please try again later."
@@ -1310,7 +1388,126 @@ def web_search(q, num=3, search_type="general"):
         logger.error(f"💥 Search exception: {e}")
         return "Search service temporarily unavailable. Try again later."
 
-    # Process results
+    # Enhanced result processing based on search type
+    if search_type == "sports_schedule":
+        return process_sports_results(data, query)
+    elif search_type == "business_hours":
+        return process_business_hours_results(data, query)
+    else:
+        return process_general_results(data, query)
+
+def process_sports_results(data, original_query):
+    """Process search results specifically for sports schedules"""
+    
+    # Look for answer box or featured snippet first
+    if "answer_box" in data:
+        answer = data["answer_box"]
+        if "answer" in answer:
+            return f"{answer['answer']}"
+        elif "snippet" in answer:
+            return f"{answer['snippet']}"
+    
+    # Look for sports results
+    if "sports_results" in data:
+        sports = data["sports_results"]
+        if "games" in sports and sports["games"]:
+            next_game = sports["games"][0]
+            
+            # Extract game info
+            date = next_game.get("date", "")
+            time = next_game.get("time", "")
+            teams = next_game.get("teams", [])
+            
+            if len(teams) >= 2:
+                team1 = teams[0].get("name", "")
+                team2 = teams[1].get("name", "")
+                
+                result = f"Next game: {team1} vs {team2}"
+                if date:
+                    result += f" on {date}"
+                if time:
+                    result += f" at {time}"
+                
+                return result
+    
+    # Look for knowledge graph info
+    if "knowledge_graph" in data:
+        kg = data["knowledge_graph"]
+        if "description" in kg:
+            return kg["description"]
+    
+    # Fall back to organic results but look for date/time info
+    org = data.get("organic_results", [])
+    for result in org[:3]:
+        title = result.get("title", "")
+        snippet = result.get("snippet", "")
+        
+        # Look for date patterns in the snippet
+        date_patterns = [
+            r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}',
+            r'\d{1,2}/\d{1,2}/\d{4}',
+            r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)',
+            r'\d{1,2}:\d{2}\s*(AM|PM|am|pm)',
+            r'(today|tomorrow|this\s+\w+|next\s+\w+)'
+        ]
+        
+        snippet_lower = snippet.lower()
+        has_date_info = any(re.search(pattern, snippet, re.I) for pattern in date_patterns)
+        
+        # Prioritize results with actual date/time information
+        if has_date_info and any(word in snippet_lower for word in ['game', 'play', 'vs', 'against', 'kickoff', 'tip-off']):
+            result_text = title
+            if snippet:
+                result_text += f" — {snippet}"
+            return result_text[:500]
+    
+    # If no specific date info found, return the first relevant result
+    if org:
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result_text = f"{title}"
+        if snippet:
+            result_text += f" — {snippet}"
+        
+        # Add a helpful note if we couldn't find specific date info
+        if "schedule" in result_text.lower() and not any(re.search(pattern, result_text, re.I) for pattern in [r'\d{1,2}/\d{1,2}', r'(today|tomorrow)', r'\d{1,2}:\d{2}']):
+            result_text += " (Check the team's official website for specific game times)"
+        
+        return result_text[:500]
+    
+    return f"I couldn't find specific schedule information for {original_query}. Try checking the team's official website."
+
+def process_business_hours_results(data, original_query):
+    """Process search results specifically for business hours"""
+    
+    # Look for knowledge panel with hours
+    if "knowledge_graph" in data:
+        kg = data["knowledge_graph"]
+        if "hours" in kg:
+            hours = kg["hours"]
+            return f"Hours: {hours}"
+        elif "description" in kg:
+            desc = kg["description"]
+            if any(word in desc.lower() for word in ['open', 'hours', 'am', 'pm']):
+                return desc
+    
+    # Look for local results with hours
+    if "local_results" in data and data["local_results"]:
+        local = data["local_results"][0]
+        
+        name = local.get("title", "")
+        hours = local.get("hours", "")
+        
+        if hours:
+            return f"{name} — {hours}"
+    
+    # Fall back to organic results
+    return process_general_results(data, original_query)
+
+def process_general_results(data, original_query):
+    """Process general search results"""
     org = data.get("organic_results", [])
     if org:
         top = org[0]
@@ -1322,7 +1519,7 @@ def web_search(q, num=3, search_type="general"):
             result += f" — {snippet}"
         return result[:500]
     
-    return f"No results found for '{q}'."
+    return f"No results found for '{original_query}'."
 
 # === Claude Integration ===
 def ask_claude(phone, user_msg):
@@ -1410,7 +1607,7 @@ IMPORTANT GUIDELINES:
             if match:
                 search_term = match.group(1).strip()
                 logger.info(f"🔍 Claude suggested search for: {search_term}")
-                search_result = web_search(search_term, search_type="general")
+                search_result = enhanced_web_search(search_term, search_type="general")
                 return search_result
         
         if len(reply) > 500:
@@ -1428,6 +1625,76 @@ IMPORTANT GUIDELINES:
     except Exception as e:
         logger.error(f"💥 Claude integration error for {phone}: {e}")
         return "I'm having trouble processing that question. Let me try to search for that information instead."
+
+# === Enhanced Query Processing ===
+def process_user_query(sender, body, user_context):
+    """Enhanced query processing with better intent handling"""
+    
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
+    
+    logger.info(f"🎯 Detected intent: {intent_type}")
+    
+    try:
+        if intent and intent.type == "sports_schedule":
+            # Handle sports schedule queries
+            team = intent.entities.get("team", "")
+            logger.info(f"🏈 Sports schedule query for team: {team}")
+            
+            response_msg = enhanced_web_search(
+                body, 
+                search_type="sports_schedule", 
+                user_location=user_context.get('location')
+            )
+            
+            if user_context['personalized']:
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+                
+        elif intent and intent.type == "business_hours":
+            # Handle business hours queries
+            business = intent.entities.get("business", "")
+            logger.info(f"🏪 Business hours query for: {business}")
+            
+            response_msg = enhanced_web_search(
+                body, 
+                search_type="business_hours", 
+                user_location=user_context.get('location')
+            )
+            
+        elif intent and intent.type == "weather":
+            # Use user's location if available
+            if user_context['personalized']:
+                city = user_context['location']
+                logger.info(f"🌍 Using user's saved location: {city}")
+                query = f"weather forecast {city}"
+                response_msg = enhanced_web_search(query, search_type="general")
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+            else:
+                response_msg = enhanced_web_search("weather forecast", search_type="general")
+                
+        else:
+            # Use Claude for general queries
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            # If Claude suggests a search, perform it with enhanced search
+            if "Let me search for" in response_msg:
+                search_term = body
+                # Add location context to search if available
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = enhanced_web_search(search_term, search_type="general")
+        
+        return response_msg, intent_type
+        
+    except Exception as e:
+        logger.error(f"💥 Query processing error: {e}")
+        return "Sorry, I'm having trouble processing your request. Please try again.", "error"
 
 # === Rate Limiting ===
 def can_send(sender):
@@ -1447,7 +1714,7 @@ def save_usage(data):
     except Exception as e:
         logger.error(f"Failed to save usage data: {e}")
 
-# === FIXED SMS WEBHOOK WITH IMPROVED LOGIC ===
+# === ENHANCED SMS WEBHOOK WITH IMPROVED SEARCH LOGIC ===
 @app.route("/sms", methods=["POST"])
 @handle_errors  
 def sms_webhook():
@@ -1608,40 +1875,12 @@ def sms_webhook():
     # User is fully onboarded - process normal queries
     logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
     
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
     # Get user context for personalized responses
     user_context = get_user_context_for_queries(sender)
     
     try:
-        # Process based on intent
-        if intent and intent.type == "weather":
-            # Use user's location if no city specified and user is onboarded
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-        else:
-            # Use Claude for general queries with user context
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            # If Claude suggests a search, perform it
-            if "Let me search for" in response_msg:
-                search_term = body
-                # Add location context to search if available
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
+        # Process query using enhanced logic
+        response_msg, intent_type = process_user_query(sender, body, user_context)
         
         # Ensure response is not too long for SMS
         if len(response_msg) > 1600:
@@ -1676,7 +1915,7 @@ def sms_webhook():
         response_time = int((time.time() - start_time) * 1000)
         
         try:
-            log_usage_analytics(sender, intent_type, False, response_time)
+            log_usage_analytics(sender, "general", False, response_time)
         except Exception as analytics_error:
             logger.error(f"Analytics logging failed: {analytics_error}")
             
