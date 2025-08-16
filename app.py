@@ -22,6 +22,11 @@ import stripe
 import hmac
 import hashlib
 
+# PostgreSQL support
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+
 # Load env vars
 load_dotenv()
 
@@ -39,8 +44,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 CHANGELOG = {
+    "2.9": "Added PostgreSQL support for persistent database storage in production, maintains SQLite for local development",
     "2.8": "Enhanced search capabilities for sports schedules and business hours, improved query specificity",
     "2.7": "Fixed user onboarding persistence logic, enhanced whitelist/profile coordination",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
@@ -62,12 +68,17 @@ CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
+# Database Configuration - PostgreSQL for production, SQLite for local development
+DATABASE_URL = os.getenv("DATABASE_URL")  # This will be set by Render
+DB_PATH = os.getenv("DB_PATH", "chat.db")  # Fallback for local development
+
 # Debug API key availability
 logger.info(f"🔑 API Keys Status:")
 logger.info(f"  CLICKSEND_USERNAME: {'✅ Set' if CLICKSEND_USERNAME else '❌ Missing'}")
 logger.info(f"  CLICKSEND_API_KEY: {'✅ Set' if CLICKSEND_API_KEY else '❌ Missing'}")
 logger.info(f"  ANTHROPIC_API_KEY: {'✅ Set' if ANTHROPIC_API_KEY else '❌ Missing'}")
 logger.info(f"  SERPAPI_API_KEY: {'✅ Set' if SERPAPI_API_KEY else '❌ Missing'}")
+logger.info(f"  DATABASE_URL: {'✅ Set (PostgreSQL)' if DATABASE_URL else '❌ Missing (using SQLite)'}")
 
 # Stripe Configuration
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -100,7 +111,6 @@ MONTHLY_USAGE_FILE = "monthly_usage.json"
 USAGE_LIMIT = 200
 MONTHLY_LIMIT = 300
 RESET_DAYS = 30
-DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 # WELCOME MESSAGE
 WELCOME_MSG = (
@@ -164,6 +174,34 @@ def handle_errors(f):
             return {"error": "Internal server error"}, 500
     return decorated_function
 
+# === Database Connection Management ===
+def get_db_connection():
+    """Get database connection - PostgreSQL in production, SQLite locally"""
+    if DATABASE_URL:
+        try:
+            # Parse the DATABASE_URL
+            parsed = urlparse(DATABASE_URL)
+            
+            # Connect to PostgreSQL
+            conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port,
+                database=parsed.path[1:],  # Remove leading slash
+                user=parsed.username,
+                password=parsed.password,
+                cursor_factory=RealDictCursor,
+                sslmode='require'  # Render requires SSL
+            )
+            return conn, "postgresql"
+        except Exception as e:
+            logger.error(f"Failed to connect to PostgreSQL: {e}")
+            logger.info("Falling back to SQLite for local development")
+            return sqlite3.connect(DB_PATH), "sqlite"
+    else:
+        # Local development: Use SQLite
+        logger.info("Using SQLite for local development")
+        return sqlite3.connect(DB_PATH), "sqlite"
+
 # === Helper Functions ===
 def normalize_phone_number(phone):
     """Normalize phone number to consistent format"""
@@ -201,210 +239,189 @@ def extract_phone_from_stripe_metadata(metadata):
 def log_stripe_event(event_type, customer_id, subscription_id, phone, status, details=None):
     """Log Stripe webhook events for debugging and audit"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO stripe_events 
-                (event_type, customer_id, subscription_id, phone, status, details, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (event_type, customer_id, subscription_id, phone, status, json.dumps(details) if details else None))
-            conn.commit()
-            logger.info(f"📋 Logged Stripe event: {event_type} for {phone}")
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO stripe_events 
+                        (event_type, customer_id, subscription_id, phone, status, details, timestamp)
+                        VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    """, (event_type, customer_id, subscription_id, phone, status, json.dumps(details) if details else None))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO stripe_events 
+                    (event_type, customer_id, subscription_id, phone, status, details, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (event_type, customer_id, subscription_id, phone, status, json.dumps(details) if details else None))
+                connection.commit()
+        
+        logger.info(f"📋 Logged Stripe event: {event_type} for {phone}")
     except Exception as e:
         logger.error(f"Error logging Stripe event: {e}")
 
 # === Database Initialization ===
 def init_db():
     try:
-        logger.info(f"🗄️ Initializing database at: {DB_PATH}")
+        conn, db_type = get_db_connection()
+        logger.info(f"🗄️ Initializing {db_type} database")
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Check if database exists and has data
-            c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            existing_tables = [row[0] for row in c.fetchall()]
-            logger.info(f"📊 Existing tables: {existing_tables}")
-            
-            # Messages table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                content TEXT NOT NULL,
-                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                intent_type TEXT,
-                response_time_ms INTEGER
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
-            ON messages(phone, ts DESC);
-            """)
-            
-            # User profiles table for onboarding and Stripe integration
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                first_name TEXT,
-                location TEXT,
-                onboarding_step INTEGER DEFAULT 0,
-                onboarding_completed BOOLEAN DEFAULT FALSE,
-                stripe_customer_id TEXT,
-                subscription_status TEXT DEFAULT 'inactive',
-                subscription_id TEXT,
-                trial_end_date DATETIME,
-                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
-            ON user_profiles(phone);
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_customer 
-            ON user_profiles(stripe_customer_id);
-            """)
-            
-            # Usage analytics table - FIXED: This was missing!
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS usage_analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                intent_type TEXT,
-                success BOOLEAN,
-                response_time_ms INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts 
-            ON usage_analytics(phone, timestamp DESC);
-            """)
-            
-            # Stripe events table for audit trail
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS stripe_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                customer_id TEXT,
-                subscription_id TEXT,
-                phone TEXT,
-                status TEXT,
-                details TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stripe_events_customer 
-            ON stripe_events(customer_id);
-            """)
-            
-            # Other existing tables...
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS onboarding_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                step INTEGER NOT NULL,
-                response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                source TEXT DEFAULT 'manual'
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_content TEXT NOT NULL,
-                clicksend_response TEXT,
-                delivery_status TEXT,
-                message_id TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_count INTEGER DEFAULT 1,
-                period_start DATE NOT NULL,
-                period_end DATE NOT NULL,
-                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                quota_warnings_sent INTEGER DEFAULT 0,
-                quota_exceeded BOOLEAN DEFAULT FALSE,
-                UNIQUE(phone, period_start)
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period 
-            ON monthly_sms_usage(phone, period_start DESC);
-            """)
-            
-            # Check and add missing columns to existing tables
-            logger.info("🔄 Checking for missing columns...")
-            
-            # Check user_profiles for Stripe columns
-            c.execute("PRAGMA table_info(user_profiles)")
-            columns = [row[1] for row in c.fetchall()]
-            
-            stripe_columns = [
-                ('stripe_customer_id', 'TEXT'),
-                ('subscription_status', 'TEXT DEFAULT "inactive"'),
-                ('subscription_id', 'TEXT'),
-                ('trial_end_date', 'DATETIME')
+        if db_type == "postgresql":
+            # PostgreSQL schema
+            tables = [
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    stripe_customer_id TEXT,
+                    subscription_status TEXT DEFAULT 'inactive',
+                    subscription_id TEXT,
+                    trial_end_date TIMESTAMP,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS usage_analytics (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    intent_type TEXT,
+                    success BOOLEAN,
+                    response_time_ms INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS stripe_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT,
+                    phone TEXT,
+                    status TEXT,
+                    details TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT DEFAULT 'manual'
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status TEXT,
+                    message_id TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """
             ]
             
-            for col_name, col_type in stripe_columns:
-                if col_name not in columns:
-                    try:
-                        c.execute(f"ALTER TABLE user_profiles ADD COLUMN {col_name} {col_type}")
-                        logger.info(f"✅ Added missing column: {col_name}")
-                    except sqlite3.OperationalError as e:
-                        if "duplicate column name" not in str(e):
-                            logger.warning(f"⚠️ Could not add column {col_name}: {e}")
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);",
+                "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);",
+                "CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);"
+            ]
             
-            # Check whitelist_events for source column
-            c.execute("PRAGMA table_info(whitelist_events)")
-            columns = [row[1] for row in c.fetchall()]
+            with conn:
+                with conn.cursor() as cursor:
+                    for table in tables:
+                        cursor.execute(table)
+                    for index in indexes:
+                        cursor.execute(index)
             
-            if 'source' not in columns:
-                try:
-                    c.execute("ALTER TABLE whitelist_events ADD COLUMN source TEXT DEFAULT 'manual'")
-                    logger.info("✅ Added missing column: source to whitelist_events")
-                except sqlite3.OperationalError as e:
-                    if "duplicate column name" not in str(e):
-                        logger.warning(f"⚠️ Could not add source column: {e}")
+            logger.info("✅ PostgreSQL database initialized successfully")
             
-            conn.commit()
-            
-            # Final verification - check that usage_analytics exists and works
-            try:
-                c.execute("SELECT COUNT(*) FROM usage_analytics")
-                logger.info("✅ usage_analytics table verified working")
-            except sqlite3.OperationalError:
-                logger.error("❌ usage_analytics table still missing - creating manually")
+        else:
+            # SQLite schema for local development
+            with closing(conn) as connection:
+                c = connection.cursor()
+                
+                # User profiles table
                 c.execute("""
-                CREATE TABLE usage_analytics (
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    stripe_customer_id TEXT,
+                    subscription_status TEXT DEFAULT 'inactive',
+                    subscription_id TEXT,
+                    trial_end_date DATETIME,
+                    created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Messages table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """)
+                
+                # Usage analytics table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS usage_analytics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     phone TEXT NOT NULL,
                     intent_type TEXT,
@@ -413,33 +430,130 @@ def init_db():
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
                 """)
-                conn.commit()
-                logger.info("✅ usage_analytics table created manually")
-            
-            # Check for existing data
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            user_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM messages")  
-            message_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM usage_analytics")
-            analytics_count = c.fetchone()[0]
-            
-            logger.info(f"📊 Database initialized successfully")
-            logger.info(f"📊 Found {user_count} user profiles, {message_count} messages, {analytics_count} analytics records")
-            
-            # Show recent users for debugging
-            if user_count > 0:
+                
+                # Stripe events table
                 c.execute("""
-                    SELECT phone, first_name, location, subscription_status, created_date 
-                    FROM user_profiles 
-                    ORDER BY created_date DESC 
-                    LIMIT 5
+                CREATE TABLE IF NOT EXISTS stripe_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT,
+                    phone TEXT,
+                    status TEXT,
+                    details TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
                 """)
-                recent_users = c.fetchall()
-                logger.info(f"📊 Recent users: {recent_users}")
-            
+                
+                # Onboarding log table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Whitelist events table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT DEFAULT 'manual'
+                );
+                """)
+                
+                # SMS delivery log table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status TEXT,
+                    message_id TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Monthly SMS usage table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """)
+                
+                # Create indexes for SQLite
+                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);")
+                
+                connection.commit()
+                logger.info("✅ SQLite database initialized successfully")
+        
+        # Check existing data
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
+                    user_count = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) FROM messages")
+                    message_count = cursor.fetchone()['count']
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                user_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM messages")
+                message_count = c.fetchone()[0]
+        
+        logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
+        
+        # Show recent users for debugging
+        if user_count > 0:
+            if db_type == "postgresql":
+                with conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT phone, first_name, location, subscription_status, created_date 
+                            FROM user_profiles 
+                            ORDER BY created_date DESC 
+                            LIMIT 5
+                        """)
+                        recent_users = cursor.fetchall()
+                        logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
+            else:
+                with closing(conn) as connection:
+                    c = connection.cursor()
+                    c.execute("""
+                        SELECT phone, first_name, location, subscription_status, created_date 
+                        FROM user_profiles 
+                        ORDER BY created_date DESC 
+                        LIMIT 5
+                    """)
+                    recent_users = c.fetchall()
+                    logger.info(f"📊 Recent users: {recent_users}")
+        
+        if db_type == "postgresql":
+            conn.close()
+        
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
         raise
@@ -448,29 +562,56 @@ def init_db():
 def get_user_profile(phone):
     """Get user profile and onboarding status"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT first_name, location, onboarding_step, onboarding_completed,
-                       stripe_customer_id, subscription_status, subscription_id, trial_end_date
-                FROM user_profiles
-                WHERE phone = ?
-            """, (phone,))
-            result = c.fetchone()
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT first_name, location, onboarding_step, onboarding_completed,
+                               stripe_customer_id, subscription_status, subscription_id, trial_end_date
+                        FROM user_profiles
+                        WHERE phone = %s
+                    """, (phone,))
+                    result = cursor.fetchone()
             
             if result:
                 return {
-                    'first_name': result[0],
-                    'location': result[1],
-                    'onboarding_step': result[2],
-                    'onboarding_completed': bool(result[3]),
-                    'stripe_customer_id': result[4],
-                    'subscription_status': result[5],
-                    'subscription_id': result[6],
-                    'trial_end_date': result[7]
+                    'first_name': result['first_name'],
+                    'location': result['location'],
+                    'onboarding_step': result['onboarding_step'],
+                    'onboarding_completed': bool(result['onboarding_completed']),
+                    'stripe_customer_id': result['stripe_customer_id'],
+                    'subscription_status': result['subscription_status'],
+                    'subscription_id': result['subscription_id'],
+                    'trial_end_date': result['trial_end_date']
                 }
-            else:
-                return None
+        else:
+            # SQLite
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT first_name, location, onboarding_step, onboarding_completed,
+                           stripe_customer_id, subscription_status, subscription_id, trial_end_date
+                    FROM user_profiles
+                    WHERE phone = ?
+                """, (phone,))
+                result = c.fetchone()
+                
+                if result:
+                    return {
+                        'first_name': result[0],
+                        'location': result[1],
+                        'onboarding_step': result[2],
+                        'onboarding_completed': bool(result[3]),
+                        'stripe_customer_id': result[4],
+                        'subscription_status': result[5],
+                        'subscription_id': result[6],
+                        'trial_end_date': result[7]
+                    }
+        
+        return None
+            
     except Exception as e:
         logger.error(f"Error getting user profile for {phone}: {e}")
         return None
@@ -478,16 +619,29 @@ def get_user_profile(phone):
 def create_user_profile(phone, stripe_customer_id=None, subscription_status='inactive'):
     """Create new user profile for onboarding"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR IGNORE INTO user_profiles 
-                (phone, onboarding_step, onboarding_completed, stripe_customer_id, subscription_status)
-                VALUES (?, 1, FALSE, ?, ?)
-            """, (phone, stripe_customer_id, subscription_status))
-            conn.commit()
-            logger.info(f"📝 Created user profile for {phone} with status {subscription_status}")
-            return True
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO user_profiles 
+                        (phone, onboarding_step, onboarding_completed, stripe_customer_id, subscription_status)
+                        VALUES (%s, 1, FALSE, %s, %s)
+                        ON CONFLICT (phone) DO NOTHING
+                    """, (phone, stripe_customer_id, subscription_status))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT OR IGNORE INTO user_profiles 
+                    (phone, onboarding_step, onboarding_completed, stripe_customer_id, subscription_status)
+                    VALUES (?, 1, FALSE, ?, ?)
+                """, (phone, stripe_customer_id, subscription_status))
+                connection.commit()
+        
+        logger.info(f"📝 Created user profile for {phone} with status {subscription_status}")
+        return True
     except Exception as e:
         logger.error(f"Error creating user profile for {phone}: {e}")
         return False
@@ -495,27 +649,42 @@ def create_user_profile(phone, stripe_customer_id=None, subscription_status='ina
 def update_user_profile(phone, **kwargs):
     """Update user profile information with flexible field updates"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Build dynamic update query
-            update_parts = []
-            params = []
-            
-            allowed_fields = [
-                'first_name', 'location', 'onboarding_step', 'onboarding_completed',
-                'stripe_customer_id', 'subscription_status', 'subscription_id', 'trial_end_date'
-            ]
-            
-            for field, value in kwargs.items():
-                if field in allowed_fields:
+        conn, db_type = get_db_connection()
+        
+        allowed_fields = [
+            'first_name', 'location', 'onboarding_step', 'onboarding_completed',
+            'stripe_customer_id', 'subscription_status', 'subscription_id', 'trial_end_date'
+        ]
+        
+        update_parts = []
+        params = []
+        
+        for field, value in kwargs.items():
+            if field in allowed_fields:
+                if db_type == "postgresql":
+                    update_parts.append(f"{field} = %s")
+                else:
                     update_parts.append(f"{field} = ?")
-                    params.append(value)
+                params.append(value)
+        
+        if not update_parts:
+            logger.warning(f"No valid fields to update for {phone}")
+            return False
+        
+        if db_type == "postgresql":
+            update_parts.append("updated_date = CURRENT_TIMESTAMP")
+            params.append(phone)
             
-            if not update_parts:
-                logger.warning(f"No valid fields to update for {phone}")
-                return False
+            query = f"""
+                UPDATE user_profiles 
+                SET {', '.join(update_parts)}
+                WHERE phone = %s
+            """
             
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query, params)
+        else:
             update_parts.append("updated_date = CURRENT_TIMESTAMP")
             params.append(phone)
             
@@ -525,10 +694,14 @@ def update_user_profile(phone, **kwargs):
                 WHERE phone = ?
             """
             
-            c.execute(query, params)
-            conn.commit()
-            logger.info(f"📝 Updated user profile for {phone}: {kwargs}")
-            return True
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute(query, params)
+                connection.commit()
+        
+        logger.info(f"📝 Updated user profile for {phone}: {kwargs}")
+        return True
+        
     except Exception as e:
         logger.error(f"Error updating user profile for {phone}: {e}")
         return False
@@ -536,24 +709,44 @@ def update_user_profile(phone, **kwargs):
 def get_user_by_customer_id(customer_id):
     """Get user profile by Stripe customer ID"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT phone, first_name, location, subscription_status
-                FROM user_profiles
-                WHERE stripe_customer_id = ?
-            """, (customer_id,))
-            result = c.fetchone()
-            
-            if result:
-                return {
-                    'phone': result[0],
-                    'first_name': result[1], 
-                    'location': result[2],
-                    'subscription_status': result[3]
-                }
-            else:
-                return None
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT phone, first_name, location, subscription_status
+                        FROM user_profiles
+                        WHERE stripe_customer_id = %s
+                    """, (customer_id,))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        return {
+                            'phone': result['phone'],
+                            'first_name': result['first_name'], 
+                            'location': result['location'],
+                            'subscription_status': result['subscription_status']
+                        }
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT phone, first_name, location, subscription_status
+                    FROM user_profiles
+                    WHERE stripe_customer_id = ?
+                """, (customer_id,))
+                result = c.fetchone()
+                
+                if result:
+                    return {
+                        'phone': result[0],
+                        'first_name': result[1], 
+                        'location': result[2],
+                        'subscription_status': result[3]
+                    }
+        
+        return None
     except Exception as e:
         logger.error(f"Error getting user by customer ID {customer_id}: {e}")
         return None
@@ -562,13 +755,23 @@ def get_user_by_customer_id(customer_id):
 def log_onboarding_step(phone, step, response):
     """Log onboarding step response"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO onboarding_log (phone, step, response)
-                VALUES (?, ?, ?)
-            """, (phone, step, response))
-            conn.commit()
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO onboarding_log (phone, step, response)
+                        VALUES (%s, %s, %s)
+                    """, (phone, step, response))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO onboarding_log (phone, step, response)
+                    VALUES (?, ?, ?)
+                """, (phone, step, response))
+                connection.commit()
     except Exception as e:
         logger.error(f"Error logging onboarding step: {e}")
 
@@ -652,14 +855,25 @@ def get_user_context_for_queries(phone):
 def log_whitelist_event(phone, action, source='manual'):
     """Log whitelist addition/removal events"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO whitelist_events (phone, action, source, timestamp)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """, (phone, action, source))
-            conn.commit()
-            logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO whitelist_events (phone, action, source, timestamp)
+                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                    """, (phone, action, source))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO whitelist_events (phone, action, source, timestamp)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, (phone, action, source))
+                connection.commit()
+        
+        logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
 
@@ -751,6 +965,722 @@ def load_whitelist():
             return set(line.strip() for line in f if line.strip())
     except FileNotFoundError:
         return set()
+
+# === Message and Analytics Functions ===
+def save_message(phone, role, content, intent_type=None, response_time_ms=None):
+    """Save message using new connection method"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (phone, role, content, intent_type, response_time_ms))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+                    VALUES (?, ?, ?, ?, ?)
+                """, (phone, role, content, intent_type, response_time_ms))
+                connection.commit()
+                
+    except Exception as e:
+        logger.error(f"Error saving message: {e}")
+
+def load_history(phone, limit=4):
+    """Load conversation history"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT role, content
+                        FROM messages
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT %s
+                    """, (phone, limit))
+                    rows = cursor.fetchall()
+                    return [{"role": row['role'], "content": row['content']} for row in reversed(rows)]
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT role, content
+                    FROM messages
+                    WHERE phone = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                """, (phone, limit))
+                rows = c.fetchall()
+                return [{"role": r, "content": t} for (r, t) in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Error loading history: {e}")
+        return []
+
+def log_usage_analytics(phone, intent_type, success, response_time_ms):
+    """Log usage analytics with error handling"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
+                        VALUES (%s, %s, %s, %s)
+                    """, (phone, intent_type, success, response_time_ms))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
+                    VALUES (?, ?, ?, ?)
+                """, (phone, intent_type, success, response_time_ms))
+                connection.commit()
+    except Exception as e:
+        logger.error(f"Usage analytics logging error: {e}")
+
+# === SMS and Usage Tracking Functions ===
+def send_sms(to_number, message, bypass_quota=False):
+    if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
+        logger.error("ClickSend credentials not configured")
+        return {"error": "SMS service not configured"}
+    
+    url = "https://rest.clicksend.com/v3/sms/send"
+    headers = {"Content-Type": "application/json"}
+    
+    if len(message) > 1600:
+        message = message[:1597] + "..."
+    
+    payload = {"messages": [{
+        "source": "python",
+        "body": message,
+        "to": to_number,
+        "custom_string": "alex_reply"
+    }]}
+    
+    try:
+        logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}...")
+        
+        resp = requests.post(
+            url,
+            auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        
+        result = resp.json()
+        
+        if resp.status_code == 200:
+            if "data" in result and "messages" in result["data"]:
+                messages = result["data"]["messages"]
+                if messages:
+                    msg_status = messages[0].get("status")
+                    msg_id = messages[0].get("message_id")
+                    
+                    logger.info(f"✅ SMS queued successfully to {to_number}")
+                    
+                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
+                    
+                    if not bypass_quota:
+                        track_monthly_sms_usage(to_number, is_outgoing=True)
+            
+            return result
+        else:
+            logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
+            return {"error": f"ClickSend API error: {resp.status_code}"}
+            
+    except Exception as e:
+        logger.error(f"💥 SMS Exception for {to_number}: {e}")
+        return {"error": f"SMS send failed: {str(e)}"}
+
+def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
+                connection.commit()
+    except Exception as e:
+        logger.error(f"Error logging SMS delivery: {e}")
+
+def get_current_period_dates():
+    now = datetime.now(timezone.utc)
+    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    period_end = period_start + timedelta(days=30)
+    return period_start.date(), period_end.date()
+
+def track_monthly_sms_usage(phone, is_outgoing=True):
+    if not is_outgoing:
+        return True, {}, None
+    
+    period_start, period_end = get_current_period_dates()
+    
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, message_count, quota_warnings_sent, quota_exceeded
+                        FROM monthly_sms_usage
+                        WHERE phone = %s AND period_start = %s
+                    """, (phone, period_start))
+                    
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        usage_id, current_count, warnings_sent, quota_exceeded = result['id'], result['message_count'], result['quota_warnings_sent'], result['quota_exceeded']
+                        new_count = current_count + 1
+                        
+                        cursor.execute("""
+                            UPDATE monthly_sms_usage 
+                            SET message_count = %s, last_message_date = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                        """, (new_count, usage_id))
+                    else:
+                        new_count = 1
+                        warnings_sent = 0
+                        quota_exceeded = False
+                        
+                        cursor.execute("""
+                            INSERT INTO monthly_sms_usage 
+                            (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT id, message_count, quota_warnings_sent, quota_exceeded
+                    FROM monthly_sms_usage
+                    WHERE phone = ? AND period_start = ?
+                """, (phone, period_start))
+                
+                result = c.fetchone()
+                
+                if result:
+                    usage_id, current_count, warnings_sent, quota_exceeded = result
+                    new_count = current_count + 1
+                    
+                    c.execute("""
+                        UPDATE monthly_sms_usage 
+                        SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (new_count, usage_id))
+                else:
+                    new_count = 1
+                    warnings_sent = 0
+                    quota_exceeded = False
+                    
+                    c.execute("""
+                        INSERT INTO monthly_sms_usage 
+                        (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
+                
+                connection.commit()
+        
+        usage_info = {
+            "phone": phone,
+            "current_count": new_count,
+            "monthly_limit": MONTHLY_LIMIT,
+            "remaining": max(0, MONTHLY_LIMIT - new_count),
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+        }
+        
+        return True, usage_info, None
+        
+    except Exception as e:
+        logger.error(f"Error tracking SMS usage: {e}")
+        return True, {}, None
+
+# === Content Filter ===
+class ContentFilter:
+    def __init__(self):
+        self.spam_keywords = {
+            'promotional': [
+                'free money', 'win cash', 'winner selected', 'claim prize', 
+                'congratulations you won', 'act now', 'limited time offer',
+                'click here to claim', 'urgent response required'
+            ]
+        }
+        
+        self.question_patterns = [
+            r'\b(what|who|when|where|why|how|do|does|is|are|can|will|would|should)\b.*\?',
+            r'\b(free will|philosophy|philosophical|ethics|moral|meaning)\b',
+            r'\b(illusion|reality|consciousness|existence|purpose)\b'
+        ]
+    
+    def is_spam(self, text: str) -> tuple[bool, str]:
+        text_lower = text.lower().strip()
+        
+        for pattern in self.question_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return False, ""
+        
+        for category, keywords in self.spam_keywords.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return True, f"Spam detected: {category}"
+        
+        return False, ""
+    
+    def is_valid_query(self, text: str) -> tuple[bool, str]:
+        text = text.strip()
+        if len(text) < 2:
+            return False, "Query too short"
+        if len(text) > 500:
+            return False, "Query too long"
+        
+        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks', 'stop', 'start']
+        if text.lower() in short_allowed:
+            return True, ""
+        
+        is_spam, spam_reason = self.is_spam(text)
+        if is_spam:
+            return False, spam_reason
+        
+        return True, ""
+
+content_filter = ContentFilter()
+
+# === Enhanced Intent Detection ===
+@dataclass
+class IntentResult:
+    type: str
+    entities: Dict[str, Any]
+    confidence: float = 1.0
+
+def detect_sports_schedule_intent(text: str) -> Optional[IntentResult]:
+    """Detect when user is asking about sports schedules"""
+    sports_schedule_patterns = [
+        r'\b(when|what time)\s+(?:is|are)\s+(?:the\s+)?(?:next|upcoming)\s+(.+?)\s+(game|match)\b',
+        r'\bnext\s+(.+?)\s+(game|match)\b',
+        r'\b(.+?)\s+(schedule|game time|next game)\b',
+        r'\bwhen\s+(?:do|does)\s+(?:the\s+)?(.+?)\s+play\b'
+    ]
+    
+    for pattern in sports_schedule_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            # Extract team name
+            team_parts = match.groups()
+            team = None
+            for part in team_parts:
+                if part and part.lower() not in ['game', 'match', 'schedule', 'next', 'time']:
+                    team = part.strip()
+                    break
+            
+            return IntentResult("sports_schedule", {
+                "team": team,
+                "query": text
+            })
+    
+    return None
+
+def detect_business_hours_intent(text: str) -> Optional[IntentResult]:
+    """Detect when user is asking about business hours"""
+    hours_patterns = [
+        r'\b(?:what\s+time|when)\s+(?:does|do|is|are)\s+(.+?)\s+(?:open|close|hours)\b',
+        r'\b(.+?)\s+(?:hours|open|close)\b',
+        r'\bis\s+(.+?)\s+open\b'
+    ]
+    
+    for pattern in hours_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            business = match.group(1).strip()
+            return IntentResult("business_hours", {
+                "business": business,
+                "query": text
+            })
+    
+    return None
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    weather_patterns = [
+        r'\bweather\b',
+        r'\btemperature\b',
+        r'\bforecast\b',
+        r'\brain\b',
+        r'\bsnow\b',
+        r'\bsunny\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
+        return IntentResult("weather", {})
+    return None
+
+def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
+    """Enhanced intent detection with sports and business queries"""
+    
+    # Check for sports schedule queries first
+    sports_intent = detect_sports_schedule_intent(text)
+    if sports_intent:
+        return sports_intent
+    
+    # Check for business hours
+    hours_intent = detect_business_hours_intent(text)
+    if hours_intent:
+        return hours_intent
+    
+    # Check for weather
+    weather_intent = detect_weather_intent(text)
+    if weather_intent:
+        return weather_intent
+    
+    return None
+
+# === Enhanced Web Search Functions ===
+def enhanced_web_search(query, search_type="general", user_location=None):
+    """Enhanced search with better query construction for specific types"""
+    
+    if not SERPAPI_API_KEY:
+        logger.warning("❌ SERPAPI_API_KEY not configured - search unavailable")
+        return "I'd love to search for that information, but my search service isn't configured right now. Please contact support."
+    
+    # Enhance the query based on search type
+    if search_type == "sports_schedule":
+        # For sports, we want current season schedule with dates
+        current_year = datetime.now().year
+        enhanced_query = f"{query} {current_year} schedule next game date time"
+        
+    elif search_type == "business_hours":
+        # For business hours, add location context
+        if user_location:
+            enhanced_query = f"{query} hours {user_location}"
+        else:
+            enhanced_query = f"{query} hours open close times"
+            
+    else:
+        enhanced_query = query
+    
+    logger.info(f"🔍 Enhanced search query: {enhanced_query}")
+    
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google",
+        "q": enhanced_query,
+        "num": 5,  # Get more results to find better info
+        "api_key": SERPAPI_API_KEY,
+        "hl": "en",
+        "gl": "us",
+    }
+    
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        
+        if r.status_code != 200:
+            logger.error(f"❌ Search API error: {r.status_code}")
+            return f"Search temporarily unavailable. Try again later."
+            
+        data = r.json()
+        logger.info(f"✅ Search response received")
+        
+        if 'error' in data:
+            logger.error(f"❌ SerpAPI error: {data['error']}")
+            return "Search service error. Please try again later."
+        
+    except Exception as e:
+        logger.error(f"💥 Search exception: {e}")
+        return "Search service temporarily unavailable. Try again later."
+
+    # Enhanced result processing based on search type
+    if search_type == "sports_schedule":
+        return process_sports_results(data, query)
+    elif search_type == "business_hours":
+        return process_business_hours_results(data, query)
+    else:
+        return process_general_results(data, query)
+
+def process_sports_results(data, original_query):
+    """Process search results specifically for sports schedules"""
+    
+    # Look for answer box or featured snippet first
+    if "answer_box" in data:
+        answer = data["answer_box"]
+        if "answer" in answer:
+            return f"{answer['answer']}"
+        elif "snippet" in answer:
+            return f"{answer['snippet']}"
+    
+    # Look for sports results
+    if "sports_results" in data:
+        sports = data["sports_results"]
+        if "games" in sports and sports["games"]:
+            next_game = sports["games"][0]
+            
+            # Extract game info
+            date = next_game.get("date", "")
+            time = next_game.get("time", "")
+            teams = next_game.get("teams", [])
+            
+            if len(teams) >= 2:
+                team1 = teams[0].get("name", "")
+                team2 = teams[1].get("name", "")
+                
+                result = f"Next game: {team1} vs {team2}"
+                if date:
+                    result += f" on {date}"
+                if time:
+                    result += f" at {time}"
+                
+                return result
+    
+    # Fall back to organic results
+    org = data.get("organic_results", [])
+    if org:
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result = f"{title}"
+        if snippet:
+            result += f" — {snippet}"
+        return result[:500]
+    
+    return f"I couldn't find specific schedule information for {original_query}. Try checking the team's official website."
+
+def process_business_hours_results(data, original_query):
+    """Process search results specifically for business hours"""
+    
+    # Look for knowledge panel with hours
+    if "knowledge_graph" in data:
+        kg = data["knowledge_graph"]
+        if "hours" in kg:
+            hours = kg["hours"]
+            return f"Hours: {hours}"
+        elif "description" in kg:
+            desc = kg["description"]
+            if any(word in desc.lower() for word in ['open', 'hours', 'am', 'pm']):
+                return desc
+    
+    # Look for local results with hours
+    if "local_results" in data and data["local_results"]:
+        local = data["local_results"][0]
+        
+        name = local.get("title", "")
+        hours = local.get("hours", "")
+        
+        if hours:
+            return f"{name} — {hours}"
+    
+    # Fall back to organic results
+    return process_general_results(data, original_query)
+
+def process_general_results(data, original_query):
+    """Process general search results"""
+    org = data.get("organic_results", [])
+    if org:
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result = f"{title}"
+        if snippet:
+            result += f" — {snippet}"
+        return result[:500]
+    
+    return f"No results found for '{original_query}'."
+
+# === Claude Integration ===
+def ask_claude(phone, user_msg):
+    start_time = time.time()
+    
+    if not anthropic_client:
+        logger.warning("❌ ANTHROPIC_API_KEY not configured - Claude unavailable")
+        return "I'd love to help with that question, but my AI service isn't configured right now. Let me try to search for that information instead."
+    
+    try:
+        history = load_history(phone, limit=4)
+        
+        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
+
+IMPORTANT GUIDELINES:
+- Keep responses under 500 characters when possible for SMS
+- Be friendly and helpful
+- You DO have access to web search capabilities
+- For specific information requests, respond with "Let me search for [specific topic]" 
+- Never make up detailed information - always offer to search for accurate, current details
+- Be conversational and helpful"""
+        
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            messages = []
+            for msg in history[-3:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            messages.append({
+                "role": "user",
+                "content": user_msg
+            })
+            
+            data = {
+                "model": "claude-3-haiku-20240307",
+                "max_tokens": 150,
+                "temperature": 0.3,
+                "system": system_context,
+                "messages": messages
+            }
+            
+            logger.info(f"🤖 Calling Claude API")
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=15
+            )
+            
+            logger.info(f"📡 Claude API response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                reply = result.get("content", [{}])[0].get("text", "").strip()
+                logger.info(f"✅ Claude responded successfully")
+            else:
+                logger.error(f"❌ Claude API error: {response.status_code}")
+                raise Exception(f"API call failed with status {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"💥 Claude API exception: {e}")
+            return "I'm having trouble with my AI service right now. Let me try to search for that information instead."
+        
+        if not reply:
+            logger.warning("⚠️ Claude returned empty response")
+            return "I'm having trouble processing that question. Let me try to search for that information instead."
+        
+        # Check if Claude suggests a search
+        search_suggestion_patterns = [
+            r'let me search for (.+?)(?:\.|$)',
+            r'i can search for (.+?)(?:\.|$)',
+            r'search for (.+?)(?:\.|$)'
+        ]
+        
+        for pattern in search_suggestion_patterns:
+            match = re.search(pattern, reply, re.I)
+            if match:
+                search_term = match.group(1).strip()
+                logger.info(f"🔍 Claude suggested search for: {search_term}")
+                search_result = enhanced_web_search(search_term, search_type="general")
+                return search_result
+        
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
+            
+        response_time = int((time.time() - start_time) * 1000)
+        
+        try:
+            log_usage_analytics(phone, "claude_chat", True, response_time)
+        except Exception as analytics_error:
+            logger.error(f"Analytics logging failed: {analytics_error}")
+        
+        return reply
+        
+    except Exception as e:
+        logger.error(f"💥 Claude integration error for {phone}: {e}")
+        return "I'm having trouble processing that question. Let me try to search for that information instead."
+
+# === Enhanced Query Processing ===
+def process_user_query(sender, body, user_context):
+    """Enhanced query processing with better intent handling"""
+    
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
+    
+    logger.info(f"🎯 Detected intent: {intent_type}")
+    
+    try:
+        if intent and intent.type == "sports_schedule":
+            # Handle sports schedule queries
+            team = intent.entities.get("team", "")
+            logger.info(f"🏈 Sports schedule query for team: {team}")
+            
+            response_msg = enhanced_web_search(
+                body, 
+                search_type="sports_schedule", 
+                user_location=user_context.get('location')
+            )
+            
+            if user_context['personalized']:
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+                
+        elif intent and intent.type == "business_hours":
+            # Handle business hours queries
+            business = intent.entities.get("business", "")
+            logger.info(f"🏪 Business hours query for: {business}")
+            
+            response_msg = enhanced_web_search(
+                body, 
+                search_type="business_hours", 
+                user_location=user_context.get('location')
+            )
+            
+        elif intent and intent.type == "weather":
+            # Use user's location if available
+            if user_context['personalized']:
+                city = user_context['location']
+                logger.info(f"🌍 Using user's saved location: {city}")
+                query = f"weather forecast {city}"
+                response_msg = enhanced_web_search(query, search_type="general")
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+            else:
+                response_msg = enhanced_web_search("weather forecast", search_type="general")
+                
+        else:
+            # Use Claude for general queries
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            # If Claude suggests a search, perform it with enhanced search
+            if "Let me search for" in response_msg:
+                search_term = body
+                # Add location context to search if available
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = enhanced_web_search(search_term, search_type="general")
+        
+        return response_msg, intent_type
+        
+    except Exception as e:
+        logger.error(f"💥 Query processing error: {e}")
+        return "Sorry, I'm having trouble processing your request. Please try again.", "error"
 
 # === Stripe Webhook Handlers ===
 @app.route('/stripe/webhook', methods=['POST'])
@@ -1011,690 +1941,6 @@ def handle_payment_failed(invoice):
         
     except Exception as e:
         logger.error(f"❌ Error handling payment failure: {e}")
-
-# === SMS Functions ===
-def send_sms(to_number, message, bypass_quota=False):
-    if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
-        logger.error("ClickSend credentials not configured")
-        return {"error": "SMS service not configured"}
-    
-    url = "https://rest.clicksend.com/v3/sms/send"
-    headers = {"Content-Type": "application/json"}
-    
-    if len(message) > 1600:
-        message = message[:1597] + "..."
-    
-    payload = {"messages": [{
-        "source": "python",
-        "body": message,
-        "to": to_number,
-        "custom_string": "alex_reply"
-    }]}
-    
-    try:
-        logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}...")
-        
-        resp = requests.post(
-            url,
-            auth=(CLICKSEND_USERNAME, CLICKSEND_API_KEY),
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        
-        result = resp.json()
-        
-        if resp.status_code == 200:
-            if "data" in result and "messages" in result["data"]:
-                messages = result["data"]["messages"]
-                if messages:
-                    msg_status = messages[0].get("status")
-                    msg_id = messages[0].get("message_id")
-                    
-                    logger.info(f"✅ SMS queued successfully to {to_number}")
-                    
-                    log_sms_delivery(to_number, message, result, msg_status, msg_id)
-                    
-                    if not bypass_quota:
-                        track_monthly_sms_usage(to_number, is_outgoing=True)
-            
-            return result
-        else:
-            logger.error(f"❌ ClickSend API Error {resp.status_code}: {result}")
-            return {"error": f"ClickSend API error: {resp.status_code}"}
-            
-    except Exception as e:
-        logger.error(f"💥 SMS Exception for {to_number}: {e}")
-        return {"error": f"SMS send failed: {str(e)}"}
-
-def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
-        conn.commit()
-
-def save_message(phone, role, content, intent_type=None, response_time_ms=None):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, role, content, intent_type, response_time_ms))
-        conn.commit()
-
-def load_history(phone, limit=4):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE phone = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (phone, limit))
-        rows = c.fetchall()
-    return [{"role": r, "content": t} for (r, t) in reversed(rows)]
-
-def log_usage_analytics(phone, intent_type, success, response_time_ms):
-    """Log usage analytics with error handling for missing table"""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
-                VALUES (?, ?, ?, ?)
-            """, (phone, intent_type, success, response_time_ms))
-            conn.commit()
-    except sqlite3.OperationalError as e:
-        if "no such table: usage_analytics" in str(e):
-            logger.error("❌ usage_analytics table missing - attempting to create it")
-            try:
-                with closing(sqlite3.connect(DB_PATH)) as conn:
-                    c = conn.cursor()
-                    c.execute("""
-                    CREATE TABLE IF NOT EXISTS usage_analytics (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        phone TEXT NOT NULL,
-                        intent_type TEXT,
-                        success BOOLEAN,
-                        response_time_ms INTEGER,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
-                    """)
-                    # Try the insert again
-                    c.execute("""
-                        INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
-                        VALUES (?, ?, ?, ?)
-                    """, (phone, intent_type, success, response_time_ms))
-                    conn.commit()
-                    logger.info("✅ Created usage_analytics table and logged data")
-            except Exception as create_error:
-                logger.error(f"💥 Failed to create usage_analytics table: {create_error}")
-        else:
-            logger.error(f"💥 Usage analytics logging error: {e}")
-    except Exception as e:
-        logger.error(f"💥 Unexpected error logging usage analytics: {e}")
-
-def get_current_period_dates():
-    now = datetime.now(timezone.utc)
-    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    period_end = period_start + timedelta(days=30)
-    return period_start.date(), period_end.date()
-
-def track_monthly_sms_usage(phone, is_outgoing=True):
-    if not is_outgoing:
-        return True, {}, None
-    
-    period_start, period_end = get_current_period_dates()
-    
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        
-        c.execute("""
-            SELECT id, message_count, quota_warnings_sent, quota_exceeded
-            FROM monthly_sms_usage
-            WHERE phone = ? AND period_start = ?
-        """, (phone, period_start))
-        
-        result = c.fetchone()
-        
-        if result:
-            usage_id, current_count, warnings_sent, quota_exceeded = result
-            new_count = current_count + 1
-            
-            c.execute("""
-                UPDATE monthly_sms_usage 
-                SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (new_count, usage_id))
-        else:
-            new_count = 1
-            warnings_sent = 0
-            quota_exceeded = False
-            
-            c.execute("""
-                INSERT INTO monthly_sms_usage 
-                (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
-            
-            usage_id = c.lastrowid
-        
-        conn.commit()
-        
-        usage_info = {
-            "phone": phone,
-            "current_count": new_count,
-            "monthly_limit": MONTHLY_LIMIT,
-            "remaining": max(0, MONTHLY_LIMIT - new_count),
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
-        }
-        
-        return True, usage_info, None
-
-# === Content Filter ===
-class ContentFilter:
-    def __init__(self):
-        self.spam_keywords = {
-            'promotional': [
-                'free money', 'win cash', 'winner selected', 'claim prize', 
-                'congratulations you won', 'act now', 'limited time offer',
-                'click here to claim', 'urgent response required'
-            ]
-        }
-        
-        self.question_patterns = [
-            r'\b(what|who|when|where|why|how|do|does|is|are|can|will|would|should)\b.*\?',
-            r'\b(free will|philosophy|philosophical|ethics|moral|meaning)\b',
-            r'\b(illusion|reality|consciousness|existence|purpose)\b'
-        ]
-    
-    def is_spam(self, text: str) -> tuple[bool, str]:
-        text_lower = text.lower().strip()
-        
-        for pattern in self.question_patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                return False, ""
-        
-        for category, keywords in self.spam_keywords.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return True, f"Spam detected: {category}"
-        
-        return False, ""
-    
-    def is_valid_query(self, text: str) -> tuple[bool, str]:
-        text = text.strip()
-        if len(text) < 2:
-            return False, "Query too short"
-        if len(text) > 500:
-            return False, "Query too long"
-        
-        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks', 'stop', 'start']
-        if text.lower() in short_allowed:
-            return True, ""
-        
-        is_spam, spam_reason = self.is_spam(text)
-        if is_spam:
-            return False, spam_reason
-        
-        return True, ""
-
-content_filter = ContentFilter()
-
-# === Enhanced Intent Detection ===
-@dataclass
-class IntentResult:
-    type: str
-    entities: Dict[str, Any]
-    confidence: float = 1.0
-
-def detect_sports_schedule_intent(text: str) -> Optional[IntentResult]:
-    """Detect when user is asking about sports schedules"""
-    sports_schedule_patterns = [
-        r'\b(when|what time)\s+(?:is|are)\s+(?:the\s+)?(?:next|upcoming)\s+(.+?)\s+(game|match)\b',
-        r'\bnext\s+(.+?)\s+(game|match)\b',
-        r'\b(.+?)\s+(schedule|game time|next game)\b',
-        r'\bwhen\s+(?:do|does)\s+(?:the\s+)?(.+?)\s+play\b'
-    ]
-    
-    for pattern in sports_schedule_patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            # Extract team name
-            team_parts = match.groups()
-            team = None
-            for part in team_parts:
-                if part and part.lower() not in ['game', 'match', 'schedule', 'next', 'time']:
-                    team = part.strip()
-                    break
-            
-            return IntentResult("sports_schedule", {
-                "team": team,
-                "query": text
-            })
-    
-    return None
-
-def detect_business_hours_intent(text: str) -> Optional[IntentResult]:
-    """Detect when user is asking about business hours"""
-    hours_patterns = [
-        r'\b(?:what\s+time|when)\s+(?:does|do|is|are)\s+(.+?)\s+(?:open|close|hours)\b',
-        r'\b(.+?)\s+(?:hours|open|close)\b',
-        r'\bis\s+(.+?)\s+open\b'
-    ]
-    
-    for pattern in hours_patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            business = match.group(1).strip()
-            return IntentResult("business_hours", {
-                "business": business,
-                "query": text
-            })
-    
-    return None
-
-def detect_weather_intent(text: str) -> Optional[IntentResult]:
-    weather_patterns = [
-        r'\bweather\b',
-        r'\btemperature\b',
-        r'\bforecast\b',
-        r'\brain\b',
-        r'\bsnow\b',
-        r'\bsunny\b'
-    ]
-    
-    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
-        return IntentResult("weather", {})
-    return None
-
-def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
-    """Enhanced intent detection with sports and business queries"""
-    
-    # Check for sports schedule queries first
-    sports_intent = detect_sports_schedule_intent(text)
-    if sports_intent:
-        return sports_intent
-    
-    # Check for business hours
-    hours_intent = detect_business_hours_intent(text)
-    if hours_intent:
-        return hours_intent
-    
-    # Check for weather
-    weather_intent = detect_weather_intent(text)
-    if weather_intent:
-        return weather_intent
-    
-    return None
-
-# === Enhanced Web Search Functions ===
-def enhanced_web_search(query, search_type="general", user_location=None):
-    """Enhanced search with better query construction for specific types"""
-    
-    if not SERPAPI_API_KEY:
-        logger.warning("❌ SERPAPI_API_KEY not configured - search unavailable")
-        return "I'd love to search for that information, but my search service isn't configured right now. Please contact support."
-    
-    # Enhance the query based on search type
-    if search_type == "sports_schedule":
-        # For sports, we want current season schedule with dates
-        current_year = datetime.now().year
-        enhanced_query = f"{query} {current_year} schedule next game date time"
-        
-    elif search_type == "business_hours":
-        # For business hours, add location context
-        if user_location:
-            enhanced_query = f"{query} hours {user_location}"
-        else:
-            enhanced_query = f"{query} hours open close times"
-            
-    else:
-        enhanced_query = query
-    
-    logger.info(f"🔍 Enhanced search query: {enhanced_query}")
-    
-    url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google",
-        "q": enhanced_query,
-        "num": 5,  # Get more results to find better info
-        "api_key": SERPAPI_API_KEY,
-        "hl": "en",
-        "gl": "us",
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        
-        if r.status_code != 200:
-            logger.error(f"❌ Search API error: {r.status_code}")
-            return f"Search temporarily unavailable. Try again later."
-            
-        data = r.json()
-        logger.info(f"✅ Search response received")
-        
-        if 'error' in data:
-            logger.error(f"❌ SerpAPI error: {data['error']}")
-            return "Search service error. Please try again later."
-        
-    except Exception as e:
-        logger.error(f"💥 Search exception: {e}")
-        return "Search service temporarily unavailable. Try again later."
-
-    # Enhanced result processing based on search type
-    if search_type == "sports_schedule":
-        return process_sports_results(data, query)
-    elif search_type == "business_hours":
-        return process_business_hours_results(data, query)
-    else:
-        return process_general_results(data, query)
-
-def process_sports_results(data, original_query):
-    """Process search results specifically for sports schedules"""
-    
-    # Look for answer box or featured snippet first
-    if "answer_box" in data:
-        answer = data["answer_box"]
-        if "answer" in answer:
-            return f"{answer['answer']}"
-        elif "snippet" in answer:
-            return f"{answer['snippet']}"
-    
-    # Look for sports results
-    if "sports_results" in data:
-        sports = data["sports_results"]
-        if "games" in sports and sports["games"]:
-            next_game = sports["games"][0]
-            
-            # Extract game info
-            date = next_game.get("date", "")
-            time = next_game.get("time", "")
-            teams = next_game.get("teams", [])
-            
-            if len(teams) >= 2:
-                team1 = teams[0].get("name", "")
-                team2 = teams[1].get("name", "")
-                
-                result = f"Next game: {team1} vs {team2}"
-                if date:
-                    result += f" on {date}"
-                if time:
-                    result += f" at {time}"
-                
-                return result
-    
-    # Look for knowledge graph info
-    if "knowledge_graph" in data:
-        kg = data["knowledge_graph"]
-        if "description" in kg:
-            return kg["description"]
-    
-    # Fall back to organic results but look for date/time info
-    org = data.get("organic_results", [])
-    for result in org[:3]:
-        title = result.get("title", "")
-        snippet = result.get("snippet", "")
-        
-        # Look for date patterns in the snippet
-        date_patterns = [
-            r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}',
-            r'\d{1,2}/\d{1,2}/\d{4}',
-            r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)',
-            r'\d{1,2}:\d{2}\s*(AM|PM|am|pm)',
-            r'(today|tomorrow|this\s+\w+|next\s+\w+)'
-        ]
-        
-        snippet_lower = snippet.lower()
-        has_date_info = any(re.search(pattern, snippet, re.I) for pattern in date_patterns)
-        
-        # Prioritize results with actual date/time information
-        if has_date_info and any(word in snippet_lower for word in ['game', 'play', 'vs', 'against', 'kickoff', 'tip-off']):
-            result_text = title
-            if snippet:
-                result_text += f" — {snippet}"
-            return result_text[:500]
-    
-    # If no specific date info found, return the first relevant result
-    if org:
-        top = org[0]
-        title = top.get("title", "")
-        snippet = top.get("snippet", "")
-        
-        result_text = f"{title}"
-        if snippet:
-            result_text += f" — {snippet}"
-        
-        # Add a helpful note if we couldn't find specific date info
-        if "schedule" in result_text.lower() and not any(re.search(pattern, result_text, re.I) for pattern in [r'\d{1,2}/\d{1,2}', r'(today|tomorrow)', r'\d{1,2}:\d{2}']):
-            result_text += " (Check the team's official website for specific game times)"
-        
-        return result_text[:500]
-    
-    return f"I couldn't find specific schedule information for {original_query}. Try checking the team's official website."
-
-def process_business_hours_results(data, original_query):
-    """Process search results specifically for business hours"""
-    
-    # Look for knowledge panel with hours
-    if "knowledge_graph" in data:
-        kg = data["knowledge_graph"]
-        if "hours" in kg:
-            hours = kg["hours"]
-            return f"Hours: {hours}"
-        elif "description" in kg:
-            desc = kg["description"]
-            if any(word in desc.lower() for word in ['open', 'hours', 'am', 'pm']):
-                return desc
-    
-    # Look for local results with hours
-    if "local_results" in data and data["local_results"]:
-        local = data["local_results"][0]
-        
-        name = local.get("title", "")
-        hours = local.get("hours", "")
-        
-        if hours:
-            return f"{name} — {hours}"
-    
-    # Fall back to organic results
-    return process_general_results(data, original_query)
-
-def process_general_results(data, original_query):
-    """Process general search results"""
-    org = data.get("organic_results", [])
-    if org:
-        top = org[0]
-        title = top.get("title", "")
-        snippet = top.get("snippet", "")
-        
-        result = f"{title}"
-        if snippet:
-            result += f" — {snippet}"
-        return result[:500]
-    
-    return f"No results found for '{original_query}'."
-
-# === Claude Integration ===
-def ask_claude(phone, user_msg):
-    start_time = time.time()
-    
-    if not anthropic_client:
-        logger.warning("❌ ANTHROPIC_API_KEY not configured - Claude unavailable")
-        return "I'd love to help with that question, but my AI service isn't configured right now. Let me try to search for that information instead."
-    
-    try:
-        history = load_history(phone, limit=4)
-        
-        system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
-
-IMPORTANT GUIDELINES:
-- Keep responses under 500 characters when possible for SMS
-- Be friendly and helpful
-- You DO have access to web search capabilities
-- For specific information requests, respond with "Let me search for [specific topic]" 
-- Never make up detailed information - always offer to search for accurate, current details
-- Be conversational and helpful"""
-        
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "X-API-Key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01"
-            }
-            
-            messages = []
-            for msg in history[-3:]:
-                messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-            messages.append({
-                "role": "user",
-                "content": user_msg
-            })
-            
-            data = {
-                "model": "claude-3-haiku-20240307",
-                "max_tokens": 150,
-                "temperature": 0.3,
-                "system": system_context,
-                "messages": messages
-            }
-            
-            logger.info(f"🤖 Calling Claude API")
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data,
-                timeout=15
-            )
-            
-            logger.info(f"📡 Claude API response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                reply = result.get("content", [{}])[0].get("text", "").strip()
-                logger.info(f"✅ Claude responded successfully")
-            else:
-                logger.error(f"❌ Claude API error: {response.status_code}")
-                raise Exception(f"API call failed with status {response.status_code}")
-                
-        except Exception as e:
-            logger.error(f"💥 Claude API exception: {e}")
-            return "I'm having trouble with my AI service right now. Let me try to search for that information instead."
-        
-        if not reply:
-            logger.warning("⚠️ Claude returned empty response")
-            return "I'm having trouble processing that question. Let me try to search for that information instead."
-        
-        # Check if Claude suggests a search
-        search_suggestion_patterns = [
-            r'let me search for (.+?)(?:\.|$)',
-            r'i can search for (.+?)(?:\.|$)',
-            r'search for (.+?)(?:\.|$)'
-        ]
-        
-        for pattern in search_suggestion_patterns:
-            match = re.search(pattern, reply, re.I)
-            if match:
-                search_term = match.group(1).strip()
-                logger.info(f"🔍 Claude suggested search for: {search_term}")
-                search_result = enhanced_web_search(search_term, search_type="general")
-                return search_result
-        
-        if len(reply) > 500:
-            reply = reply[:497] + "..."
-            
-        response_time = int((time.time() - start_time) * 1000)
-        
-        try:
-            log_usage_analytics(phone, "claude_chat", True, response_time)
-        except Exception as analytics_error:
-            logger.error(f"Analytics logging failed: {analytics_error}")
-        
-        return reply
-        
-    except Exception as e:
-        logger.error(f"💥 Claude integration error for {phone}: {e}")
-        return "I'm having trouble processing that question. Let me try to search for that information instead."
-
-# === Enhanced Query Processing ===
-def process_user_query(sender, body, user_context):
-    """Enhanced query processing with better intent handling"""
-    
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
-    logger.info(f"🎯 Detected intent: {intent_type}")
-    
-    try:
-        if intent and intent.type == "sports_schedule":
-            # Handle sports schedule queries
-            team = intent.entities.get("team", "")
-            logger.info(f"🏈 Sports schedule query for team: {team}")
-            
-            response_msg = enhanced_web_search(
-                body, 
-                search_type="sports_schedule", 
-                user_location=user_context.get('location')
-            )
-            
-            if user_context['personalized']:
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-                
-        elif intent and intent.type == "business_hours":
-            # Handle business hours queries
-            business = intent.entities.get("business", "")
-            logger.info(f"🏪 Business hours query for: {business}")
-            
-            response_msg = enhanced_web_search(
-                body, 
-                search_type="business_hours", 
-                user_location=user_context.get('location')
-            )
-            
-        elif intent and intent.type == "weather":
-            # Use user's location if available
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = enhanced_web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = enhanced_web_search("weather forecast", search_type="general")
-                
-        else:
-            # Use Claude for general queries
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            # If Claude suggests a search, perform it with enhanced search
-            if "Let me search for" in response_msg:
-                search_term = body
-                # Add location context to search if available
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = enhanced_web_search(search_term, search_type="general")
-        
-        return response_msg, intent_type
-        
-    except Exception as e:
-        logger.error(f"💥 Query processing error: {e}")
-        return "Sorry, I'm having trouble processing your request. Please try again.", "error"
 
 # === Rate Limiting ===
 def can_send(sender):
@@ -1963,181 +2209,82 @@ def admin_add_to_whitelist():
 def get_all_users():
     """Admin endpoint to view all users with their profiles and subscription status"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    up.phone, 
-                    up.first_name, 
-                    up.location, 
-                    up.onboarding_step,
-                    up.onboarding_completed,
-                    up.stripe_customer_id,
-                    up.subscription_status,
-                    up.subscription_id,
-                    up.trial_end_date,
-                    up.created_date
-                FROM user_profiles up
-                ORDER BY up.created_date DESC
-            """)
-            
-            users = []
-            for row in c.fetchall():
-                users.append({
-                    'phone': row[0],
-                    'first_name': row[1],
-                    'location': row[2],
-                    'onboarding_step': row[3],
-                    'onboarding_completed': bool(row[4]),
-                    'stripe_customer_id': row[5],
-                    'subscription_status': row[6],
-                    'subscription_id': row[7],
-                    'trial_end_date': row[8],
-                    'created_date': row[9]
-                })
-            
-            return jsonify({
-                'total_users': len(users),
-                'users': users
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting all users: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/stripe/events', methods=['GET'])
-def get_stripe_events():
-    """Admin endpoint to view recent Stripe webhook events"""
-    try:
-        limit = request.args.get('limit', 50, type=int)
+        conn, db_type = get_db_connection()
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT event_type, customer_id, subscription_id, phone, status, details, timestamp
-                FROM stripe_events
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
-            
-            events = []
-            for row in c.fetchall():
-                event_details = None
-                if row[5]:  # details column
-                    try:
-                        event_details = json.loads(row[5])
-                    except:
-                        event_details = row[5]
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT 
+                            up.phone, 
+                            up.first_name, 
+                            up.location, 
+                            up.onboarding_step,
+                            up.onboarding_completed,
+                            up.stripe_customer_id,
+                            up.subscription_status,
+                            up.subscription_id,
+                            up.trial_end_date,
+                            up.created_date
+                        FROM user_profiles up
+                        ORDER BY up.created_date DESC
+                    """)
+                    
+                    users = []
+                    for row in cursor.fetchall():
+                        users.append({
+                            'phone': row['phone'],
+                            'first_name': row['first_name'],
+                            'location': row['location'],
+                            'onboarding_step': row['onboarding_step'],
+                            'onboarding_completed': bool(row['onboarding_completed']),
+                            'stripe_customer_id': row['stripe_customer_id'],
+                            'subscription_status': row['subscription_status'],
+                            'subscription_id': row['subscription_id'],
+                            'trial_end_date': row['trial_end_date'],
+                            'created_date': row['created_date']
+                        })
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT 
+                        up.phone, 
+                        up.first_name, 
+                        up.location, 
+                        up.onboarding_step,
+                        up.onboarding_completed,
+                        up.stripe_customer_id,
+                        up.subscription_status,
+                        up.subscription_id,
+                        up.trial_end_date,
+                        up.created_date
+                    FROM user_profiles up
+                    ORDER BY up.created_date DESC
+                """)
                 
-                events.append({
-                    'event_type': row[0],
-                    'customer_id': row[1],
-                    'subscription_id': row[2],
-                    'phone': row[3],
-                    'status': row[4],
-                    'details': event_details,
-                    'timestamp': row[6]
-                })
-            
-            return jsonify({
-                'total_events': len(events),
-                'events': events
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting Stripe events: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/subscription/status/<phone>', methods=['GET'])
-def get_subscription_status(phone):
-    """Admin endpoint to check a specific user's subscription status"""
-    try:
-        phone = normalize_phone_number(phone)
-        profile = get_user_profile(phone)
-        
-        if not profile:
-            return jsonify({"error": "User not found"}), 404
-        
-        # Get usage statistics
-        whitelist = load_whitelist()
-        is_whitelisted = phone in whitelist
-        
-        # Get recent messages
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT COUNT(*) FROM messages 
-                WHERE phone = ? AND ts > datetime('now', '-30 days')
-            """, (phone,))
-            recent_message_count = c.fetchone()[0]
+                users = []
+                for row in c.fetchall():
+                    users.append({
+                        'phone': row[0],
+                        'first_name': row[1],
+                        'location': row[2],
+                        'onboarding_step': row[3],
+                        'onboarding_completed': bool(row[4]),
+                        'stripe_customer_id': row[5],
+                        'subscription_status': row[6],
+                        'subscription_id': row[7],
+                        'trial_end_date': row[8],
+                        'created_date': row[9]
+                    })
         
         return jsonify({
-            'phone': phone,
-            'profile': profile,
-            'is_whitelisted': is_whitelisted,
-            'recent_message_count': recent_message_count,
-            'subscription_active': profile['subscription_status'] in ['active', 'trialing']
+            'total_users': len(users),
+            'users': users
         })
         
     except Exception as e:
-        logger.error(f"Error getting subscription status for {phone}: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/sync/stripe', methods=['POST'])
-def sync_stripe_customer():
-    """Admin endpoint to manually sync a Stripe customer with phone number"""
-    try:
-        data = request.get_json()
-        customer_id = data.get('customer_id')
-        phone = data.get('phone')
-        
-        if not customer_id or not phone:
-            return jsonify({"error": "Both customer_id and phone required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Get or create user profile
-        profile = get_user_profile(phone)
-        if not profile:
-            create_user_profile(phone, stripe_customer_id=customer_id)
-        else:
-            update_user_profile(phone, stripe_customer_id=customer_id)
-        
-        # Get current subscription from Stripe
-        try:
-            customer = stripe.Customer.retrieve(customer_id)
-            subscriptions = stripe.Subscription.list(customer=customer_id, status='all')
-            
-            if subscriptions.data:
-                latest_sub = subscriptions.data[0]  # Most recent subscription
-                update_user_profile(
-                    phone,
-                    subscription_status=latest_sub.status,
-                    subscription_id=latest_sub.id
-                )
-                
-                # Add to whitelist if subscription is active
-                if latest_sub.status in ['active', 'trialing']:
-                    add_to_whitelist(phone, send_welcome=False, source='admin_sync')
-                
-                return jsonify({
-                    "success": True,
-                    "message": f"Synced customer {customer_id} with phone {phone}",
-                    "subscription_status": latest_sub.status
-                })
-            else:
-                return jsonify({
-                    "success": True,
-                    "message": f"Synced customer {customer_id} with phone {phone}",
-                    "subscription_status": "no_subscription"
-                })
-        
-        except stripe.error.StripeError as e:
-            logger.error(f"Stripe error during sync: {e}")
-            return jsonify({"error": f"Stripe error: {str(e)}"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error syncing Stripe customer: {e}")
+        logger.error(f"Error getting all users: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
@@ -2147,6 +2294,7 @@ def health_check():
         "status": "healthy",
         "version": APP_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": "postgresql" if DATABASE_URL else "sqlite",
         "services": {
             "database": "connected",
             "clicksend": "configured" if CLICKSEND_API_KEY else "not_configured",
@@ -2160,48 +2308,78 @@ def health_check():
 def get_stats():
     """Admin endpoint to get system statistics"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Total users
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            total_users = c.fetchone()[0]
-            
-            # Active subscriptions
-            c.execute("SELECT COUNT(*) FROM user_profiles WHERE subscription_status IN ('active', 'trialing')")
-            active_subscriptions = c.fetchone()[0]
-            
-            # Completed onboarding
-            c.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_completed = TRUE")
-            onboarded_users = c.fetchone()[0]
-            
-            # Messages in last 30 days
-            c.execute("SELECT COUNT(*) FROM messages WHERE ts > datetime('now', '-30 days')")
-            recent_messages = c.fetchone()[0]
-            
-            # Successful responses in last 30 days
-            c.execute("SELECT COUNT(*) FROM usage_analytics WHERE success = TRUE AND timestamp > datetime('now', '-30 days')")
-            successful_responses = c.fetchone()[0]
-            
-            # Stripe events in last 7 days
-            c.execute("SELECT COUNT(*) FROM stripe_events WHERE timestamp > datetime('now', '-7 days')")
-            recent_stripe_events = c.fetchone()[0]
-            
-            # Whitelist count
-            whitelist = load_whitelist()
-            whitelist_count = len(whitelist)
-            
-            return jsonify({
-                "total_users": total_users,
-                "active_subscriptions": active_subscriptions,
-                "onboarded_users": onboarded_users,
-                "whitelist_count": whitelist_count,
-                "recent_messages_30d": recent_messages,
-                "successful_responses_30d": successful_responses,
-                "recent_stripe_events_7d": recent_stripe_events,
-                "success_rate": round((successful_responses / recent_messages * 100) if recent_messages > 0 else 0, 2)
-            })
-            
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    # Total users
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
+                    total_users = cursor.fetchone()['count']
+                    
+                    # Active subscriptions
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles WHERE subscription_status IN ('active', 'trialing')")
+                    active_subscriptions = cursor.fetchone()['count']
+                    
+                    # Completed onboarding
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_completed = TRUE")
+                    onboarded_users = cursor.fetchone()['count']
+                    
+                    # Messages in last 30 days
+                    cursor.execute("SELECT COUNT(*) FROM messages WHERE ts > CURRENT_TIMESTAMP - INTERVAL '30 days'")
+                    recent_messages = cursor.fetchone()['count']
+                    
+                    # Successful responses in last 30 days
+                    cursor.execute("SELECT COUNT(*) FROM usage_analytics WHERE success = TRUE AND timestamp > CURRENT_TIMESTAMP - INTERVAL '30 days'")
+                    successful_responses = cursor.fetchone()['count']
+                    
+                    # Stripe events in last 7 days
+                    cursor.execute("SELECT COUNT(*) FROM stripe_events WHERE timestamp > CURRENT_TIMESTAMP - INTERVAL '7 days'")
+                    recent_stripe_events = cursor.fetchone()['count']
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                
+                # Total users
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                total_users = c.fetchone()[0]
+                
+                # Active subscriptions
+                c.execute("SELECT COUNT(*) FROM user_profiles WHERE subscription_status IN ('active', 'trialing')")
+                active_subscriptions = c.fetchone()[0]
+                
+                # Completed onboarding
+                c.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_completed = TRUE")
+                onboarded_users = c.fetchone()[0]
+                
+                # Messages in last 30 days
+                c.execute("SELECT COUNT(*) FROM messages WHERE ts > datetime('now', '-30 days')")
+                recent_messages = c.fetchone()[0]
+                
+                # Successful responses in last 30 days
+                c.execute("SELECT COUNT(*) FROM usage_analytics WHERE success = TRUE AND timestamp > datetime('now', '-30 days')")
+                successful_responses = c.fetchone()[0]
+                
+                # Stripe events in last 7 days
+                c.execute("SELECT COUNT(*) FROM stripe_events WHERE timestamp > datetime('now', '-7 days')")
+                recent_stripe_events = c.fetchone()[0]
+        
+        # Whitelist count
+        whitelist = load_whitelist()
+        whitelist_count = len(whitelist)
+        
+        return jsonify({
+            "total_users": total_users,
+            "active_subscriptions": active_subscriptions,
+            "onboarded_users": onboarded_users,
+            "whitelist_count": whitelist_count,
+            "recent_messages_30d": recent_messages,
+            "successful_responses_30d": successful_responses,
+            "recent_stripe_events_7d": recent_stripe_events,
+            "success_rate": round((successful_responses / recent_messages * 100) if recent_messages > 0 else 0, 2),
+            "database_type": "postgresql" if DATABASE_URL else "sqlite"
+        })
+        
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         return jsonify({"error": str(e)}), 500
@@ -2211,18 +2389,34 @@ def get_stats():
 def landing_page():
     """Serve the landing page"""
     try:
-        # Read the landing page HTML file
-        with open('landing.html', 'r') as f:
-            html_content = f.read()
-        return html_content, 200, {'Content-Type': 'text/html'}
-    except FileNotFoundError:
-        # Fallback if landing page file doesn't exist
+        # Try to read the landing page HTML file
+        possible_files = ['landing.html', 'Hey Alex - SMS Assistant Landing Page.html', 'index.html']
+        
+        for filename in possible_files:
+            try:
+                with open(filename, 'r') as f:
+                    html_content = f.read()
+                return html_content, 200, {'Content-Type': 'text/html'}
+            except FileNotFoundError:
+                continue
+        
+        # Fallback if no landing page file exists
         return jsonify({
             "service": "Hey Alex SMS Assistant",
             "version": APP_VERSION,
             "status": "running",
             "description": "Personal SMS research assistant",
-            "subscribe": "Visit heyalex.co to subscribe"
+            "subscribe": "Visit heyalex.co to subscribe",
+            "database": "postgresql" if DATABASE_URL else "sqlite (local development)"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error serving landing page: {e}")
+        return jsonify({
+            "service": "Hey Alex SMS Assistant",
+            "version": APP_VERSION,
+            "status": "running",
+            "error": "Landing page unavailable"
         })
 
 # === Initialize and Run ===
@@ -2232,6 +2426,7 @@ init_db()
 if __name__ == "__main__":
     logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"🗄️ Database: {'PostgreSQL (Production)' if DATABASE_URL else 'SQLite (Local Development)'}")
     logger.info(f"🔗 Stripe webhook endpoint: /stripe/webhook")
     logger.info(f"📱 SMS webhook endpoint: /sms")
     logger.info(f"🏥 Health check endpoint: /health")
@@ -2251,5 +2446,14 @@ if __name__ == "__main__":
         logger.warning("Some features may not work properly")
     else:
         logger.info("✅ All critical configurations present")
+    
+    # Database connectivity check
+    try:
+        conn, db_type = get_db_connection()
+        logger.info(f"✅ Database connectivity verified: {db_type}")
+        if db_type == "postgresql":
+            conn.close()
+    except Exception as e:
+        logger.error(f"❌ Database connectivity failed: {e}")
     
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
