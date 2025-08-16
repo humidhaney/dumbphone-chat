@@ -22,20 +22,9 @@ import stripe
 import hmac
 import hashlib
 
-# PostgreSQL support with robust error handling
-POSTGRESQL_AVAILABLE = False
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    POSTGRESQL_AVAILABLE = True
-    print("✅ PostgreSQL support available")
-except ImportError as e:
-    print(f"⚠️ PostgreSQL not available: {e}")
-    print("📱 Will use SQLite - data will not persist between deployments")
-except Exception as e:
-    print(f"⚠️ PostgreSQL import error: {e}")
-    print("📱 Will use SQLite - data will not persist between deployments")
-
+# PostgreSQL support
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse
 
 # Load env vars
@@ -188,7 +177,7 @@ def handle_errors(f):
 # === Database Connection Management ===
 def get_db_connection():
     """Get database connection - PostgreSQL in production, SQLite locally"""
-    if DATABASE_URL and POSTGRESQL_AVAILABLE:
+    if DATABASE_URL:
         try:
             # Parse the DATABASE_URL
             parsed = urlparse(DATABASE_URL)
@@ -206,19 +195,11 @@ def get_db_connection():
             return conn, "postgresql"
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
-            logger.warning("Falling back to SQLite - data will not persist between deployments")
+            logger.info("Falling back to SQLite for local development")
             return sqlite3.connect(DB_PATH), "sqlite"
     else:
-        # Local development or PostgreSQL not available: Use SQLite
-        if DATABASE_URL and not POSTGRESQL_AVAILABLE:
-            logger.warning("DATABASE_URL set but PostgreSQL not available - using SQLite")
-            logger.warning("⚠️ Data will NOT persist between deployments!")
-        
-        # Ensure directory exists for SQLite
-        db_dir = os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.'
-        os.makedirs(db_dir, exist_ok=True)
-        
-        logger.info("Using SQLite for database")
+        # Local development: Use SQLite
+        logger.info("Using SQLite for local development")
         return sqlite3.connect(DB_PATH), "sqlite"
 
 # === Helper Functions ===
@@ -289,168 +270,289 @@ def init_db():
         logger.info(f"🗄️ Initializing {db_type} database")
         
         if db_type == "postgresql":
-            # PostgreSQL schema (this won't run since PostgreSQL is not available)
+            # PostgreSQL schema
             tables = [
-                # ... your PostgreSQL tables
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    stripe_customer_id TEXT,
+                    subscription_status TEXT DEFAULT 'inactive',
+                    subscription_id TEXT,
+                    trial_end_date TIMESTAMP,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS usage_analytics (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    intent_type TEXT,
+                    success BOOLEAN,
+                    response_time_ms INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS stripe_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT,
+                    phone TEXT,
+                    status TEXT,
+                    details TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT DEFAULT 'manual'
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status TEXT,
+                    message_id TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """
+            ]
+            
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);",
+                "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);",
+                "CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);"
             ]
             
             with conn:
                 with conn.cursor() as cursor:
                     for table in tables:
                         cursor.execute(table)
+                    for index in indexes:
+                        cursor.execute(index)
             
             logger.info("✅ PostgreSQL database initialized successfully")
             
         else:
-            # SQLite schema - FIX: Don't close connection in with statement
-            c = conn.cursor()
-            
-            # User profiles table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                first_name TEXT,
-                location TEXT,
-                onboarding_step INTEGER DEFAULT 0,
-                onboarding_completed BOOLEAN DEFAULT FALSE,
-                stripe_customer_id TEXT,
-                subscription_status TEXT DEFAULT 'inactive',
-                subscription_id TEXT,
-                trial_end_date DATETIME,
-                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Messages table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                content TEXT NOT NULL,
-                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                intent_type TEXT,
-                response_time_ms INTEGER
-            );
-            """)
-            
-            # Usage analytics table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS usage_analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                intent_type TEXT,
-                success BOOLEAN,
-                response_time_ms INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Stripe events table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS stripe_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                customer_id TEXT,
-                subscription_id TEXT,
-                phone TEXT,
-                status TEXT,
-                details TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Onboarding log table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS onboarding_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                step INTEGER NOT NULL,
-                response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Whitelist events table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                source TEXT DEFAULT 'manual'
-            );
-            """)
-            
-            # SMS delivery log table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_content TEXT NOT NULL,
-                clicksend_response TEXT,
-                delivery_status TEXT,
-                message_id TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Monthly SMS usage table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_count INTEGER DEFAULT 1,
-                period_start DATE NOT NULL,
-                period_end DATE NOT NULL,
-                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                quota_warnings_sent INTEGER DEFAULT 0,
-                quota_exceeded BOOLEAN DEFAULT FALSE,
-                UNIQUE(phone, period_start)
-            );
-            """)
-            
-            # Create indexes for SQLite
-            c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);")
-            
-            conn.commit()
-            logger.info("✅ SQLite database initialized successfully")
+            # SQLite schema for local development
+            with closing(conn) as connection:
+                c = connection.cursor()
+                
+                # User profiles table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    stripe_customer_id TEXT,
+                    subscription_status TEXT DEFAULT 'inactive',
+                    subscription_id TEXT,
+                    trial_end_date DATETIME,
+                    created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Messages table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """)
+                
+                # Usage analytics table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS usage_analytics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    intent_type TEXT,
+                    success BOOLEAN,
+                    response_time_ms INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Stripe events table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS stripe_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT,
+                    phone TEXT,
+                    status TEXT,
+                    details TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Onboarding log table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Whitelist events table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT DEFAULT 'manual'
+                );
+                """)
+                
+                # SMS delivery log table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status TEXT,
+                    message_id TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Monthly SMS usage table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """)
+                
+                # Create indexes for SQLite
+                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);")
+                
+                connection.commit()
+                logger.info("✅ SQLite database initialized successfully")
         
         # Check existing data
         if db_type == "postgresql":
-            # PostgreSQL data check (won't run)
-            pass
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
+                    user_count = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) FROM messages")
+                    message_count = cursor.fetchone()['count']
         else:
-            # SQLite data check
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            user_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM messages")
-            message_count = c.fetchone()[0]
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                user_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM messages")
+                message_count = c.fetchone()[0]
         
-            logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
-            
-            # Show recent users for debugging
-            if user_count > 0:
-                c.execute("""
-                    SELECT phone, first_name, location, subscription_status, created_date 
-                    FROM user_profiles 
-                    ORDER BY created_date DESC 
-                    LIMIT 5
-                """)
-                recent_users = c.fetchall()
-                logger.info(f"📊 Recent users: {recent_users}")
+        logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
         
-        # Close connection properly
-        conn.close()
+        # Show recent users for debugging
+        if user_count > 0:
+            if db_type == "postgresql":
+                with conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT phone, first_name, location, subscription_status, created_date 
+                            FROM user_profiles 
+                            ORDER BY created_date DESC 
+                            LIMIT 5
+                        """)
+                        recent_users = cursor.fetchall()
+                        logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
+            else:
+                with closing(conn) as connection:
+                    c = connection.cursor()
+                    c.execute("""
+                        SELECT phone, first_name, location, subscription_status, created_date 
+                        FROM user_profiles 
+                        ORDER BY created_date DESC 
+                        LIMIT 5
+                    """)
+                    recent_users = c.fetchall()
+                    logger.info(f"📊 Recent users: {recent_users}")
+        
+        if db_type == "postgresql":
+            conn.close()
         
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
@@ -2075,6 +2177,214 @@ def sms_webhook():
             return jsonify({"error": "Processing failed"}), 500
 
 # === Admin Endpoints ===
+@app.route('/admin/reset-onboarding', methods=['POST'])
+def reset_all_onboarding():
+    """Reset all users to restart onboarding process"""
+    try:
+        data = request.get_json() or {}
+        confirm = data.get('confirm', False)
+        
+        if not confirm:
+            return jsonify({
+                "error": "Must confirm reset by sending {\"confirm\": true}",
+                "warning": "This will reset ALL users and they will need to re-onboard"
+            }), 400
+        
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    # Reset all users to onboarding step 1
+                    cursor.execute("""
+                        UPDATE user_profiles 
+                        SET first_name = NULL,
+                            location = NULL,
+                            onboarding_step = 1,
+                            onboarding_completed = FALSE,
+                            updated_date = CURRENT_TIMESTAMP
+                        WHERE onboarding_completed = TRUE
+                    """)
+                    
+                    # Get count of reset users
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_step = 1")
+                    reset_count = cursor.fetchone()['count']
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                # Reset all users to onboarding step 1
+                c.execute("""
+                    UPDATE user_profiles 
+                    SET first_name = NULL,
+                        location = NULL,
+                        onboarding_step = 1,
+                        onboarding_completed = 0,
+                        updated_date = CURRENT_TIMESTAMP
+                    WHERE onboarding_completed = 1
+                """)
+                
+                # Get count of reset users
+                c.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_step = 1")
+                reset_count = c.fetchone()[0]
+                
+                connection.commit()
+        
+        logger.info(f"🔄 Reset {reset_count} users for re-onboarding")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Reset {reset_count} users for re-onboarding",
+            "reset_count": reset_count,
+            "next_step": "Users will be asked for their name when they next text"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting onboarding: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/send-welcome-to-all', methods=['POST'])
+def send_welcome_to_all():
+    """Send welcome message to all whitelist users to restart onboarding"""
+    try:
+        data = request.get_json() or {}
+        confirm = data.get('confirm', False)
+        
+        if not confirm:
+            return jsonify({
+                "error": "Must confirm by sending {\"confirm\": true}",
+                "warning": "This will send SMS to ALL whitelist users"
+            }), 400
+        
+        # Get all whitelist numbers
+        whitelist = load_whitelist()
+        
+        sent_count = 0
+        failed_count = 0
+        
+        for phone in whitelist:
+            try:
+                # Send onboarding start message
+                result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+                
+                if "error" not in result:
+                    # Save the message
+                    save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_restart", 0)
+                    sent_count += 1
+                    logger.info(f"✅ Sent welcome to {phone}")
+                else:
+                    failed_count += 1
+                    logger.error(f"❌ Failed to send to {phone}: {result.get('error')}")
+                
+                # Small delay to avoid rate limiting
+                import time
+                time.sleep(0.5)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"❌ Exception sending to {phone}: {e}")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Sent welcome messages to {sent_count} users",
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "total_users": len(whitelist)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error sending welcome to all: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/full-reset', methods=['POST'])
+def full_reset_and_welcome():
+    """Reset all users AND send welcome messages"""
+    try:
+        data = request.get_json() or {}
+        confirm = data.get('confirm', False)
+        
+        if not confirm:
+            return jsonify({
+                "error": "Must confirm by sending {\"confirm\": true}",
+                "warning": "This will reset ALL users AND send SMS to everyone"
+            }), 400
+        
+        # Step 1: Reset all users in database
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE user_profiles 
+                        SET first_name = NULL,
+                            location = NULL,
+                            onboarding_step = 1,
+                            onboarding_completed = FALSE,
+                            updated_date = CURRENT_TIMESTAMP
+                    """)
+                    
+                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
+                    reset_count = cursor.fetchone()['count']
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    UPDATE user_profiles 
+                    SET first_name = NULL,
+                        location = NULL,
+                        onboarding_step = 1,
+                        onboarding_completed = 0,
+                        updated_date = CURRENT_TIMESTAMP
+                """)
+                
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                reset_count = c.fetchone()[0]
+                
+                connection.commit()
+        
+        # Step 2: Send welcome messages to all
+        whitelist = load_whitelist()
+        sent_count = 0
+        failed_count = 0
+        
+        welcome_message = (
+            "🎉 Hey! We've updated Hey Alex with new features. "
+            "To get started again, what's your first name?"
+        )
+        
+        for phone in whitelist:
+            try:
+                result = send_sms(phone, welcome_message, bypass_quota=True)
+                
+                if "error" not in result:
+                    save_message(phone, "assistant", welcome_message, "full_reset", 0)
+                    sent_count += 1
+                else:
+                    failed_count += 1
+                
+                # Small delay
+                import time
+                time.sleep(0.5)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Failed to send to {phone}: {e}")
+        
+        logger.info(f"🔄 Full reset complete: {reset_count} users reset, {sent_count} messages sent")
+        
+        return jsonify({
+            "success": True,
+            "message": "Full reset completed successfully",
+            "reset_count": reset_count,
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "total_whitelist": len(whitelist)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in full reset: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
