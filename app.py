@@ -22,9 +22,17 @@ import stripe
 import hmac
 import hashlib
 
-# PostgreSQL support
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# PostgreSQL support (optional)
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRESQL_AVAILABLE = True
+    logger.info("✅ PostgreSQL driver loaded successfully")
+except ImportError as e:
+    POSTGRESQL_AVAILABLE = False
+    logger.warning(f"⚠️ PostgreSQL driver not available: {e}")
+    logger.info("📁 Will use SQLite for database storage")
+
 from urllib.parse import urlparse
 
 # Load env vars
@@ -73,6 +81,7 @@ logger.info(f"  CLICKSEND_API_KEY: {'✅ Set' if CLICKSEND_API_KEY else '❌ Mis
 logger.info(f"  ANTHROPIC_API_KEY: {'✅ Set' if ANTHROPIC_API_KEY else '❌ Missing'}")
 logger.info(f"  SERPAPI_API_KEY: {'✅ Set' if SERPAPI_API_KEY else '❌ Missing'}")
 logger.info(f"  DATABASE_URL: {'✅ Set (PostgreSQL)' if DATABASE_URL else '❌ Missing (using SQLite)'}")
+logger.info(f"  POSTGRESQL_DRIVER: {'✅ Available' if POSTGRESQL_AVAILABLE else '❌ Not Available'}")
 
 # Stripe Configuration
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -172,7 +181,7 @@ def handle_errors(f):
 # === Database Connection Management ===
 def get_db_connection():
     """Get database connection - PostgreSQL in production, SQLite locally"""
-    if DATABASE_URL:
+    if DATABASE_URL and POSTGRESQL_AVAILABLE:
         try:
             # Parse the DATABASE_URL
             parsed = urlparse(DATABASE_URL)
@@ -193,8 +202,11 @@ def get_db_connection():
             logger.info("Falling back to SQLite for local development")
             return sqlite3.connect(DB_PATH), "sqlite"
     else:
-        # Local development: Use SQLite
-        logger.info("Using SQLite for local development")
+        # Local development or PostgreSQL not available: Use SQLite
+        if DATABASE_URL and not POSTGRESQL_AVAILABLE:
+            logger.warning("DATABASE_URL set but PostgreSQL not available, using SQLite")
+        else:
+            logger.info("Using SQLite for local development")
         return sqlite3.connect(DB_PATH), "sqlite"
 
 # === Helper Functions ===
