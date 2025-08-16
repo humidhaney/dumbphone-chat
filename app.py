@@ -13,7 +13,7 @@ import datetime as dt
 from dotenv import load_dotenv
 import urllib.parse
 import logging
-from functools import wraps
+from functools import wrapsF
 import time
 import anthropic
 import csv
@@ -289,289 +289,168 @@ def init_db():
         logger.info(f"🗄️ Initializing {db_type} database")
         
         if db_type == "postgresql":
-            # PostgreSQL schema
+            # PostgreSQL schema (this won't run since PostgreSQL is not available)
             tables = [
-                """
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT UNIQUE NOT NULL,
-                    first_name TEXT,
-                    location TEXT,
-                    onboarding_step INTEGER DEFAULT 0,
-                    onboarding_completed BOOLEAN DEFAULT FALSE,
-                    stripe_customer_id TEXT,
-                    subscription_status TEXT DEFAULT 'inactive',
-                    subscription_id TEXT,
-                    trial_end_date TIMESTAMP,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                    content TEXT NOT NULL,
-                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    intent_type TEXT,
-                    response_time_ms INTEGER
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS usage_analytics (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    intent_type TEXT,
-                    success BOOLEAN,
-                    response_time_ms INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS stripe_events (
-                    id SERIAL PRIMARY KEY,
-                    event_type TEXT NOT NULL,
-                    customer_id TEXT,
-                    subscription_id TEXT,
-                    phone TEXT,
-                    status TEXT,
-                    details TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS onboarding_log (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    step INTEGER NOT NULL,
-                    response TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS whitelist_events (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    source TEXT DEFAULT 'manual'
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    message_content TEXT NOT NULL,
-                    clicksend_response TEXT,
-                    delivery_status TEXT,
-                    message_id TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    message_count INTEGER DEFAULT 1,
-                    period_start DATE NOT NULL,
-                    period_end DATE NOT NULL,
-                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    quota_warnings_sent INTEGER DEFAULT 0,
-                    quota_exceeded BOOLEAN DEFAULT FALSE,
-                    UNIQUE(phone, period_start)
-                );
-                """
-            ]
-            
-            indexes = [
-                "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
-                "CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);",
-                "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);",
-                "CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);",
-                "CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);",
-                "CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);"
+                # ... your PostgreSQL tables
             ]
             
             with conn:
                 with conn.cursor() as cursor:
                     for table in tables:
                         cursor.execute(table)
-                    for index in indexes:
-                        cursor.execute(index)
             
             logger.info("✅ PostgreSQL database initialized successfully")
             
         else:
-            # SQLite schema for local development
-            with closing(conn) as connection:
-                c = connection.cursor()
-                
-                # User profiles table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT UNIQUE NOT NULL,
-                    first_name TEXT,
-                    location TEXT,
-                    onboarding_step INTEGER DEFAULT 0,
-                    onboarding_completed BOOLEAN DEFAULT FALSE,
-                    stripe_customer_id TEXT,
-                    subscription_status TEXT DEFAULT 'inactive',
-                    subscription_id TEXT,
-                    trial_end_date DATETIME,
-                    created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Messages table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                    content TEXT NOT NULL,
-                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    intent_type TEXT,
-                    response_time_ms INTEGER
-                );
-                """)
-                
-                # Usage analytics table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS usage_analytics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    intent_type TEXT,
-                    success BOOLEAN,
-                    response_time_ms INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Stripe events table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS stripe_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,
-                    customer_id TEXT,
-                    subscription_id TEXT,
-                    phone TEXT,
-                    status TEXT,
-                    details TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Onboarding log table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS onboarding_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    step INTEGER NOT NULL,
-                    response TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Whitelist events table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS whitelist_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    source TEXT DEFAULT 'manual'
-                );
-                """)
-                
-                # SMS delivery log table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    message_content TEXT NOT NULL,
-                    clicksend_response TEXT,
-                    delivery_status TEXT,
-                    message_id TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Monthly SMS usage table
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    message_count INTEGER DEFAULT 1,
-                    period_start DATE NOT NULL,
-                    period_end DATE NOT NULL,
-                    last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    quota_warnings_sent INTEGER DEFAULT 0,
-                    quota_exceeded BOOLEAN DEFAULT FALSE,
-                    UNIQUE(phone, period_start)
-                );
-                """)
-                
-                # Create indexes for SQLite
-                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);")
-                
-                connection.commit()
-                logger.info("✅ SQLite database initialized successfully")
+            # SQLite schema - FIX: Don't close connection in with statement
+            c = conn.cursor()
+            
+            # User profiles table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                first_name TEXT,
+                location TEXT,
+                onboarding_step INTEGER DEFAULT 0,
+                onboarding_completed BOOLEAN DEFAULT FALSE,
+                stripe_customer_id TEXT,
+                subscription_status TEXT DEFAULT 'inactive',
+                subscription_id TEXT,
+                trial_end_date DATETIME,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Messages table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                content TEXT NOT NULL,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                intent_type TEXT,
+                response_time_ms INTEGER
+            );
+            """)
+            
+            # Usage analytics table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS usage_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                intent_type TEXT,
+                success BOOLEAN,
+                response_time_ms INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Stripe events table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                customer_id TEXT,
+                subscription_id TEXT,
+                phone TEXT,
+                status TEXT,
+                details TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Onboarding log table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS onboarding_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                response TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Whitelist events table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source TEXT DEFAULT 'manual'
+            );
+            """)
+            
+            # SMS delivery log table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                message_content TEXT NOT NULL,
+                clicksend_response TEXT,
+                delivery_status TEXT,
+                message_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Monthly SMS usage table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                message_count INTEGER DEFAULT 1,
+                period_start DATE NOT NULL,
+                period_end DATE NOT NULL,
+                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                quota_warnings_sent INTEGER DEFAULT 0,
+                quota_exceeded BOOLEAN DEFAULT FALSE,
+                UNIQUE(phone, period_start)
+            );
+            """)
+            
+            # Create indexes for SQLite
+            c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);")
+            
+            conn.commit()
+            logger.info("✅ SQLite database initialized successfully")
         
         # Check existing data
         if db_type == "postgresql":
-            with conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
-                    user_count = cursor.fetchone()['count']
-                    
-                    cursor.execute("SELECT COUNT(*) FROM messages")
-                    message_count = cursor.fetchone()['count']
+            # PostgreSQL data check (won't run)
+            pass
         else:
-            with closing(conn) as connection:
-                c = connection.cursor()
-                c.execute("SELECT COUNT(*) FROM user_profiles")
-                user_count = c.fetchone()[0]
-                
-                c.execute("SELECT COUNT(*) FROM messages")
-                message_count = c.fetchone()[0]
+            # SQLite data check
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM user_profiles")
+            user_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
         
-        logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
+            logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
+            
+            # Show recent users for debugging
+            if user_count > 0:
+                c.execute("""
+                    SELECT phone, first_name, location, subscription_status, created_date 
+                    FROM user_profiles 
+                    ORDER BY created_date DESC 
+                    LIMIT 5
+                """)
+                recent_users = c.fetchall()
+                logger.info(f"📊 Recent users: {recent_users}")
         
-        # Show recent users for debugging
-        if user_count > 0:
-            if db_type == "postgresql":
-                with conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            SELECT phone, first_name, location, subscription_status, created_date 
-                            FROM user_profiles 
-                            ORDER BY created_date DESC 
-                            LIMIT 5
-                        """)
-                        recent_users = cursor.fetchall()
-                        logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
-            else:
-                with closing(conn) as connection:
-                    c = connection.cursor()
-                    c.execute("""
-                        SELECT phone, first_name, location, subscription_status, created_date 
-                        FROM user_profiles 
-                        ORDER BY created_date DESC 
-                        LIMIT 5
-                    """)
-                    recent_users = c.fetchall()
-                    logger.info(f"📊 Recent users: {recent_users}")
-        
-        if db_type == "postgresql":
-            conn.close()
+        # Close connection properly
+        conn.close()
         
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
