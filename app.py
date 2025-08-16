@@ -188,7 +188,7 @@ def handle_errors(f):
 # === Database Connection Management ===
 def get_db_connection():
     """Get database connection - PostgreSQL in production, SQLite locally"""
-    if DATABASE_URL:
+    if DATABASE_URL and POSTGRESQL_AVAILABLE:
         try:
             # Parse the DATABASE_URL
             parsed = urlparse(DATABASE_URL)
@@ -206,11 +206,19 @@ def get_db_connection():
             return conn, "postgresql"
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
-            logger.info("Falling back to SQLite for local development")
+            logger.warning("Falling back to SQLite - data will not persist between deployments")
             return sqlite3.connect(DB_PATH), "sqlite"
     else:
-        # Local development: Use SQLite
-        logger.info("Using SQLite for local development")
+        # Local development or PostgreSQL not available: Use SQLite
+        if DATABASE_URL and not POSTGRESQL_AVAILABLE:
+            logger.warning("DATABASE_URL set but PostgreSQL not available - using SQLite")
+            logger.warning("⚠️ Data will NOT persist between deployments!")
+        
+        # Ensure directory exists for SQLite
+        db_dir = os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.'
+        os.makedirs(db_dir, exist_ok=True)
+        
+        logger.info("Using SQLite for database")
         return sqlite3.connect(DB_PATH), "sqlite"
 
 # === Helper Functions ===
