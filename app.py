@@ -44,22 +44,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 CHANGELOG = {
+    "3.0": "Migrated whitelist to database storage, enhanced persistence and reliability across deployments",
     "2.9": "Added PostgreSQL support for persistent database storage in production, maintains SQLite for local development",
     "2.8": "Enhanced search capabilities for sports schedules and business hours, improved query specificity",
     "2.7": "Fixed user onboarding persistence logic, enhanced whitelist/profile coordination",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
     "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
     "2.4": "Fixed content filter false positives for philosophical questions, improved spam detection accuracy",
-    "2.3": "Added ClickSend contact list sync, enhanced broadcasting capabilities, and contact management features",
-    "2.2": "Added comprehensive monthly SMS usage tracking with 300 message quota per 30-day period, quota management system, and usage analytics",
-    "2.1": "Major upgrade: Enhanced cultural query detection, improved restaurant intent filtering, enhanced SMS debugging with ClickSend status monitoring",
-    "1.4": "Fixed search capability claims - Claude now properly routes searches instead of denying search ability",
-    "1.3": "Updated welcome message with personality and clear examples, ready for testing",
-    "1.2": "Fixed search follow-ups, enhanced context awareness, prevented search promise loops",
-    "1.1": "Enhanced fact-checking, fixed intent detection order, improved Claude context isolation",
-    "1.0": "Initial release with SMS assistant functionality"
+    "2.3": "Added ClickSend contact list sync, enhanced broadcasting capabilities, and contact management features"
 }
 
 # === Config & API Keys ===
@@ -105,6 +99,7 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning("❌ ANTHROPIC_API_KEY not found")
 
+# Legacy file paths for migration
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
 MONTHLY_USAGE_FILE = "monthly_usage.json"
@@ -289,6 +284,15 @@ def init_db():
                 );
                 """,
                 """
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE NOT NULL,
+                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    added_by TEXT DEFAULT 'system',
+                    is_active BOOLEAN DEFAULT TRUE
+                );
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS messages (
                     id SERIAL PRIMARY KEY,
                     phone TEXT NOT NULL,
@@ -368,6 +372,8 @@ def init_db():
             indexes = [
                 "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
                 "CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);",
+                "CREATE INDEX IF NOT EXISTS idx_whitelist_phone ON whitelist(phone);",
+                "CREATE INDEX IF NOT EXISTS idx_whitelist_active ON whitelist(is_active);",
                 "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);",
                 "CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);",
                 "CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);",
@@ -403,6 +409,17 @@ def init_db():
                     trial_end_date DATETIME,
                     created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Whitelist table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE NOT NULL,
+                    added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    added_by TEXT DEFAULT 'system',
+                    is_active BOOLEAN DEFAULT TRUE
                 );
                 """)
                 
@@ -498,6 +515,8 @@ def init_db():
                 # Create indexes for SQLite
                 c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_customer ON user_profiles(stripe_customer_id);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_whitelist_phone ON whitelist(phone);")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_whitelist_active ON whitelist(is_active);")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_usage_analytics_phone_ts ON usage_analytics(phone, timestamp DESC);")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_customer ON stripe_events(customer_id);")
@@ -505,6 +524,9 @@ def init_db():
                 
                 connection.commit()
                 logger.info("✅ SQLite database initialized successfully")
+        
+        # Migrate legacy whitelist file if it exists
+        migrate_legacy_whitelist()
         
         # Check existing data
         if db_type == "postgresql":
@@ -515,6 +537,9 @@ def init_db():
                     
                     cursor.execute("SELECT COUNT(*) FROM messages")
                     message_count = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = TRUE")
+                    whitelist_count = cursor.fetchone()['count']
         else:
             with closing(conn) as connection:
                 c = connection.cursor()
@@ -523,33 +548,11 @@ def init_db():
                 
                 c.execute("SELECT COUNT(*) FROM messages")
                 message_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = TRUE")
+                whitelist_count = c.fetchone()[0]
         
-        logger.info(f"📊 Database ready: {user_count} users, {message_count} messages")
-        
-        # Show recent users for debugging
-        if user_count > 0:
-            if db_type == "postgresql":
-                with conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            SELECT phone, first_name, location, subscription_status, created_date 
-                            FROM user_profiles 
-                            ORDER BY created_date DESC 
-                            LIMIT 5
-                        """)
-                        recent_users = cursor.fetchall()
-                        logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
-            else:
-                with closing(conn) as connection:
-                    c = connection.cursor()
-                    c.execute("""
-                        SELECT phone, first_name, location, subscription_status, created_date 
-                        FROM user_profiles 
-                        ORDER BY created_date DESC 
-                        LIMIT 5
-                    """)
-                    recent_users = c.fetchall()
-                    logger.info(f"📊 Recent users: {recent_users}")
+        logger.info(f"📊 Database ready: {user_count} users, {message_count} messages, {whitelist_count} whitelisted")
         
         if db_type == "postgresql":
             conn.close()
@@ -557,6 +560,286 @@ def init_db():
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
         raise
+
+def migrate_legacy_whitelist():
+    """Migrate whitelist from text file to database if file exists"""
+    try:
+        if os.path.exists(WHITELIST_FILE):
+            logger.info("📁 Found legacy whitelist file, migrating to database...")
+            
+            with open(WHITELIST_FILE, 'r') as f:
+                legacy_phones = [line.strip() for line in f if line.strip()]
+            
+            if legacy_phones:
+                conn, db_type = get_db_connection()
+                migrated_count = 0
+                
+                for phone in legacy_phones:
+                    try:
+                        normalized_phone = normalize_phone_number(phone)
+                        if normalized_phone:
+                            if db_type == "postgresql":
+                                with conn:
+                                    with conn.cursor() as cursor:
+                                        cursor.execute("""
+                                            INSERT INTO whitelist (phone, added_by, added_date)
+                                            VALUES (%s, 'legacy_migration', CURRENT_TIMESTAMP)
+                                            ON CONFLICT (phone) DO NOTHING
+                                        """, (normalized_phone,))
+                            else:
+                                with closing(conn) as connection:
+                                    c = connection.cursor()
+                                    c.execute("""
+                                        INSERT OR IGNORE INTO whitelist (phone, added_by, added_date)
+                                        VALUES (?, 'legacy_migration', CURRENT_TIMESTAMP)
+                                    """, (normalized_phone,))
+                                    connection.commit()
+                            
+                            migrated_count += 1
+                    except Exception as phone_error:
+                        logger.error(f"Error migrating phone {phone}: {phone_error}")
+                
+                logger.info(f"✅ Migrated {migrated_count} numbers from legacy whitelist")
+                
+                # Backup the old file
+                backup_file = f"{WHITELIST_FILE}.backup.{int(time.time())}"
+                os.rename(WHITELIST_FILE, backup_file)
+                logger.info(f"📁 Legacy whitelist backed up to {backup_file}")
+                
+                if db_type == "postgresql":
+                    conn.close()
+            else:
+                logger.info("📁 Legacy whitelist file was empty")
+        else:
+            logger.info("📁 No legacy whitelist file found")
+            
+    except Exception as e:
+        logger.error(f"Error migrating legacy whitelist: {e}")
+
+# === Enhanced Whitelist Management with Database Storage ===
+def load_whitelist():
+    """Load active whitelist numbers from database"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT phone FROM whitelist WHERE is_active = TRUE")
+                    results = cursor.fetchall()
+                    return set(row['phone'] for row in results)
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("SELECT phone FROM whitelist WHERE is_active = TRUE")
+                results = c.fetchall()
+                return set(row[0] for row in results)
+                
+    except Exception as e:
+        logger.error(f"Error loading whitelist from database: {e}")
+        # Fallback to file-based whitelist if database fails
+        try:
+            if os.path.exists(WHITELIST_FILE):
+                with open(WHITELIST_FILE, "r") as f:
+                    return set(line.strip() for line in f if line.strip())
+        except Exception as file_error:
+            logger.error(f"Fallback file whitelist also failed: {file_error}")
+        return set()
+
+def add_to_whitelist(phone, send_welcome=True, source='manual'):
+    """Enhanced whitelist addition with database storage"""
+    if not phone:
+        return False
+        
+    phone = normalize_phone_number(phone)
+    
+    try:
+        conn, db_type = get_db_connection()
+        
+        # Check if already exists
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT is_active FROM whitelist WHERE phone = %s", (phone,))
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        if not existing['is_active']:
+                            # Reactivate existing entry
+                            cursor.execute("""
+                                UPDATE whitelist 
+                                SET is_active = TRUE, added_date = CURRENT_TIMESTAMP, added_by = %s
+                                WHERE phone = %s
+                            """, (source, phone))
+                            logger.info(f"📱 Reactivated {phone} in whitelist")
+                        else:
+                            logger.info(f"📱 {phone} already in active whitelist")
+                            return True
+                    else:
+                        # Add new entry
+                        cursor.execute("""
+                            INSERT INTO whitelist (phone, added_by, added_date, is_active)
+                            VALUES (%s, %s, CURRENT_TIMESTAMP, TRUE)
+                        """, (phone, source))
+                        logger.info(f"📱 Added new user {phone} to whitelist")
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("SELECT is_active FROM whitelist WHERE phone = ?", (phone,))
+                existing = c.fetchone()
+                
+                if existing:
+                    if not existing[0]:
+                        # Reactivate existing entry
+                        c.execute("""
+                            UPDATE whitelist 
+                            SET is_active = 1, added_date = CURRENT_TIMESTAMP, added_by = ?
+                            WHERE phone = ?
+                        """, (source, phone))
+                        logger.info(f"📱 Reactivated {phone} in whitelist")
+                    else:
+                        logger.info(f"📱 {phone} already in active whitelist")
+                        return True
+                else:
+                    # Add new entry
+                    c.execute("""
+                        INSERT INTO whitelist (phone, added_by, added_date, is_active)
+                        VALUES (?, ?, CURRENT_TIMESTAMP, 1)
+                    """, (phone, source))
+                    logger.info(f"📱 Added new user {phone} to whitelist")
+                
+                connection.commit()
+        
+        # Log the event
+        log_whitelist_event(phone, "added", source)
+        
+        # Create user profile if it doesn't exist
+        profile = get_user_profile(phone)
+        if not profile:
+            create_user_profile(phone)
+        
+        # Send welcome message for new users
+        if send_welcome:
+            try:
+                send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+                logger.info(f"🎉 Onboarding started for new user {phone}")
+                
+                # Log the welcome message
+                save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+                
+            except Exception as sms_error:
+                logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
+        
+        if db_type == "postgresql":
+            conn.close()
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to add {phone} to whitelist: {e}")
+        return False
+
+def remove_from_whitelist(phone, send_goodbye=False, source='manual'):
+    """Enhanced whitelist removal with database storage"""
+    if not phone:
+        return False
+        
+    phone = normalize_phone_number(phone)
+    
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE whitelist 
+                        SET is_active = FALSE 
+                        WHERE phone = %s AND is_active = TRUE
+                    """, (phone,))
+                    
+                    if cursor.rowcount > 0:
+                        logger.info(f"📱 Removed {phone} from whitelist (source: {source})")
+                        removed = True
+                    else:
+                        logger.info(f"📱 {phone} was not in active whitelist")
+                        removed = False
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    UPDATE whitelist 
+                    SET is_active = 0 
+                    WHERE phone = ? AND is_active = 1
+                """, (phone,))
+                
+                if c.rowcount > 0:
+                    logger.info(f"📱 Removed {phone} from whitelist (source: {source})")
+                    removed = True
+                else:
+                    logger.info(f"📱 {phone} was not in active whitelist")
+                    removed = False
+                
+                connection.commit()
+        
+        if removed:
+            # Log the removal
+            log_whitelist_event(phone, "removed", source)
+            
+            # Send goodbye message if requested
+            if send_goodbye:
+                try:
+                    send_sms(phone, SUBSCRIPTION_CANCELLED_MSG, bypass_quota=True)
+                    logger.info(f"👋 Goodbye message sent to {phone}")
+                except Exception as sms_error:
+                    logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
+        
+        if db_type == "postgresql":
+            conn.close()
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to remove {phone} from whitelist: {e}")
+        return False
+
+def get_whitelist_stats():
+    """Get whitelist statistics from database"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = TRUE")
+                    active_count = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = FALSE")
+                    inactive_count = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) FROM whitelist")
+                    total_count = cursor.fetchone()['count']
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = 1")
+                active_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = 0")
+                inactive_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM whitelist")
+                total_count = c.fetchone()[0]
+        
+        return {
+            "active": active_count,
+            "inactive": inactive_count,
+            "total": total_count
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting whitelist stats: {e}")
+        return {"active": 0, "inactive": 0, "total": 0}
 
 # === User Profile Management ===
 def get_user_profile(phone):
@@ -851,7 +1134,6 @@ def get_user_context_for_queries(phone):
         }
     return {'personalized': False}
 
-# === Whitelist Management ===
 def log_whitelist_event(phone, action, source='manual'):
     """Log whitelist addition/removal events"""
     try:
@@ -876,95 +1158,6 @@ def log_whitelist_event(phone, action, source='manual'):
         logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
-
-def add_to_whitelist(phone, send_welcome=True, source='manual'):
-    """Enhanced whitelist addition with automatic welcome message and onboarding"""
-    if not phone:
-        return False
-        
-    phone = normalize_phone_number(phone)
-    wl = load_whitelist()
-    
-    # Check if this is a new user
-    is_new_user = phone not in wl
-    
-    if is_new_user:
-        try:
-            with open(WHITELIST_FILE, "a") as f:
-                f.write(phone + "\n")
-            
-            # Log the new user addition
-            log_whitelist_event(phone, "added", source)
-            
-            logger.info(f"📱 Added new user {phone} to whitelist (source: {source})")
-            
-            # Create user profile if it doesn't exist
-            profile = get_user_profile(phone)
-            if not profile:
-                create_user_profile(phone)
-            
-            # Send welcome message to start onboarding for new users
-            if send_welcome:
-                try:
-                    send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
-                    logger.info(f"🎉 Onboarding started for new user {phone}")
-                    
-                    # Log the welcome message
-                    save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-                    
-                except Exception as sms_error:
-                    logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Failed to add {phone} to whitelist: {e}")
-            return False
-    else:
-        logger.info(f"📱 {phone} already in whitelist")
-        return True
-
-def remove_from_whitelist(phone, send_goodbye=False, source='manual'):
-    """Enhanced whitelist removal with optional goodbye message"""
-    if not phone:
-        return False
-        
-    phone = normalize_phone_number(phone)
-    wl = load_whitelist()
-    
-    if phone in wl:
-        try:
-            wl.remove(phone)
-            with open(WHITELIST_FILE, "w") as f:
-                for num in wl:
-                    f.write(num + "\n")
-            
-            # Log the removal
-            log_whitelist_event(phone, "removed", source)
-            
-            logger.info(f"📱 Removed {phone} from whitelist (source: {source})")
-            
-            # Send goodbye message if requested
-            if send_goodbye:
-                try:
-                    send_sms(phone, SUBSCRIPTION_CANCELLED_MSG, bypass_quota=True)
-                    logger.info(f"👋 Goodbye message sent to {phone}")
-                except Exception as sms_error:
-                    logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Failed to remove {phone} from whitelist: {e}")
-            return False
-    else:
-        logger.info(f"📱 {phone} not in whitelist")
-        return True
-
-def load_whitelist():
-    try:
-        with open(WHITELIST_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return set()
 
 # === Message and Analytics Functions ===
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
@@ -2177,214 +2370,6 @@ def sms_webhook():
             return jsonify({"error": "Processing failed"}), 500
 
 # === Admin Endpoints ===
-@app.route('/admin/reset-onboarding', methods=['POST'])
-def reset_all_onboarding():
-    """Reset all users to restart onboarding process"""
-    try:
-        data = request.get_json() or {}
-        confirm = data.get('confirm', False)
-        
-        if not confirm:
-            return jsonify({
-                "error": "Must confirm reset by sending {\"confirm\": true}",
-                "warning": "This will reset ALL users and they will need to re-onboard"
-            }), 400
-        
-        conn, db_type = get_db_connection()
-        
-        if db_type == "postgresql":
-            with conn:
-                with conn.cursor() as cursor:
-                    # Reset all users to onboarding step 1
-                    cursor.execute("""
-                        UPDATE user_profiles 
-                        SET first_name = NULL,
-                            location = NULL,
-                            onboarding_step = 1,
-                            onboarding_completed = FALSE,
-                            updated_date = CURRENT_TIMESTAMP
-                        WHERE onboarding_completed = TRUE
-                    """)
-                    
-                    # Get count of reset users
-                    cursor.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_step = 1")
-                    reset_count = cursor.fetchone()['count']
-        else:
-            with closing(conn) as connection:
-                c = connection.cursor()
-                # Reset all users to onboarding step 1
-                c.execute("""
-                    UPDATE user_profiles 
-                    SET first_name = NULL,
-                        location = NULL,
-                        onboarding_step = 1,
-                        onboarding_completed = 0,
-                        updated_date = CURRENT_TIMESTAMP
-                    WHERE onboarding_completed = 1
-                """)
-                
-                # Get count of reset users
-                c.execute("SELECT COUNT(*) FROM user_profiles WHERE onboarding_step = 1")
-                reset_count = c.fetchone()[0]
-                
-                connection.commit()
-        
-        logger.info(f"🔄 Reset {reset_count} users for re-onboarding")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Reset {reset_count} users for re-onboarding",
-            "reset_count": reset_count,
-            "next_step": "Users will be asked for their name when they next text"
-        })
-        
-    except Exception as e:
-        logger.error(f"Error resetting onboarding: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/send-welcome-to-all', methods=['POST'])
-def send_welcome_to_all():
-    """Send welcome message to all whitelist users to restart onboarding"""
-    try:
-        data = request.get_json() or {}
-        confirm = data.get('confirm', False)
-        
-        if not confirm:
-            return jsonify({
-                "error": "Must confirm by sending {\"confirm\": true}",
-                "warning": "This will send SMS to ALL whitelist users"
-            }), 400
-        
-        # Get all whitelist numbers
-        whitelist = load_whitelist()
-        
-        sent_count = 0
-        failed_count = 0
-        
-        for phone in whitelist:
-            try:
-                # Send onboarding start message
-                result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
-                
-                if "error" not in result:
-                    # Save the message
-                    save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_restart", 0)
-                    sent_count += 1
-                    logger.info(f"✅ Sent welcome to {phone}")
-                else:
-                    failed_count += 1
-                    logger.error(f"❌ Failed to send to {phone}: {result.get('error')}")
-                
-                # Small delay to avoid rate limiting
-                import time
-                time.sleep(0.5)
-                
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"❌ Exception sending to {phone}: {e}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Sent welcome messages to {sent_count} users",
-            "sent_count": sent_count,
-            "failed_count": failed_count,
-            "total_users": len(whitelist)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error sending welcome to all: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/full-reset', methods=['POST'])
-def full_reset_and_welcome():
-    """Reset all users AND send welcome messages"""
-    try:
-        data = request.get_json() or {}
-        confirm = data.get('confirm', False)
-        
-        if not confirm:
-            return jsonify({
-                "error": "Must confirm by sending {\"confirm\": true}",
-                "warning": "This will reset ALL users AND send SMS to everyone"
-            }), 400
-        
-        # Step 1: Reset all users in database
-        conn, db_type = get_db_connection()
-        
-        if db_type == "postgresql":
-            with conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE user_profiles 
-                        SET first_name = NULL,
-                            location = NULL,
-                            onboarding_step = 1,
-                            onboarding_completed = FALSE,
-                            updated_date = CURRENT_TIMESTAMP
-                    """)
-                    
-                    cursor.execute("SELECT COUNT(*) FROM user_profiles")
-                    reset_count = cursor.fetchone()['count']
-        else:
-            with closing(conn) as connection:
-                c = connection.cursor()
-                c.execute("""
-                    UPDATE user_profiles 
-                    SET first_name = NULL,
-                        location = NULL,
-                        onboarding_step = 1,
-                        onboarding_completed = 0,
-                        updated_date = CURRENT_TIMESTAMP
-                """)
-                
-                c.execute("SELECT COUNT(*) FROM user_profiles")
-                reset_count = c.fetchone()[0]
-                
-                connection.commit()
-        
-        # Step 2: Send welcome messages to all
-        whitelist = load_whitelist()
-        sent_count = 0
-        failed_count = 0
-        
-        welcome_message = (
-            "🎉 Hey! We've updated Hey Alex with new features. "
-            "To get started again, what's your first name?"
-        )
-        
-        for phone in whitelist:
-            try:
-                result = send_sms(phone, welcome_message, bypass_quota=True)
-                
-                if "error" not in result:
-                    save_message(phone, "assistant", welcome_message, "full_reset", 0)
-                    sent_count += 1
-                else:
-                    failed_count += 1
-                
-                # Small delay
-                import time
-                time.sleep(0.5)
-                
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"Failed to send to {phone}: {e}")
-        
-        logger.info(f"🔄 Full reset complete: {reset_count} users reset, {sent_count} messages sent")
-        
-        return jsonify({
-            "success": True,
-            "message": "Full reset completed successfully",
-            "reset_count": reset_count,
-            "sent_count": sent_count,
-            "failed_count": failed_count,
-            "total_whitelist": len(whitelist)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in full reset: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
@@ -2413,6 +2398,97 @@ def admin_add_to_whitelist():
         logger.error(f"Error in admin add to whitelist: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/admin/whitelist/remove', methods=['POST'])
+def admin_remove_from_whitelist():
+    """Admin endpoint to manually remove users from whitelist"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        send_goodbye = data.get('send_goodbye', False)
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        success = remove_from_whitelist(phone, send_goodbye=send_goodbye, source='admin')
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Removed {phone} from whitelist",
+                "goodbye_sent": send_goodbye
+            })
+        else:
+            return jsonify({"error": "Failed to remove from whitelist"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error in admin remove from whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/whitelist', methods=['GET'])
+def get_whitelist_admin():
+    """Admin endpoint to view all whitelist entries"""
+    try:
+        conn, db_type = get_db_connection()
+        
+        if db_type == "postgresql":
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT w.phone, w.added_date, w.added_by, w.is_active,
+                               up.first_name, up.location, up.subscription_status
+                        FROM whitelist w
+                        LEFT JOIN user_profiles up ON w.phone = up.phone
+                        ORDER BY w.added_date DESC
+                    """)
+                    
+                    results = []
+                    for row in cursor.fetchall():
+                        results.append({
+                            'phone': row['phone'],
+                            'added_date': row['added_date'],
+                            'added_by': row['added_by'],
+                            'is_active': bool(row['is_active']),
+                            'first_name': row['first_name'],
+                            'location': row['location'],
+                            'subscription_status': row['subscription_status']
+                        })
+        else:
+            with closing(conn) as connection:
+                c = connection.cursor()
+                c.execute("""
+                    SELECT w.phone, w.added_date, w.added_by, w.is_active,
+                           up.first_name, up.location, up.subscription_status
+                    FROM whitelist w
+                    LEFT JOIN user_profiles up ON w.phone = up.phone
+                    ORDER BY w.added_date DESC
+                """)
+                
+                results = []
+                for row in c.fetchall():
+                    results.append({
+                        'phone': row[0],
+                        'added_date': row[1],
+                        'added_by': row[2],
+                        'is_active': bool(row[3]),
+                        'first_name': row[4],
+                        'location': row[5],
+                        'subscription_status': row[6]
+                    })
+        
+        stats = get_whitelist_stats()
+        
+        return jsonify({
+            'stats': stats,
+            'entries': results,
+            'total_entries': len(results)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/users', methods=['GET'])
 def get_all_users():
     """Admin endpoint to view all users with their profiles and subscription status"""
@@ -2433,8 +2509,10 @@ def get_all_users():
                             up.subscription_status,
                             up.subscription_id,
                             up.trial_end_date,
-                            up.created_date
+                            up.created_date,
+                            w.is_active as in_whitelist
                         FROM user_profiles up
+                        LEFT JOIN whitelist w ON up.phone = w.phone
                         ORDER BY up.created_date DESC
                     """)
                     
@@ -2450,7 +2528,8 @@ def get_all_users():
                             'subscription_status': row['subscription_status'],
                             'subscription_id': row['subscription_id'],
                             'trial_end_date': row['trial_end_date'],
-                            'created_date': row['created_date']
+                            'created_date': row['created_date'],
+                            'in_whitelist': bool(row['in_whitelist']) if row['in_whitelist'] is not None else False
                         })
         else:
             with closing(conn) as connection:
@@ -2466,8 +2545,10 @@ def get_all_users():
                         up.subscription_status,
                         up.subscription_id,
                         up.trial_end_date,
-                        up.created_date
+                        up.created_date,
+                        w.is_active as in_whitelist
                     FROM user_profiles up
+                    LEFT JOIN whitelist w ON up.phone = w.phone
                     ORDER BY up.created_date DESC
                 """)
                 
@@ -2483,7 +2564,8 @@ def get_all_users():
                         'subscription_status': row[6],
                         'subscription_id': row[7],
                         'trial_end_date': row[8],
-                        'created_date': row[9]
+                        'created_date': row[9],
+                        'in_whitelist': bool(row[10]) if row[10] is not None else False
                     })
         
         return jsonify({
@@ -2573,14 +2655,13 @@ def get_stats():
                 recent_stripe_events = c.fetchone()[0]
         
         # Whitelist count
-        whitelist = load_whitelist()
-        whitelist_count = len(whitelist)
+        stats = get_whitelist_stats()
         
         return jsonify({
             "total_users": total_users,
             "active_subscriptions": active_subscriptions,
             "onboarded_users": onboarded_users,
-            "whitelist_count": whitelist_count,
+            "whitelist_stats": stats,
             "recent_messages_30d": recent_messages,
             "successful_responses_30d": successful_responses,
             "recent_stripe_events_7d": recent_stripe_events,
@@ -2615,7 +2696,8 @@ def landing_page():
             "status": "running",
             "description": "Personal SMS research assistant",
             "subscribe": "Visit heyalex.co to subscribe",
-            "database": "postgresql" if DATABASE_URL else "sqlite (local development)"
+            "database": "postgresql" if DATABASE_URL else "sqlite (local development)",
+            "changelog": CHANGELOG[APP_VERSION]
         })
         
     except Exception as e:
@@ -2639,6 +2721,7 @@ if __name__ == "__main__":
     logger.info(f"📱 SMS webhook endpoint: /sms")
     logger.info(f"🏥 Health check endpoint: /health")
     logger.info(f"📊 Admin stats endpoint: /admin/stats")
+    logger.info(f"👥 Admin whitelist endpoint: /admin/whitelist")
     
     # Check critical configurations
     missing_configs = []
@@ -2659,6 +2742,11 @@ if __name__ == "__main__":
     try:
         conn, db_type = get_db_connection()
         logger.info(f"✅ Database connectivity verified: {db_type}")
+        
+        # Check whitelist migration status
+        stats = get_whitelist_stats()
+        logger.info(f"📊 Whitelist status: {stats['active']} active, {stats['inactive']} inactive, {stats['total']} total")
+        
         if db_type == "postgresql":
             conn.close()
     except Exception as e:
