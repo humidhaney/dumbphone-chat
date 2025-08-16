@@ -22,9 +22,20 @@ import stripe
 import hmac
 import hashlib
 
-# PostgreSQL support
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# PostgreSQL support with robust error handling
+POSTGRESQL_AVAILABLE = False
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRESQL_AVAILABLE = True
+    print("✅ PostgreSQL support available")
+except ImportError as e:
+    print(f"⚠️ PostgreSQL not available: {e}")
+    print("📱 Will use SQLite - data will not persist between deployments")
+except Exception as e:
+    print(f"⚠️ PostgreSQL import error: {e}")
+    print("📱 Will use SQLite - data will not persist between deployments")
+
 from urllib.parse import urlparse
 
 # Load env vars
