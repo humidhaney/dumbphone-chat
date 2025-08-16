@@ -22,17 +22,6 @@ import stripe
 import hmac
 import hashlib
 
-# PostgreSQL support (optional)
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    POSTGRESQL_AVAILABLE = True
-    logger.info("✅ PostgreSQL driver loaded successfully")
-except ImportError as e:
-    POSTGRESQL_AVAILABLE = False
-    logger.warning(f"⚠️ PostgreSQL driver not available: {e}")
-    logger.info("📁 Will use SQLite for database storage")
-
 from urllib.parse import urlparse
 
 # Load env vars
@@ -48,6 +37,27 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# PostgreSQL support - Try psycopg3 first, fallback to psycopg2
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    POSTGRESQL_VERSION = "psycopg3"
+    POSTGRESQL_AVAILABLE = True
+    logger.info("✅ PostgreSQL driver (psycopg3) loaded successfully")
+except ImportError:
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        POSTGRESQL_VERSION = "psycopg2"
+        POSTGRESQL_AVAILABLE = True
+        logger.info("✅ PostgreSQL driver (psycopg2) loaded successfully")
+    except ImportError as e:
+        POSTGRESQL_AVAILABLE = False
+        POSTGRESQL_VERSION = None
+        logger.error(f"❌ No PostgreSQL driver available: {e}")
+        logger.error("🚨 CRITICAL: PostgreSQL is required for production!")
+        raise ImportError("PostgreSQL driver required for production deployment")
 
 app = Flask(__name__)
 
@@ -180,13 +190,31 @@ def handle_errors(f):
 
 # === Database Connection Management ===
 def get_db_connection():
-    """Get database connection - PostgreSQL in production, SQLite locally"""
-    if DATABASE_URL and POSTGRESQL_AVAILABLE:
-        try:
-            # Parse the DATABASE_URL
-            parsed = urlparse(DATABASE_URL)
-            
-            # Connect to PostgreSQL
+    """Get database connection - PostgreSQL only for production"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is required for production deployment")
+    
+    if not POSTGRESQL_AVAILABLE:
+        raise ImportError("PostgreSQL driver is required but not available")
+    
+    try:
+        # Parse the DATABASE_URL
+        parsed = urlparse(DATABASE_URL)
+        
+        if POSTGRESQL_VERSION == "psycopg3":
+            # Use psycopg3 (modern driver)
+            conn = psycopg.connect(
+                host=parsed.hostname,
+                port=parsed.port,
+                dbname=parsed.path[1:],  # Remove leading slash
+                user=parsed.username,
+                password=parsed.password,
+                sslmode='require',
+                row_factory=dict_row
+            )
+            return conn, "postgresql"
+        else:
+            # Use psycopg2 (legacy driver)
             conn = psycopg2.connect(
                 host=parsed.hostname,
                 port=parsed.port,
@@ -194,20 +222,14 @@ def get_db_connection():
                 user=parsed.username,
                 password=parsed.password,
                 cursor_factory=RealDictCursor,
-                sslmode='require'  # Render requires SSL
+                sslmode='require'
             )
             return conn, "postgresql"
-        except Exception as e:
-            logger.error(f"Failed to connect to PostgreSQL: {e}")
-            logger.info("Falling back to SQLite for local development")
-            return sqlite3.connect(DB_PATH), "sqlite"
-    else:
-        # Local development or PostgreSQL not available: Use SQLite
-        if DATABASE_URL and not POSTGRESQL_AVAILABLE:
-            logger.warning("DATABASE_URL set but PostgreSQL not available, using SQLite")
-        else:
-            logger.info("Using SQLite for local development")
-        return sqlite3.connect(DB_PATH), "sqlite"
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to PostgreSQL: {e}")
+        logger.error(f"🔍 Connection details: host={parsed.hostname}, port={parsed.port}, db={parsed.path[1:]}")
+        raise
 
 # === Helper Functions ===
 def normalize_phone_number(phone):
@@ -392,12 +414,23 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period ON monthly_sms_usage(phone, period_start DESC);"
             ]
             
-            with conn:
+            
+            if POSTGRESQL_VERSION == "psycopg3":
+                # psycopg3 - auto-commit by default, no need for 'with conn:'
                 with conn.cursor() as cursor:
                     for table in tables:
                         cursor.execute(table)
                     for index in indexes:
                         cursor.execute(index)
+                conn.commit()  # Explicit commit for schema changes
+            else:
+                # psycopg2 - needs 'with conn:' for auto-commit
+                with conn:
+                    with conn.cursor() as cursor:
+                        for table in tables:
+                            cursor.execute(table)
+                        for index in indexes:
+                            cursor.execute(index)
             
             logger.info("✅ PostgreSQL database initialized successfully")
             
@@ -542,7 +575,7 @@ def init_db():
         
         # Check existing data
         if db_type == "postgresql":
-            with conn:
+            if POSTGRESQL_VERSION == "psycopg3":
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT COUNT(*) FROM user_profiles")
                     user_count = cursor.fetchone()['count']
@@ -552,6 +585,17 @@ def init_db():
                     
                     cursor.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = TRUE")
                     whitelist_count = cursor.fetchone()['count']
+            else:
+                with conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT COUNT(*) FROM user_profiles")
+                        user_count = cursor.fetchone()['count']
+                        
+                        cursor.execute("SELECT COUNT(*) FROM messages")
+                        message_count = cursor.fetchone()['count']
+                        
+                        cursor.execute("SELECT COUNT(*) FROM whitelist WHERE is_active = TRUE")
+                        whitelist_count = cursor.fetchone()['count']
         else:
             with closing(conn) as connection:
                 c = connection.cursor()
@@ -566,8 +610,7 @@ def init_db():
         
         logger.info(f"📊 Database ready: {user_count} users, {message_count} messages, {whitelist_count} whitelisted")
         
-        if db_type == "postgresql":
-            conn.close()
+        conn.close()  # Close connection for both versions
         
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
