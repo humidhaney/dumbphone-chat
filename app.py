@@ -16,11 +16,8 @@ import logging
 from functools import wraps
 import time
 import anthropic
-import csv
-import io
-import stripe
-import hmac
-import hashlib
+import psycopg
+from urllib.parse import urlparse
 
 # Load env vars
 load_dotenv()
@@ -39,8 +36,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 CHANGELOG = {
+    "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage across deployments",
     "2.9": "Improved response quality: removed unnecessary location mentions, increased character limit to 700, refined Claude prompts",
     "2.8": "Added comprehensive debugging and user profile recovery system to prevent onboarding loops",
     "2.7": "Enhanced news detection and Google News integration with SerpAPI, improved topic-specific news searches",
@@ -101,7 +99,25 @@ MONTHLY_USAGE_FILE = "monthly_usage.json"
 USAGE_LIMIT = 200
 MONTHLY_LIMIT = 300
 RESET_DAYS = 30
-DB_PATH = os.getenv("DB_PATH", "chat.db")
+
+# Database Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    logger.info("🐘 Using PostgreSQL database")
+    # Parse PostgreSQL URL
+    parsed = urlparse(DATABASE_URL)
+    DB_CONFIG = {
+        'host': parsed.hostname,
+        'port': parsed.port,
+        'dbname': parsed.path[1:],  # Remove leading slash
+        'user': parsed.username,
+        'password': parsed.password
+    }
+    USE_POSTGRES = True
+else:
+    logger.info("📁 Using SQLite database")
+    DB_PATH = os.getenv("DB_PATH", "chat.db")
+    USE_POSTGRES = False
 
 # WELCOME MESSAGE
 WELCOME_MSG = (
@@ -180,43 +196,77 @@ def load_whitelist():
     except FileNotFoundError:
         return set()
 
+# === Database Connection Helper ===
+def get_db_connection():
+    """Get database connection (PostgreSQL or SQLite)"""
+    if USE_POSTGRES:
+        return psycopg.connect(**DB_CONFIG)
+    else:
+        return sqlite3.connect(DB_PATH)
+
+def execute_db_query(query, params=None, fetch=None):
+    """Execute database query with proper connection handling"""
+    try:
+        with get_db_connection() as conn:
+            if USE_POSTGRES:
+                with conn.cursor() as c:
+                    c.execute(query, params or ())
+                    if fetch == 'one':
+                        return c.fetchone()
+                    elif fetch == 'all':
+                        return c.fetchall()
+                    elif fetch == 'lastrowid':
+                        return c.lastrowid if hasattr(c, 'lastrowid') else None
+                    conn.commit()
+                    return c.rowcount
+            else:
+                c = conn.cursor()
+                c.execute(query, params or ())
+                if fetch == 'one':
+                    return c.fetchone()
+                elif fetch == 'all':
+                    return c.fetchall()
+                elif fetch == 'lastrowid':
+                    return c.lastrowid
+                conn.commit()
+                return c.rowcount
+    except Exception as e:
+        logger.error(f"Database query error: {e}")
+        raise
 # === Debug Functions ===
 def debug_database_state():
     """Debug function to check database state"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Check user profiles
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            profile_count = c.fetchone()[0]
-            
-            c.execute("SELECT phone, first_name, onboarding_completed FROM user_profiles LIMIT 10")
-            profiles = c.fetchall()
-            
-            # Check messages
-            c.execute("SELECT COUNT(*) FROM messages")
-            message_count = c.fetchone()[0]
-            
-            # Check whitelist content
-            whitelist = load_whitelist()
-            
-            logger.info(f"🔍 DATABASE DEBUG:")
-            logger.info(f"  Database path: {DB_PATH}")
-            logger.info(f"  User profiles: {profile_count}")
-            logger.info(f"  Messages: {message_count}")
-            logger.info(f"  Whitelist entries: {len(whitelist)}")
-            logger.info(f"  Sample profiles: {profiles}")
-            logger.info(f"  Whitelist content: {list(whitelist)[:5]}")  # First 5 entries
-            
-            return {
-                'profile_count': profile_count,
-                'message_count': message_count,
-                'whitelist_count': len(whitelist),
-                'profiles': profiles,
-                'whitelist': list(whitelist)
-            }
-            
+        # Check user profiles
+        profile_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
+        profiles = execute_db_query("SELECT phone, first_name, onboarding_completed FROM user_profiles LIMIT 10", fetch='all')
+        
+        # Check messages
+        message_count = execute_db_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
+        
+        # Check whitelist content
+        whitelist = load_whitelist()
+        
+        db_info = f"PostgreSQL ({DB_CONFIG['host']})" if USE_POSTGRES else f"SQLite ({DB_PATH})"
+        
+        logger.info(f"🔍 DATABASE DEBUG:")
+        logger.info(f"  Database: {db_info}")
+        logger.info(f"  User profiles: {profile_count}")
+        logger.info(f"  Messages: {message_count}")
+        logger.info(f"  Whitelist entries: {len(whitelist)}")
+        logger.info(f"  Sample profiles: {profiles}")
+        logger.info(f"  Whitelist content: {list(whitelist)[:5]}")  # First 5 entries
+        
+        return {
+            'database_type': 'PostgreSQL' if USE_POSTGRES else 'SQLite',
+            'database_info': db_info,
+            'profile_count': profile_count,
+            'message_count': message_count,
+            'whitelist_count': len(whitelist),
+            'profiles': profiles,
+            'whitelist': list(whitelist)
+        }
+        
     except Exception as e:
         logger.error(f"💥 Database debug error: {e}")
         return None
@@ -229,33 +279,30 @@ def debug_phone_lookup(phone):
         logger.info(f"  Original: {phone}")
         logger.info(f"  Normalized: {normalized}")
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Try exact match
-            c.execute("SELECT phone, first_name FROM user_profiles WHERE phone = ?", (phone,))
-            exact_match = c.fetchone()
-            
-            # Try normalized match
-            c.execute("SELECT phone, first_name FROM user_profiles WHERE phone = ?", (normalized,))
-            normalized_match = c.fetchone()
-            
-            # Get all phone numbers to compare
-            c.execute("SELECT phone FROM user_profiles")
-            all_phones = [row[0] for row in c.fetchall()]
-            
-            logger.info(f"  Exact match: {exact_match}")
-            logger.info(f"  Normalized match: {normalized_match}")
-            logger.info(f"  All phones in DB: {all_phones}")
-            
-            return {
-                'original': phone,
-                'normalized': normalized,
-                'exact_match': exact_match,
-                'normalized_match': normalized_match,
-                'all_phones': all_phones
-            }
-            
+        # Try exact match
+        exact_match = execute_db_query("SELECT phone, first_name FROM user_profiles WHERE phone = %s" if USE_POSTGRES else "SELECT phone, first_name FROM user_profiles WHERE phone = ?", 
+                                     (phone,), fetch='one')
+        
+        # Try normalized match
+        normalized_match = execute_db_query("SELECT phone, first_name FROM user_profiles WHERE phone = %s" if USE_POSTGRES else "SELECT phone, first_name FROM user_profiles WHERE phone = ?", 
+                                          (normalized,), fetch='one')
+        
+        # Get all phone numbers to compare
+        all_phones = execute_db_query("SELECT phone FROM user_profiles", fetch='all')
+        all_phones = [row[0] for row in all_phones] if all_phones else []
+        
+        logger.info(f"  Exact match: {exact_match}")
+        logger.info(f"  Normalized match: {normalized_match}")
+        logger.info(f"  All phones in DB: {all_phones}")
+        
+        return {
+            'original': phone,
+            'normalized': normalized,
+            'exact_match': exact_match,
+            'normalized_match': normalized_match,
+            'all_phones': all_phones
+        }
+        
     except Exception as e:
         logger.error(f"💥 Phone debug error: {e}")
         return None
@@ -686,51 +733,48 @@ def get_user_profile(phone):
     """Enhanced get_user_profile with debugging and phone format flexibility"""
     try:
         # First try the original phone number
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
+        placeholder = "%s" if USE_POSTGRES else "?"
+        result = execute_db_query(f"""
+            SELECT first_name, location, onboarding_step, onboarding_completed
+            FROM user_profiles
+            WHERE phone = {placeholder}
+        """, (phone,), fetch='one')
+        
+        if result:
+            logger.info(f"✅ Found profile for {phone} (exact match)")
+            return {
+                'first_name': result[0],
+                'location': result[1],
+                'onboarding_step': result[2],
+                'onboarding_completed': bool(result[3])
+            }
+        
+        # If not found, try normalized phone number
+        normalized = normalize_phone_number(phone)
+        if normalized != phone:
+            result = execute_db_query(f"""
                 SELECT first_name, location, onboarding_step, onboarding_completed
                 FROM user_profiles
-                WHERE phone = ?
-            """, (phone,))
-            result = c.fetchone()
+                WHERE phone = {placeholder}
+            """, (normalized,), fetch='one')
             
             if result:
-                logger.info(f"✅ Found profile for {phone} (exact match)")
+                logger.info(f"✅ Found profile for {phone} (normalized as {normalized})")
                 return {
                     'first_name': result[0],
                     'location': result[1],
                     'onboarding_step': result[2],
                     'onboarding_completed': bool(result[3])
                 }
-            
-            # If not found, try normalized phone number
-            normalized = normalize_phone_number(phone)
-            if normalized != phone:
-                c.execute("""
-                    SELECT first_name, location, onboarding_step, onboarding_completed
-                    FROM user_profiles
-                    WHERE phone = ?
-                """, (normalized,))
-                result = c.fetchone()
-                
-                if result:
-                    logger.info(f"✅ Found profile for {phone} (normalized as {normalized})")
-                    return {
-                        'first_name': result[0],
-                        'location': result[1],
-                        'onboarding_step': result[2],
-                        'onboarding_completed': bool(result[3])
-                    }
-            
-            # If still not found, log debug info for whitelisted users
-            whitelist = load_whitelist()
-            if phone in whitelist or normalized in whitelist:
-                logger.warning(f"❌ Whitelisted user {phone} has no profile - may need recovery")
-                debug_phone_lookup(phone)
-            
-            return None
-            
+        
+        # If still not found, log debug info for whitelisted users
+        whitelist = load_whitelist()
+        if phone in whitelist or normalized in whitelist:
+            logger.warning(f"❌ Whitelisted user {phone} has no profile - may need recovery")
+            debug_phone_lookup(phone)
+        
+        return None
+        
     except Exception as e:
         logger.error(f"Error getting user profile for {phone}: {e}")
         return None
@@ -743,49 +787,53 @@ def create_user_profile(phone):
         
         logger.info(f"📝 Creating user profile - Original: {original_phone}, Normalized: {phone}")
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Check if profile already exists
-            c.execute("SELECT phone, onboarding_completed FROM user_profiles WHERE phone = ?", (phone,))
-            existing = c.fetchone()
-            
-            if existing:
-                logger.info(f"👤 Profile already exists for {phone}: completed={existing[1]}")
-                return True
-            
-            # Create new profile
-            c.execute("""
+        # Check if profile already exists
+        placeholder = "%s" if USE_POSTGRES else "?"
+        existing = execute_db_query(f"SELECT phone, onboarding_completed FROM user_profiles WHERE phone = {placeholder}", 
+                                  (phone,), fetch='one')
+        
+        if existing:
+            logger.info(f"👤 Profile already exists for {phone}: completed={existing[1]}")
+            return True
+        
+        # Create new profile
+        if USE_POSTGRES:
+            query = """
+                INSERT INTO user_profiles 
+                (phone, onboarding_step, onboarding_completed, created_date, updated_date)
+                VALUES (%s, 1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                RETURNING id
+            """
+            result = execute_db_query(query, (phone,), fetch='one')
+            profile_id = result[0] if result else None
+        else:
+            query = """
                 INSERT INTO user_profiles 
                 (phone, onboarding_step, onboarding_completed, created_date, updated_date)
                 VALUES (?, 1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """, (phone,))
-            
-            rows_affected = c.rowcount
-            conn.commit()
-            
-            # Verify creation
-            c.execute("SELECT id, phone FROM user_profiles WHERE phone = ?", (phone,))
-            created = c.fetchone()
-            
-            logger.info(f"📝 Profile creation result - Rows affected: {rows_affected}, Created: {created}")
-            
-            if created:
-                logger.info(f"✅ Successfully created user profile for {phone} (ID: {created[0]})")
-                return True
-            else:
-                logger.error(f"❌ Failed to create profile for {phone} - no record found after insert")
-                return False
-            
+            """
+            execute_db_query(query, (phone,))
+            profile_id = execute_db_query("SELECT last_insert_rowid()", fetch='one')[0]
+        
+        # Verify creation
+        created = execute_db_query(f"SELECT id, phone FROM user_profiles WHERE phone = {placeholder}", 
+                                 (phone,), fetch='one')
+        
+        logger.info(f"📝 Profile creation result - ID: {profile_id}, Created: {created}")
+        
+        if created:
+            logger.info(f"✅ Successfully created user profile for {phone} (ID: {created[0]})")
+            return True
+        else:
+            logger.error(f"❌ Failed to create profile for {phone} - no record found after insert")
+            return False
+        
     except Exception as e:
         logger.error(f"💥 Error creating user profile for {phone}: {e}")
         # Log database state for debugging
         try:
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                c = conn.cursor()
-                c.execute("SELECT COUNT(*) FROM user_profiles")
-                count = c.fetchone()[0]
-                logger.error(f"📊 Current profile count in database: {count}")
+            profile_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
+            logger.error(f"📊 Current profile count in database: {profile_count}")
         except:
             logger.error("📊 Could not check database state")
         return False
@@ -1023,133 +1071,148 @@ def remove_from_whitelist(phone, send_goodbye=False):
 # === Database Initialization ===
 def init_db():
     try:
-        logger.info(f"🗄️ Initializing database at: {DB_PATH}")
+        db_info = f"PostgreSQL ({DB_CONFIG['host']})" if USE_POSTGRES else f"SQLite ({DB_PATH})"
+        logger.info(f"🗄️ Initializing database: {db_info}")
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
+        with get_db_connection() as conn:
+            if USE_POSTGRES:
+                c = conn.cursor()
+            else:
+                c = conn.cursor()
             
-            # Check if database exists and has data
-            c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            # Check existing tables
+            if USE_POSTGRES:
+                c.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            else:
+                c.execute("SELECT name FROM sqlite_master WHERE type='table'")
             existing_tables = [row[0] for row in c.fetchall()]
             logger.info(f"📊 Existing tables: {existing_tables}")
             
-            # Messages table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                content TEXT NOT NULL,
-                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                intent_type TEXT,
-                response_time_ms INTEGER
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
-            ON messages(phone, ts DESC);
-            """)
-            
-            # User profiles table for onboarding
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                first_name TEXT,
-                location TEXT,
-                onboarding_step INTEGER DEFAULT 0,
-                onboarding_completed BOOLEAN DEFAULT FALSE,
-                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
-            ON user_profiles(phone);
-            """)
-            
-            # Other tables...
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS onboarding_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                step INTEGER NOT NULL,
-                response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                source TEXT DEFAULT 'manual'
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_content TEXT NOT NULL,
-                clicksend_response TEXT,
-                delivery_status TEXT,
-                message_id TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_count INTEGER DEFAULT 1,
-                period_start DATE NOT NULL,
-                period_end DATE NOT NULL,
-                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                quota_warnings_sent INTEGER DEFAULT 0,
-                quota_exceeded BOOLEAN DEFAULT FALSE,
-                UNIQUE(phone, period_start)
-            );
-            """)
-            
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS usage_analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                intent_type TEXT,
-                success BOOLEAN,
-                response_time_ms INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
+            # Create tables with appropriate SQL syntax
+            if USE_POSTGRES:
+                # PostgreSQL syntax
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """)
+                
+                c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
+                ON messages(phone, ts DESC);
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
+                ON user_profiles(phone);
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT DEFAULT 'manual'
+                );
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status TEXT,
+                    message_id TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """)
+                
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS usage_analytics (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    intent_type TEXT,
+                    success BOOLEAN,
+                    response_time_ms INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+            else:
+                # SQLite syntax (existing code)
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """)
+                
+                # ... (rest of SQLite table creation code)
             
             conn.commit()
             
-            # Check for existing data and log detailed info
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            user_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM messages")  
-            message_count = c.fetchone()[0]
+            # Check for existing data
+            if USE_POSTGRES:
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                user_count = c.fetchone()[0]
+                c.execute("SELECT COUNT(*) FROM messages")
+                message_count = c.fetchone()[0]
+            else:
+                user_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
+                message_count = execute_db_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
             
             logger.info(f"📊 Database initialized successfully")
             logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
-            
-            # If we have data, show some samples for debugging
-            if user_count > 0:
-                c.execute("""
-                    SELECT phone, first_name, location, onboarding_completed, created_date 
-                    FROM user_profiles 
-                    ORDER BY created_date DESC 
-                    LIMIT 5
-                """)
-                recent_users = c.fetchall()
-                logger.info(f"📊 Recent users: {recent_users}")
             
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
