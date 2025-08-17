@@ -3,166 +3,318 @@ import os
 import logging
 import sys
 
+# Database imports - try psycopg3 first, then psycopg2
+POSTGRES_AVAILABLE = False
+psycopg = None
+RealDictCursor = None
+
+try:
+    # Try psycopg3 first (better Python 3.13 support)
+    import psycopg
+    from psycopg.rows import dict_row
+    POSTGRES_AVAILABLE = True
+    PSYCOPG_VERSION = 3
+    logger = logging.getLogger(__name__)
+    logger.info("✅ psycopg3 imported successfully")
+except ImportError:
+    try:
+        # Fallback to psycopg2
+        import psycopg2 as psycopg
+        from psycopg2.extras import RealDictCursor
+        POSTGRES_AVAILABLE = True
+        PSYCOPG_VERSION = 2
+        logger = logging.getLogger(__name__)
+        logger.info("✅ psycopg2 imported successfully")
+    except ImportError as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"❌ No PostgreSQL driver available: {e}")
+
+# SQLite fallback
+import sqlite3
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-@app.route('/', methods=['GET'])
-def home():
-    """Home page with links to debug endpoints"""
-    return '''
-    <h1>Hey Alex Debug Server</h1>
-    <p><a href="/debug">🔍 Full Debug Info</a></p>
-    <p><a href="/health">❤️ Health Check</a></p>
-    <p><a href="/test-postgres">🗄️ Test PostgreSQL</a></p>
-    '''
+# === Database Configuration ===
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "chat.db")
 
-@app.route('/debug', methods=['GET'])
-def debug():
-    """Debug all imports and environment"""
-    debug_info = {
-        "python_version": sys.version,
-        "environment_variables": {},
-        "import_tests": {},
-        "installed_packages": []
-    }
-    
-    # Environment variables
-    env_vars = ["DATABASE_URL", "RENDER", "RENDER_SERVICE_NAME", "PORT"]
-    for var in env_vars:
-        value = os.getenv(var)
-        if var == "DATABASE_URL" and value:
-            debug_info["environment_variables"][var] = value[:30] + "..."
+USE_POSTGRES = bool(DATABASE_URL and POSTGRES_AVAILABLE)
+logger.info(f"🗄️ Database Configuration:")
+logger.info(f"  DATABASE_URL: {'✅ Set' if DATABASE_URL else '❌ Missing'}")
+logger.info(f"  PostgreSQL Available: {'✅ Yes' if POSTGRES_AVAILABLE else '❌ No'}")
+logger.info(f"  Using: {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
+if POSTGRES_AVAILABLE:
+    logger.info(f"  PostgreSQL Version: psycopg{PSYCOPG_VERSION}")
+
+def get_db_connection():
+    """Get database connection based on environment"""
+    if USE_POSTGRES:
+        if PSYCOPG_VERSION == 3:
+            # psycopg3 syntax
+            return psycopg.connect(DATABASE_URL)
         else:
-            debug_info["environment_variables"][var] = value
-    
-    # Test imports
-    imports_to_test = [
-        "sqlite3",
-        "psycopg2",
-        "psycopg2.extras", 
-        "flask",
-        "requests"
-    ]
-    
-    for module_name in imports_to_test:
-        try:
-            module = __import__(module_name)
-            debug_info["import_tests"][module_name] = {
-                "status": "✅ SUCCESS",
-                "file": getattr(module, '__file__', 'unknown'),
-                "version": getattr(module, '__version__', 'unknown')
-            }
-        except ImportError as e:
-            debug_info["import_tests"][module_name] = {
-                "status": f"❌ FAILED: {str(e)}"
-            }
-    
-    # Get installed packages
+            # psycopg2 syntax
+            return psycopg.connect(DATABASE_URL)
+    else:
+        return sqlite3.connect(DB_PATH)
+
+def execute_query(query, params=None, fetch=False, fetchall=False, fetchone=False):
+    """Execute database query with proper connection handling"""
     try:
-        import pkg_resources
-        installed_packages = [f"{d.project_name}=={d.version}" for d in pkg_resources.working_set]
-        postgres_related = [p for p in installed_packages if 'psycopg' in p.lower() or 'postgres' in p.lower()]
-        debug_info["postgres_packages"] = postgres_related
-        debug_info["total_packages"] = len(installed_packages)
+        if USE_POSTGRES:
+            with get_db_connection() as conn:
+                if PSYCOPG_VERSION == 3:
+                    # psycopg3 syntax
+                    with conn.cursor(row_factory=dict_row) as cursor:
+                        cursor.execute(query, params or ())
+                        conn.commit()
+                        
+                        if fetchall:
+                            return cursor.fetchall()
+                        elif fetchone:
+                            return cursor.fetchone()
+                        elif fetch:
+                            return cursor.fetchall()
+                        else:
+                            return cursor.rowcount
+                else:
+                    # psycopg2 syntax
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute(query, params or ())
+                        conn.commit()
+                        
+                        if fetchall:
+                            return cursor.fetchall()
+                        elif fetchone:
+                            return cursor.fetchone()
+                        elif fetch:
+                            return cursor.fetchall()
+                        else:
+                            return cursor.rowcount
+        else:
+            # SQLite
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params or ())
+                conn.commit()
+                
+                if fetchall:
+                    return cursor.fetchall()
+                elif fetchone:
+                    return cursor.fetchone()
+                elif fetch:
+                    return cursor.fetchall()
+                else:
+                    return cursor.rowcount
+                    
+    except Exception as e:
+        logger.error(f"Database query error: {e}")
+        logger.error(f"Query: {query}")
+        logger.error(f"Params: {params}")
+        raise
+
+def init_db():
+    """Initialize database with proper schema"""
+    try:
+        logger.info(f"🗄️ Initializing {'PostgreSQL' if USE_POSTGRES else 'SQLite'} database")
         
-        # Show first 20 packages for debugging
-        debug_info["sample_packages"] = sorted(installed_packages)[:20]
+        if USE_POSTGRES:
+            # PostgreSQL table creation
+            tables = [
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) UNIQUE NOT NULL,
+                    first_name VARCHAR(100),
+                    location VARCHAR(200),
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    role VARCHAR(20) NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    intent_type VARCHAR(50),
+                    response_time_ms INTEGER
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
+                "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);"
+            ]
+            
+            for table_sql in tables:
+                execute_query(table_sql)
+            
+            logger.info("✅ PostgreSQL tables created successfully")
+            
+        else:
+            # SQLite table creation
+            tables = [
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE NOT NULL,
+                    first_name TEXT,
+                    location TEXT,
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    intent_type TEXT,
+                    response_time_ms INTEGER
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);",
+                "CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages(phone, ts DESC);"
+            ]
+            
+            for table_sql in tables:
+                execute_query(table_sql)
+            
+            logger.info("✅ SQLite tables created successfully")
+        
+        # Check for existing data
+        user_count = execute_query("SELECT COUNT(*) FROM user_profiles", fetchone=True)[0]
+        message_count = execute_query("SELECT COUNT(*) FROM messages", fetchone=True)[0]
+        
+        logger.info(f"📊 Database initialized successfully")
+        logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
         
     except Exception as e:
-        debug_info["package_error"] = str(e)
-    
-    return jsonify(debug_info)
+        logger.error(f"💥 Database initialization error: {e}")
+        raise
 
-@app.route('/test-postgres', methods=['GET'])
-def test_postgres():
-    """Test PostgreSQL connection specifically"""
-    result = {"test": "PostgreSQL Connection"}
-    
-    try:
-        import psycopg2
-        result["psycopg2_import"] = "✅ SUCCESS"
-        result["psycopg2_version"] = getattr(psycopg2, '__version__', 'unknown')
-        result["psycopg2_file"] = getattr(psycopg2, '__file__', 'unknown')
-        
-        # Test DATABASE_URL
-        database_url = os.getenv("DATABASE_URL")
-        if database_url:
-            result["database_url"] = "✅ SET"
-            
-            try:
-                # Test connection
-                conn = psycopg2.connect(database_url)
-                result["connection"] = "✅ SUCCESS"
-                
-                # Test query
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT version()")
-                    version = cursor.fetchone()[0]
-                    result["postgres_version"] = version[:100] + "..." if len(version) > 100 else version
-                
-                # Test table creation
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS test_table (
-                            id SERIAL PRIMARY KEY,
-                            name VARCHAR(100),
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    conn.commit()
-                    result["table_creation"] = "✅ SUCCESS"
-                
-                # Test data insertion
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO test_table (name) VALUES (%s) RETURNING id
-                    """, ("test_user",))
-                    new_id = cursor.fetchone()[0]
-                    conn.commit()
-                    result["data_insertion"] = f"✅ SUCCESS (ID: {new_id})"
-                
-                # Test data retrieval
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT COUNT(*) FROM test_table")
-                    count = cursor.fetchone()[0]
-                    result["data_retrieval"] = f"✅ SUCCESS ({count} records)"
-                
-                conn.close()
-                
-            except Exception as e:
-                result["connection_error"] = f"❌ {str(e)}"
-        else:
-            result["database_url"] = "❌ NOT SET"
-            
-    except ImportError as e:
-        result["psycopg2_import"] = f"❌ FAILED: {str(e)}"
-        
-        # Try to diagnose the import issue
-        try:
-            import sys
-            result["python_path"] = sys.path[:5]  # First 5 paths
-            
-            # Check if the package files exist
-            try:
-                import pkg_resources
-                dist = pkg_resources.get_distribution('psycopg2-binary')
-                result["psycopg2_binary_location"] = dist.location
-            except:
-                pass
-                
-        except Exception as debug_error:
-            result["debug_error"] = str(debug_error)
-    
-    return jsonify(result)
+@app.route('/', methods=['GET'])
+def home():
+    """Home page"""
+    return '''
+    <h1>Hey Alex SMS Assistant</h1>
+    <p><a href="/health">❤️ Health Check</a></p>
+    <p><a href="/test-db">🗄️ Test Database</a></p>
+    '''
 
 @app.route('/health', methods=['GET'])
-def health():
-    """Simple health check"""
-    return jsonify({"status": "healthy", "message": "Hey Alex Debug Server is running"})
+def health_check():
+    """Health check endpoint with database status"""
+    try:
+        # Test database connection
+        user_count = execute_query("SELECT COUNT(*) FROM user_profiles", fetchone=True)[0]
+        db_status = "✅ Connected"
+    except Exception as e:
+        db_status = f"❌ Error: {str(e)}"
+        user_count = "unknown"
+    
+    return jsonify({
+        "status": "healthy",
+        "version": "2.8",
+        "database": {
+            "type": f"PostgreSQL (psycopg{PSYCOPG_VERSION})" if USE_POSTGRES else "SQLite",
+            "status": db_status,
+            "user_count": user_count
+        },
+        "environment": {
+            "python_version": sys.version,
+            "postgres_available": POSTGRES_AVAILABLE,
+            "database_url_set": bool(DATABASE_URL)
+        }
+    })
+
+@app.route('/test-db', methods=['GET'])
+def test_database():
+    """Test database operations"""
+    try:
+        # Test creating a user profile
+        test_phone = "+1234567890"
+        
+        # Create test user
+        if USE_POSTGRES:
+            execute_query("""
+                INSERT INTO user_profiles (phone, first_name, location, onboarding_completed)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (phone) DO UPDATE SET
+                    first_name = EXCLUDED.first_name,
+                    location = EXCLUDED.location,
+                    onboarding_completed = EXCLUDED.onboarding_completed,
+                    updated_date = CURRENT_TIMESTAMP
+            """, (test_phone, "Test User", "Test City", True))
+        else:
+            execute_query("""
+                INSERT OR REPLACE INTO user_profiles 
+                (phone, first_name, location, onboarding_completed)
+                VALUES (?, ?, ?, ?)
+            """, (test_phone, "Test User", "Test City", True))
+        
+        # Get user profile
+        profile = execute_query("""
+            SELECT first_name, location, onboarding_completed
+            FROM user_profiles
+            WHERE phone = %s
+        """ if USE_POSTGRES else """
+            SELECT first_name, location, onboarding_completed
+            FROM user_profiles
+            WHERE phone = ?
+        """, (test_phone,), fetchone=True)
+        
+        # Save test message
+        execute_query("""
+            INSERT INTO messages (phone, role, content)
+            VALUES (%s, %s, %s)
+        """ if USE_POSTGRES else """
+            INSERT INTO messages (phone, role, content)
+            VALUES (?, ?, ?)
+        """, (test_phone, "user", "test message"))
+        
+        # Load history
+        history = execute_query("""
+            SELECT role, content
+            FROM messages
+            WHERE phone = %s
+            ORDER BY id DESC
+            LIMIT 1
+        """ if USE_POSTGRES else """
+            SELECT role, content
+            FROM messages
+            WHERE phone = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (test_phone,), fetchall=True)
+        
+        return jsonify({
+            "status": "success",
+            "database_type": f"PostgreSQL (psycopg{PSYCOPG_VERSION})" if USE_POSTGRES else "SQLite",
+            "test_profile": dict(profile) if USE_POSTGRES else {"first_name": profile[0], "location": profile[1], "onboarding_completed": bool(profile[2])},
+            "test_history": [dict(h) if USE_POSTGRES else {"role": h[0], "content": h[1]} for h in history]
+        })
+        
+    except Exception as e:
+        logger.error(f"Database test error: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+# Initialize database on startup
+init_db()
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Hey Alex Debug Server")
+    logger.info(f"🚀 Starting Hey Alex SMS Assistant")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
