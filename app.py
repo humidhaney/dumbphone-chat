@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
@@ -149,7 +149,7 @@ def get_db_connection():
     """Context manager for PostgreSQL connections"""
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
         yield conn
     except Exception as e:
         if conn:
@@ -358,15 +358,7 @@ def get_user_profile(phone):
                 result = c.fetchone()
                 
                 if result:
-                    return {
-                        'first_name': result['first_name'],
-                        'location': result['location'],
-                        'onboarding_step': result['onboarding_step'],
-                        'onboarding_completed': bool(result['onboarding_completed']),
-                        'stripe_customer_id': result['stripe_customer_id'],
-                        'subscription_status': result['subscription_status'],
-                        'subscription_id': result['subscription_id']
-                    }
+                    return dict(result)
                 else:
                     return None
     except Exception as e:
