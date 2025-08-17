@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 CHANGELOG = {
+    "3.3": "Added STOP → CANCEL flow: Users can now cancel Stripe subscriptions via SMS with STOP then CANCEL commands",
     "3.2": "Added admin endpoints: /admin/reset-user and /admin/whitelist/remove for user management",
     "3.1": "Fixed PostgreSQL imports - updated from psycopg2 to psycopg3 for compatibility",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
@@ -959,6 +960,54 @@ IMPORTANT GUIDELINES:
         logger.error(f"💥 Claude integration error for {phone}: {e}")
         return "I'm having trouble processing that question. Let me try to search for that information instead."
 
+def cancel_stripe_subscription(customer_id):
+    """Cancel all active subscriptions for a Stripe customer"""
+    if not STRIPE_SECRET_KEY:
+        logger.error("Stripe not configured for subscription cancellation")
+        return False, "Stripe not configured"
+    
+    try:
+        # Get all subscriptions for the customer
+        subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
+        
+        if not subscriptions.data:
+            logger.warning(f"No active subscriptions found for customer {customer_id}")
+            return False, "No active subscriptions found"
+        
+        cancelled_count = 0
+        errors = []
+        
+        # Cancel all active subscriptions
+        for subscription in subscriptions.data:
+            try:
+                cancelled_sub = stripe.Subscription.cancel(subscription.id)
+                logger.info(f"✅ Cancelled subscription {subscription.id} for customer {customer_id}")
+                cancelled_count += 1
+                
+                # Log the cancellation event
+                log_stripe_event(
+                    'manual_cancellation', 
+                    customer_id, 
+                    subscription.id, 
+                    None, 
+                    'cancelled',
+                    {'cancelled_via': 'sms_command', 'subscription_id': subscription.id}
+                )
+                
+            except Exception as sub_error:
+                error_msg = f"Failed to cancel subscription {subscription.id}: {str(sub_error)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+        
+        if cancelled_count > 0:
+            return True, f"Cancelled {cancelled_count} subscription(s)"
+        else:
+            return False, f"Failed to cancel subscriptions: {'; '.join(errors)}"
+            
+    except Exception as e:
+        logger.error(f"💥 Error cancelling subscriptions for customer {customer_id}: {e}")
+        return False, f"Stripe error: {str(e)}"
+
 # === Stripe Functions ===
 def log_stripe_event(event_type, customer_id, subscription_id, phone, status, additional_data=None):
     """Log Stripe webhook events for debugging"""
@@ -1302,13 +1351,73 @@ def sms_webhook():
     
     # Handle special commands
     if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
+        # Check if user has an active subscription
+        profile = get_user_profile(sender)
+        if profile and profile.get('stripe_customer_id') and profile.get('subscription_status') not in ['cancelled', 'inactive']:
+            response_msg = (
+                "⏸️ You've been temporarily unsubscribed from Hey Alex SMS. "
+                "To permanently CANCEL your paid subscription and stop all billing, reply CANCEL. "
+                "To resume SMS without cancelling, text START anytime."
+            )
+        else:
+            response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
+        
         try:
             send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Unsubscribe processed"}), 200
+            return jsonify({"message": "Stop processed"}), 200
         except Exception as e:
-            logger.error(f"Failed to send unsubscribe message: {e}")
-            return jsonify({"error": "Failed to process unsubscribe"}), 500
+            logger.error(f"Failed to send stop message: {e}")
+            return jsonify({"error": "Failed to process stop"}), 500
+    
+    if body.upper() == 'CANCEL':
+        # Handle subscription cancellation
+        try:
+            profile = get_user_profile(sender)
+            if not profile:
+                response_msg = "No account found. If you have billing questions, contact support."
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "No profile found for cancellation"}), 200
+            
+            stripe_customer_id = profile.get('stripe_customer_id')
+            subscription_status = profile.get('subscription_status')
+            
+            if not stripe_customer_id or subscription_status in ['cancelled', 'inactive']:
+                response_msg = "No active subscription found to cancel. If you have billing questions, contact support."
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "No active subscription"}), 200
+            
+            # Cancel subscription in Stripe
+            success, message = cancel_stripe_subscription(stripe_customer_id)
+            
+            if success:
+                # Remove from whitelist and update profile
+                remove_from_whitelist(sender, send_goodbye=False)
+                update_user_profile(sender, subscription_status='cancelled')
+                
+                response_msg = (
+                    "✅ Your Hey Alex subscription has been cancelled. "
+                    "No further charges will occur. Thanks for using Hey Alex! "
+                    "You can resubscribe anytime at heyalex.co"
+                )
+                logger.info(f"🚫 Successfully cancelled subscription for {sender}")
+            else:
+                response_msg = (
+                    "❌ There was an issue cancelling your subscription. "
+                    "Please contact support for assistance."
+                )
+                logger.error(f"❌ Failed to cancel subscription for {sender}: {message}")
+            
+            send_sms(sender, response_msg, bypass_quota=True)
+            return jsonify({"message": "Cancellation processed", "success": success}), 200
+            
+        except Exception as e:
+            logger.error(f"💥 Error processing cancellation for {sender}: {e}")
+            response_msg = "There was an error processing your cancellation. Please contact support."
+            try:
+                send_sms(sender, response_msg, bypass_quota=True)
+            except:
+                pass
+            return jsonify({"error": "Cancellation processing failed"}), 500
     
     if body.lower() in ['start', 'subscribe', 'resume']:
         if is_user_onboarded(sender):
