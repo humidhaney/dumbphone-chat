@@ -1833,7 +1833,9 @@ def debug_user(phone):
         })
         
     except Exception as e:
-        @app.route('/debug/database', methods=['GET'])
+                return jsonify({'error': str(e)}), 500
+
+@app.route('/debug/database', methods=['GET'])
 def debug_database():
     """Debug endpoint to check database state"""
     try:
