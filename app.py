@@ -736,21 +736,58 @@ def get_user_profile(phone):
         return None
 
 def create_user_profile(phone):
-    """Create new user profile for onboarding"""
+    """Create new user profile for onboarding with enhanced debugging"""
     try:
+        original_phone = phone
         phone = normalize_phone_number(phone)
+        
+        logger.info(f"📝 Creating user profile - Original: {original_phone}, Normalized: {phone}")
+        
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
+            
+            # Check if profile already exists
+            c.execute("SELECT phone, onboarding_completed FROM user_profiles WHERE phone = ?", (phone,))
+            existing = c.fetchone()
+            
+            if existing:
+                logger.info(f"👤 Profile already exists for {phone}: completed={existing[1]}")
+                return True
+            
+            # Create new profile
             c.execute("""
-                INSERT OR IGNORE INTO user_profiles 
-                (phone, onboarding_step, onboarding_completed)
-                VALUES (?, 1, FALSE)
+                INSERT INTO user_profiles 
+                (phone, onboarding_step, onboarding_completed, created_date, updated_date)
+                VALUES (?, 1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """, (phone,))
+            
+            rows_affected = c.rowcount
             conn.commit()
-            logger.info(f"📝 Created user profile for {phone}")
-            return True
+            
+            # Verify creation
+            c.execute("SELECT id, phone FROM user_profiles WHERE phone = ?", (phone,))
+            created = c.fetchone()
+            
+            logger.info(f"📝 Profile creation result - Rows affected: {rows_affected}, Created: {created}")
+            
+            if created:
+                logger.info(f"✅ Successfully created user profile for {phone} (ID: {created[0]})")
+                return True
+            else:
+                logger.error(f"❌ Failed to create profile for {phone} - no record found after insert")
+                return False
+            
     except Exception as e:
-        logger.error(f"Error creating user profile for {phone}: {e}")
+        logger.error(f"💥 Error creating user profile for {phone}: {e}")
+        # Log database state for debugging
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM user_profiles")
+                count = c.fetchone()[0]
+                logger.error(f"📊 Current profile count in database: {count}")
+        except:
+            logger.error("📊 Could not check database state")
         return False
 
 def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, onboarding_completed=None):
@@ -1185,14 +1222,46 @@ def log_sms_delivery(phone, message_content, clicksend_response, delivery_status
         conn.commit()
 
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
-    phone = normalize_phone_number(phone)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, role, content, intent_type, response_time_ms))
-        conn.commit()
+    """Save message with enhanced debugging"""
+    try:
+        original_phone = phone
+        phone = normalize_phone_number(phone)
+        
+        logger.info(f"💬 Saving message - Phone: {original_phone} -> {phone}, Role: {role}, Content: {content[:50]}...")
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+                VALUES (?, ?, ?, ?, ?)
+            """, (phone, role, content, intent_type, response_time_ms))
+            
+            rows_affected = c.rowcount
+            message_id = c.lastrowid
+            conn.commit()
+            
+            logger.info(f"💬 Message saved - ID: {message_id}, Rows affected: {rows_affected}")
+            
+            # Verify save
+            c.execute("SELECT id FROM messages WHERE phone = ? ORDER BY id DESC LIMIT 1", (phone,))
+            verify = c.fetchone()
+            
+            if verify:
+                logger.info(f"✅ Message verification successful - Latest message ID: {verify[0]}")
+            else:
+                logger.error(f"❌ Message verification failed - no messages found for {phone}")
+                
+    except Exception as e:
+        logger.error(f"💥 Error saving message for {phone}: {e}")
+        # Log database state
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM messages")
+                count = c.fetchone()[0]
+                logger.error(f"📊 Current message count in database: {count}")
+        except:
+            logger.error("📊 Could not check message count")
 
 def load_history(phone, limit=4):
     phone = normalize_phone_number(phone)
@@ -1517,17 +1586,69 @@ def sms_webhook():
     
     # Special case: If user is in whitelist but has no profile, it might be a recovery case
     if not profile:
-        logger.warning(f"🔍 User {sender} in whitelist but no profile found - checking for recovery case")
+        logger.warning(f"🔍 User {sender} in whitelist but no profile found - investigating...")
+        
+        # Enhanced debugging for this specific case
         debug_state = debug_database_state()
+        debug_phone_lookup(sender)
+        
+        # Check database permissions and connectivity
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT 1")
+                logger.info(f"✅ Database connection test successful")
+                
+                # Check if we can write to the database
+                c.execute("INSERT INTO messages (phone, role, content) VALUES (?, 'test', 'connection_test')", (sender,))
+                test_id = c.lastrowid
+                c.execute("DELETE FROM messages WHERE id = ?", (test_id,))
+                conn.commit()
+                logger.info(f"✅ Database write test successful")
+                
+        except Exception as db_error:
+            logger.error(f"💥 Database connectivity issue: {db_error}")
+            
+            # Send error message and return
+            error_msg = "Sorry, I'm having database issues. Please contact support."
+            try:
+                send_sms(sender, error_msg, bypass_quota=True)
+                return jsonify({"message": "Database error sent"}), 500
+            except Exception as sms_error:
+                logger.error(f"Failed to send database error message: {sms_error}")
+                return jsonify({"error": "Database connectivity failed"}), 500
         
         # If we have other users in the database, this might be a lookup issue
         if debug_state and debug_state['profile_count'] > 0:
             logger.warning(f"📊 Database has {debug_state['profile_count']} profiles, but lookup failed for {sender}")
-            debug_phone_lookup(sender)
         
-        # Create new profile and start onboarding
-        logger.info(f"📝 Creating new profile for {sender}")
-        create_user_profile(sender)
+        # Try to create new profile with enhanced logging
+        logger.info(f"📝 Attempting to create new profile for {sender}")
+        creation_success = create_user_profile(sender)
+        
+        if not creation_success:
+            logger.error(f"💥 Failed to create profile for {sender}")
+            error_msg = "Sorry, I'm having trouble setting up your account. Please contact support."
+            try:
+                send_sms(sender, error_msg, bypass_quota=True)
+                return jsonify({"message": "Profile creation failed"}), 500
+            except Exception as sms_error:
+                logger.error(f"Failed to send profile creation error: {sms_error}")
+                return jsonify({"error": "Profile creation failed"}), 500
+        
+        # Try to get the profile again
+        profile = get_user_profile(sender)
+        if not profile:
+            logger.error(f"💥 Profile creation appeared successful but still can't retrieve for {sender}")
+            error_msg = "Sorry, I'm having trouble with your account setup. Please contact support."
+            try:
+                send_sms(sender, error_msg, bypass_quota=True)
+                return jsonify({"message": "Profile retrieval failed"}), 500
+            except Exception as sms_error:
+                logger.error(f"Failed to send profile retrieval error: {sms_error}")
+                return jsonify({"error": "Profile retrieval failed"}), 500
+        
+        logger.info(f"✅ Successfully created and retrieved profile for {sender}")
         
         try:
             send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
@@ -1876,14 +1997,59 @@ def test_intent():
         logger.error(f"Error in intent test: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/debug/database', methods=['GET'])
-def debug_database():
-    """Debug endpoint to check database state"""
+@app.route('/debug/database-test/<phone>', methods=['POST'])
+def test_database_operations(phone):
+    """Test database operations for a specific phone number"""
     try:
-        debug_state = debug_database_state()
-        return jsonify(debug_state)
+        phone = normalize_phone_number(phone)
+        results = {}
+        
+        # Test 1: Basic database connection
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT 1")
+                results['connection'] = "✅ Success"
+        except Exception as e:
+            results['connection'] = f"❌ Failed: {e}"
+            return jsonify(results)
+        
+        # Test 2: Create user profile
+        try:
+            success = create_user_profile(phone)
+            results['create_profile'] = "✅ Success" if success else "❌ Failed"
+        except Exception as e:
+            results['create_profile'] = f"❌ Exception: {e}"
+        
+        # Test 3: Retrieve user profile
+        try:
+            profile = get_user_profile(phone)
+            results['get_profile'] = f"✅ Found: {profile}" if profile else "❌ Not found"
+        except Exception as e:
+            results['get_profile'] = f"❌ Exception: {e}"
+        
+        # Test 4: Save message
+        try:
+            save_message(phone, "test", "test message")
+            results['save_message'] = "✅ Success"
+        except Exception as e:
+            results['save_message'] = f"❌ Exception: {e}"
+        
+        # Test 5: Load history
+        try:
+            history = load_history(phone, 1)
+            results['load_history'] = f"✅ Found {len(history)} messages"
+        except Exception as e:
+            results['load_history'] = f"❌ Exception: {e}"
+        
+        return jsonify({
+            'phone': phone,
+            'tests': results,
+            'database_path': DB_PATH
+        })
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 # Initialize database on startup
 init_db()
