@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.5"
+APP_VERSION = "3.6"
 CHANGELOG = {
+    "3.6": "Added admin debug endpoints: /admin/users, /admin/subscription-events, /admin/user/<phone>, /admin/link-stripe",
     "3.5": "Optimized SMS responses: Removed intro phrases and confirmations to maximize valuable content within character limits",
     "3.4": "Fixed cancellation flow: Use 'Cancel Chat' → 'CONFIRM CANCEL' (avoids ClickSend STOP). Added cancellation instructions to onboarding.",
     "3.3": "Added STOP → CANCEL flow: Users can now cancel Stripe subscriptions via SMS with STOP then CANCEL commands",
@@ -1111,6 +1112,120 @@ def handle_subscription_deleted(subscription):
                         {'error': str(e)})
 
 # === ADMIN ENDPOINTS ===
+@app.route('/admin/users', methods=['GET'])
+def admin_list_users():
+    """Admin endpoint to list all users and their profiles"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT phone, first_name, location, onboarding_completed, 
+                           stripe_customer_id, subscription_status, created_date
+                    FROM user_profiles
+                    ORDER BY created_date DESC
+                """)
+                users = c.fetchall()
+                
+                return jsonify({
+                    "total_users": len(users),
+                    "users": [dict(user) for user in users]
+                })
+                
+    except Exception as e:
+        logger.error(f"Error listing users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/subscription-events', methods=['GET'])
+def admin_subscription_events():
+    """Admin endpoint to view recent Stripe webhook events"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT event_type, stripe_customer_id, subscription_id, phone, 
+                           status, event_data, timestamp
+                    FROM subscription_events
+                    ORDER BY timestamp DESC
+                    LIMIT 20
+                """)
+                events = c.fetchall()
+                
+                return jsonify({
+                    "total_events": len(events),
+                    "events": [dict(event) for event in events]
+                })
+                
+    except Exception as e:
+        logger.error(f"Error getting subscription events: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/user/<phone>', methods=['GET'])
+def admin_get_user(phone):
+    """Admin endpoint to get specific user details"""
+    try:
+        phone = normalize_phone_number(phone)
+        profile = get_user_profile(phone)
+        
+        if not profile:
+            return jsonify({"error": "User not found"}), 404
+        
+        # Also get recent messages
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT role, content, intent_type, ts
+                    FROM messages
+                    WHERE phone = %s
+                    ORDER BY id DESC
+                    LIMIT 10
+                """, (phone,))
+                messages = c.fetchall()
+        
+        return jsonify({
+            "profile": profile,
+            "recent_messages": [dict(msg) for msg in messages]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting user {phone}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/link-stripe', methods=['POST'])
+def admin_link_stripe():
+    """Admin endpoint to manually link Stripe customer to user profile"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        stripe_customer_id = data.get('stripe_customer_id')
+        subscription_status = data.get('subscription_status', 'active')
+        
+        if not phone or not stripe_customer_id:
+            return jsonify({"error": "phone and stripe_customer_id required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Update the user profile
+        success = update_user_profile(
+            phone,
+            stripe_customer_id=stripe_customer_id,
+            subscription_status=subscription_status
+        )
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Linked {phone} to Stripe customer {stripe_customer_id}",
+                "phone": phone,
+                "stripe_customer_id": stripe_customer_id,
+                "subscription_status": subscription_status
+            })
+        else:
+            return jsonify({"error": "Failed to update profile"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error linking Stripe: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/whitelist/remove', methods=['POST'])
 def admin_remove_from_whitelist():
     """Admin endpoint to remove users from whitelist"""
