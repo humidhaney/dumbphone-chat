@@ -1244,127 +1244,7 @@ def admin_add_to_whitelist():
         send_welcome = data.get('send_welcome', True)
         
         if not phone:
-            return jsonify({"message": "Onboarding started for new user"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send onboarding start message: {e}")
-            return jsonify({"error": "Failed to start onboarding"}), 500
-    
-    elif not profile['onboarding_completed']:
-        # Profile exists but onboarding not complete
-        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
-        
-        try:
-            response_msg = handle_onboarding_response(sender, body)
-            
-            # Send response
-            result = send_sms(sender, response_msg)
-            
-            if "error" not in result:
-                logger.info(f"✅ Onboarding response sent to {sender}")
-                return jsonify({"message": "Onboarding response sent"}), 200
-            else:
-                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
-                return jsonify({"error": "Failed to send onboarding response"}), 500
-                
-        except Exception as e:
-            logger.error(f"💥 Onboarding error for {sender}: {e}")
-            fallback_msg = "Sorry, there was an error during setup. Please try again."
-            try:
-                send_sms(sender, fallback_msg, bypass_quota=True)
-                return jsonify({"message": "Onboarding fallback sent"}), 200
-            except Exception as fallback_error:
-                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
-                return jsonify({"error": "Onboarding failed"}), 500
-    
-    # User is fully onboarded - continue to normal processing
-    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
-    
-    # User is onboarded, process normal queries
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
-    # Get user context for personalized responses
-    user_context = get_user_context_for_queries(sender)
-    
-    try:
-        # Process based on intent
-        if intent and intent.type == "weather":
-            # Use user's location if no city specified and user is onboarded
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-        else:
-            # Use Claude for general queries with user context
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            # If Claude suggests a search, perform it
-            if "Let me search for" in response_msg:
-                search_term = body
-                # Add location context to search if available
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
-        
-        # Ensure response is not too long for SMS
-        if len(response_msg) > 1600:
-            response_msg = response_msg[:1597] + "..."
-        
-        # Save assistant response
-        response_time = int((time.time() - start_time) * 1000)
-        save_message(sender, "assistant", response_msg, intent_type, response_time)
-        
-        # Send main response
-        result = send_sms(sender, response_msg)
-        
-        if "error" not in result:
-            log_usage_analytics(sender, intent_type, True, response_time)
-            logger.info(f"✅ Response sent to {sender} in {response_time}ms")
-            return jsonify({"message": "Response sent successfully"}), 200
-        else:
-            log_usage_analytics(sender, intent_type, False, response_time)
-            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
-            return jsonify({"error": "Failed to send response"}), 500
-            
-    except Exception as e:
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(sender, intent_type, False, response_time)
-        logger.error(f"💥 Processing error for {sender}: {e}")
-        
-        # Send fallback response
-        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
-        try:
-            send_sms(sender, fallback_msg, bypass_quota=True)
-            return jsonify({"message": "Fallback response sent"}), 200
-        except Exception as fallback_error:
-            logger.error(f"Failed to send fallback message: {fallback_error}")
-            return jsonify({"error": "Processing failed"}), 500
-
-# === HEALTH CHECK ===
-@app.route('/')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'version': APP_VERSION,
-        'latest_changes': CHANGELOG[APP_VERSION]
-    })
-
-# Initialize database on startup
-init_db()
-
-if __name__ == "__main__":
-    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
-    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))error": "Phone number required"}), 400
+            return jsonify({"error": "Phone number required"}), 400
         
         phone = normalize_phone_number(phone)
         
@@ -1737,4 +1617,124 @@ def sms_webhook():
         try:
             send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
             save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"
+            return jsonify({"message": "Onboarding started for new user"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send onboarding start message: {e}")
+            return jsonify({"error": "Failed to start onboarding"}), 500
+    
+    elif not profile['onboarding_completed']:
+        # Profile exists but onboarding not complete
+        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
+        
+        try:
+            response_msg = handle_onboarding_response(sender, body)
+            
+            # Send response
+            result = send_sms(sender, response_msg)
+            
+            if "error" not in result:
+                logger.info(f"✅ Onboarding response sent to {sender}")
+                return jsonify({"message": "Onboarding response sent"}), 200
+            else:
+                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
+                return jsonify({"error": "Failed to send onboarding response"}), 500
+                
+        except Exception as e:
+            logger.error(f"💥 Onboarding error for {sender}: {e}")
+            fallback_msg = "Sorry, there was an error during setup. Please try again."
+            try:
+                send_sms(sender, fallback_msg, bypass_quota=True)
+                return jsonify({"message": "Onboarding fallback sent"}), 200
+            except Exception as fallback_error:
+                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
+                return jsonify({"error": "Onboarding failed"}), 500
+    
+    # User is fully onboarded - continue to normal processing
+    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
+    
+    # User is onboarded, process normal queries
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
+    
+    # Get user context for personalized responses
+    user_context = get_user_context_for_queries(sender)
+    
+    try:
+        # Process based on intent
+        if intent and intent.type == "weather":
+            # Use user's location if no city specified and user is onboarded
+            if user_context['personalized']:
+                city = user_context['location']
+                logger.info(f"🌍 Using user's saved location: {city}")
+                query = f"weather forecast {city}"
+                response_msg = web_search(query, search_type="general")
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+            else:
+                response_msg = web_search("weather forecast", search_type="general")
+        else:
+            # Use Claude for general queries with user context
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            # If Claude suggests a search, perform it
+            if "Let me search for" in response_msg:
+                search_term = body
+                # Add location context to search if available
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
+        
+        # Ensure response is not too long for SMS
+        if len(response_msg) > 1600:
+            response_msg = response_msg[:1597] + "..."
+        
+        # Save assistant response
+        response_time = int((time.time() - start_time) * 1000)
+        save_message(sender, "assistant", response_msg, intent_type, response_time)
+        
+        # Send main response
+        result = send_sms(sender, response_msg)
+        
+        if "error" not in result:
+            log_usage_analytics(sender, intent_type, True, response_time)
+            logger.info(f"✅ Response sent to {sender} in {response_time}ms")
+            return jsonify({"message": "Response sent successfully"}), 200
+        else:
+            log_usage_analytics(sender, intent_type, False, response_time)
+            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
+            return jsonify({"error": "Failed to send response"}), 500
+            
+    except Exception as e:
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        logger.error(f"💥 Processing error for {sender}: {e}")
+        
+        # Send fallback response
+        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
+        try:
+            send_sms(sender, fallback_msg, bypass_quota=True)
+            return jsonify({"message": "Fallback response sent"}), 200
+        except Exception as fallback_error:
+            logger.error(f"Failed to send fallback message: {fallback_error}")
+            return jsonify({"error": "Processing failed"}), 500
+
+# === HEALTH CHECK ===
+@app.route('/')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'version': APP_VERSION,
+        'latest_changes': CHANGELOG[APP_VERSION]
+    })
+
+# Initialize database on startup
+init_db()
+
+if __name__ == "__main__":
+    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
+    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
