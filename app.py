@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 CHANGELOG = {
+    "3.5": "Optimized SMS responses: Removed intro phrases and confirmations to maximize valuable content within character limits",
     "3.4": "Fixed cancellation flow: Use 'Cancel Chat' → 'CONFIRM CANCEL' (avoids ClickSend STOP). Added cancellation instructions to onboarding.",
     "3.3": "Added STOP → CANCEL flow: Users can now cancel Stripe subscriptions via SMS with STOP then CANCEL commands",
     "3.2": "Added admin endpoints: /admin/reset-user and /admin/whitelist/remove for user management",
@@ -872,13 +873,15 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- You can now provide responses up to {MAX_SMS_LENGTH} characters (increased from 500)
-- Give more detailed, thorough answers while staying within the character limit
-- Be friendly and helpful with comprehensive information
+- You can provide responses up to {MAX_SMS_LENGTH} characters
+- BE DIRECT AND CONCISE - Skip intro phrases like "Okay, got it", "Let me help you", "Here's what I found"
+- NO confirmation phrases about names, cities, or search results
+- Start responses immediately with the actual information
+- Be friendly but efficient with every character
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Be conversational and provide valuable, complete answers"""
+- Provide complete, valuable answers within the character limit"""
         
         try:
             headers = {
