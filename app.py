@@ -1032,6 +1032,7 @@ def save_usage(data):
 
 # === Stripe Webhook Handler ===
 @app.route('/webhook/stripe', methods=['POST'])
+@app.route('/stripe/webhook', methods=['POST'])  # Alternative URL for compatibility
 @handle_errors
 def stripe_webhook():
     """Handle Stripe webhook events for subscription management"""
