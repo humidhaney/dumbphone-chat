@@ -1833,7 +1833,14 @@ def debug_user(phone):
         })
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        @app.route('/debug/database', methods=['GET'])
+def debug_database():
+    """Debug endpoint to check database state"""
+    try:
+        debug_state = debug_database_state()
+        return jsonify(debug_state)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/admin/recover-user', methods=['POST'])
 def recover_user():
