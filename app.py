@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 CHANGELOG = {
+    "2.9": "Improved response quality: removed unnecessary location mentions, increased character limit to 700, refined Claude prompts",
     "2.8": "Added comprehensive debugging and user profile recovery system to prevent onboarding loops",
     "2.7": "Enhanced news detection and Google News integration with SerpAPI, improved topic-specific news searches",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
@@ -1341,12 +1342,14 @@ def ask_claude(phone, user_msg):
         system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- Keep responses under 500 characters when possible for SMS
-- Be friendly and helpful
+- Keep responses under 700 characters when possible for SMS
+- Be friendly and helpful  
 - You DO have access to web search capabilities
-- For specific information requests, respond with "Let me search for [specific topic]" 
-- Never make up detailed information - always offer to search for accurate, current details
-- Be conversational and helpful"""
+- For specific information requests, provide direct answers when you have knowledge, or respond with "Let me search for [specific topic]" if you need current information
+- Never make up detailed information - always offer to search for accurate, current details when uncertain
+- Be conversational and helpful
+- Don't mention searching unless you actually need to search
+- Don't add location context unless the query specifically relates to location"""
         
         try:
             headers = {
@@ -1416,8 +1419,8 @@ IMPORTANT GUIDELINES:
                 search_result = enhanced_web_search(search_term, search_type="general")
                 return search_result
         
-        if len(reply) > 500:
-            reply = reply[:497] + "..."
+        if len(reply) > 700:
+            reply = reply[:697] + "..."
             
         response_time = int((time.time() - start_time) * 1000)
         log_usage_analytics(phone, "claude_chat", True, response_time)
@@ -1620,7 +1623,12 @@ def sms_webhook():
         else:
             # Use Claude for general queries with user context
             if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                # Only add location context for location-specific queries
+                location_keywords = ['near', 'in', 'around', 'restaurant', 'weather', 'business', 'store']
+                if any(keyword in body.lower() for keyword in location_keywords):
+                    personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                else:
+                    personalized_msg = f"User's name is {user_context['first_name']}. " + body
                 response_msg = ask_claude(sender, personalized_msg)
             else:
                 response_msg = ask_claude(sender, body)
@@ -1641,8 +1649,11 @@ def sms_webhook():
                     else:
                         response_msg = enhanced_web_search(search_term, search_type="news")
                 else:
-                    # Add location context to search if available
-                    if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    # Only add location context for location-relevant searches
+                    location_keywords = ['near', 'in', 'around', 'restaurant', 'weather', 'business', 'store']
+                    if (user_context['personalized'] and 
+                        any(keyword in body.lower() for keyword in location_keywords) and 
+                        not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at '])):
                         search_term += f" in {user_context['location']}"
                     response_msg = enhanced_web_search(search_term, search_type="general")
         
