@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 CHANGELOG = {
+    "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
     "2.7": "Added complete Stripe webhook integration for automatic subscription management and user lifecycle",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
     "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
@@ -76,13 +77,12 @@ STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
     logger.info("✅ Stripe API initialized successfully")
+    logger.info(f"🔑 Stripe Keys Status:")
+    logger.info(f"  STRIPE_SECRET_KEY: {'✅ Set' if STRIPE_SECRET_KEY else '❌ Missing'}")
+    logger.info(f"  STRIPE_WEBHOOK_SECRET: {'✅ Set' if STRIPE_WEBHOOK_SECRET else '❌ Missing'}")
+    logger.info(f"  STRIPE_PUBLISHABLE_KEY: {'✅ Set' if STRIPE_PUBLISHABLE_KEY else '❌ Missing'}")
 else:
-    logger.warning("❌ STRIPE_SECRET_KEY not found")
-
-logger.info(f"🔑 Stripe Keys Status:")
-logger.info(f"  STRIPE_SECRET_KEY: {'✅ Set' if STRIPE_SECRET_KEY else '❌ Missing'}")
-logger.info(f"  STRIPE_WEBHOOK_SECRET: {'✅ Set' if STRIPE_WEBHOOK_SECRET else '❌ Missing'}")
-logger.info(f"  STRIPE_PUBLISHABLE_KEY: {'✅ Set' if STRIPE_PUBLISHABLE_KEY else '❌ Missing'}")
+    logger.warning("STRIPE_SECRET_KEY not found")
 
 # Initialize Anthropic client
 anthropic_client = None
@@ -216,6 +216,9 @@ def init_db():
                 location TEXT,
                 onboarding_step INTEGER DEFAULT 0,
                 onboarding_completed BOOLEAN DEFAULT FALSE,
+                stripe_customer_id TEXT,
+                subscription_status TEXT,
+                subscription_id TEXT,
                 created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
             );
@@ -226,7 +229,7 @@ def init_db():
             ON user_profiles(phone);
             """)
             
-            # Onboarding log table
+            # Onboarding log
             c.execute("""
             CREATE TABLE IF NOT EXISTS onboarding_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,7 +240,7 @@ def init_db():
             );
             """)
             
-            # Whitelist events table
+            # Whitelist events
             c.execute("""
             CREATE TABLE IF NOT EXISTS whitelist_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -248,7 +251,7 @@ def init_db():
             );
             """)
             
-            # SMS delivery log table
+            # SMS delivery log
             c.execute("""
             CREATE TABLE IF NOT EXISTS sms_delivery_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,7 +264,19 @@ def init_db():
             );
             """)
             
-            # Monthly SMS usage table
+            # Usage analytics
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS usage_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                intent_type TEXT,
+                success BOOLEAN,
+                response_time_ms INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Monthly SMS usage
             c.execute("""
             CREATE TABLE IF NOT EXISTS monthly_sms_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,27 +291,60 @@ def init_db():
             );
             """)
             
+            # Stripe subscription events
             c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_monthly_usage_phone_period 
-            ON monthly_sms_usage(phone, period_start DESC);
-            """)
-            
-            # Usage analytics table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS usage_analytics (
+            CREATE TABLE IF NOT EXISTS subscription_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                intent_type TEXT,
-                success BOOLEAN,
-                response_time_ms INTEGER,
+                event_type TEXT NOT NULL,
+                stripe_customer_id TEXT,
+                subscription_id TEXT,
+                phone TEXT,
+                status TEXT,
+                event_data TEXT,
+                processed BOOLEAN DEFAULT TRUE,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """)
             
-            # Add subscription events table for Stripe integration
-            add_subscription_events_table()
+            # Fact check incidents
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS fact_check_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                query TEXT NOT NULL,
+                response TEXT NOT NULL,
+                incident_type TEXT DEFAULT 'potential_hallucination',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            # Conversation context
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                context_value TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(phone, context_key)
+            );
+            """)
+            
+            # ClickSend sync log
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS clicksend_sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                list_id INTEGER,
+                list_name TEXT,
+                contacts_synced INTEGER,
+                sync_status TEXT,
+                sync_details TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
             
             conn.commit()
+            logger.info(f"📊 Subscription events table created/verified")
             
             # Check for existing data
             c.execute("SELECT COUNT(*) FROM user_profiles")
@@ -323,34 +371,6 @@ def init_db():
         logger.error(f"💥 Database initialization error: {e}")
         raise
 
-def add_subscription_events_table():
-    """Add subscription events table for tracking Stripe events"""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS subscription_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                stripe_customer_id TEXT,
-                stripe_subscription_id TEXT,
-                event_data TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_subscription_events_phone 
-            ON subscription_events(phone, timestamp DESC);
-            """)
-            
-            conn.commit()
-            logger.info("📊 Subscription events table created/verified")
-            
-    except Exception as e:
-        logger.error(f"Error creating subscription events table: {e}")
-
 # === Onboarding System ===
 def get_user_profile(phone):
     """Get user profile and onboarding status"""
@@ -358,7 +378,7 @@ def get_user_profile(phone):
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT first_name, location, onboarding_step, onboarding_completed
+                SELECT first_name, location, onboarding_step, onboarding_completed, stripe_customer_id, subscription_status
                 FROM user_profiles
                 WHERE phone = ?
             """, (phone,))
@@ -369,7 +389,9 @@ def get_user_profile(phone):
                     'first_name': result[0],
                     'location': result[1],
                     'onboarding_step': result[2],
-                    'onboarding_completed': bool(result[3])
+                    'onboarding_completed': bool(result[3]),
+                    'stripe_customer_id': result[4],
+                    'subscription_status': result[5]
                 }
             else:
                 return None
@@ -394,7 +416,9 @@ def create_user_profile(phone):
         logger.error(f"Error creating user profile for {phone}: {e}")
         return False
 
-def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, onboarding_completed=None):
+def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, 
+                       onboarding_completed=None, stripe_customer_id=None, 
+                       subscription_status=None, subscription_id=None):
     """Update user profile information"""
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -419,6 +443,18 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
             if onboarding_completed is not None:
                 update_parts.append("onboarding_completed = ?")
                 params.append(onboarding_completed)
+            
+            if stripe_customer_id is not None:
+                update_parts.append("stripe_customer_id = ?")
+                params.append(stripe_customer_id)
+            
+            if subscription_status is not None:
+                update_parts.append("subscription_status = ?")
+                params.append(subscription_status)
+            
+            if subscription_id is not None:
+                update_parts.append("subscription_id = ?")
+                params.append(subscription_id)
             
             update_parts.append("updated_date = CURRENT_TIMESTAMP")
             params.append(phone)
@@ -526,63 +562,27 @@ def get_user_context_for_queries(phone):
         }
     return {'personalized': False}
 
-def log_whitelist_event(phone, action, source='manual'):
-    """Log whitelist addition/removal events with safe constraint handling"""
-    try:
-        # Map any problematic actions to valid ones for backwards compatibility
-        action_mapping = {
-            'cleared_completely': 'removed',
-            'stripe_subscription': 'added', 
-            'stripe_cancellation': 'removed',
-            'stripe_update': 'added',
-            'stripe_payment': 'added',
-            'stripe_test': 'added'
-        }
-        
-        # Use original action first, fallback to mapping if constraint fails
-        safe_action = action
-        
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            try:
-                c.execute("""
-                    INSERT INTO whitelist_events (phone, action, source, timestamp)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """, (phone, safe_action, source))
-                conn.commit()
-                logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source})")
-            except sqlite3.IntegrityError as constraint_error:
-                # If constraint fails, try mapped action
-                if action in action_mapping:
-                    safe_action = action_mapping[action]
-                    c.execute("""
-                        INSERT INTO whitelist_events (phone, action, source, timestamp)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (phone, safe_action, source))
-                    conn.commit()
-                    logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source}, mapped from: {action})")
-                else:
-                    # If no mapping available, log as generic action
-                    safe_action = 'added' if any(word in action.lower() for word in ['add', 'creat', 'subscri']) else 'removed'
-                    c.execute("""
-                        INSERT INTO whitelist_events (phone, action, source, timestamp)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (phone, safe_action, source))
-                    conn.commit()
-                    logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source}, generic mapping from: {action})")
-                    
-    except Exception as e:
-        logger.error(f"Error logging whitelist event: {e}")
-        # Don't let logging errors break the main flow
-        pass
-
-# === Enhanced Whitelist Management ===
+# === Whitelist Management ===
 def load_whitelist():
     try:
         with open(WHITELIST_FILE, "r") as f:
             return set(line.strip() for line in f if line.strip())
     except FileNotFoundError:
         return set()
+
+def log_whitelist_event(phone, action, source='manual'):
+    """Log whitelist addition/removal events"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO whitelist_events (phone, action, timestamp, source)
+                VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+            """, (phone, action, source))
+            conn.commit()
+            logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
+    except Exception as e:
+        logger.error(f"Error logging whitelist event: {e}")
 
 def add_to_whitelist(phone, send_welcome=True, source='manual'):
     """Enhanced whitelist addition with automatic welcome message and onboarding"""
@@ -611,12 +611,13 @@ def add_to_whitelist(phone, send_welcome=True, source='manual'):
             # Send welcome message to start onboarding for new users
             if send_welcome:
                 try:
-                    send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
-                    logger.info(f"🎉 Onboarding started for new user {phone}")
-                    
-                    # Log the welcome message
-                    save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-                    
+                    result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+                    if "error" not in result:
+                        logger.info(f"🎉 Onboarding started for new user {phone}")
+                        # Log the welcome message
+                        save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+                    else:
+                        logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
                 except Exception as sms_error:
                     logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
             
@@ -628,7 +629,7 @@ def add_to_whitelist(phone, send_welcome=True, source='manual'):
         logger.info(f"📱 {phone} already in whitelist")
         return True
 
-def remove_from_whitelist(phone, send_goodbye=False, source='manual'):
+def remove_from_whitelist(phone, send_goodbye=False):
     """Enhanced whitelist removal with optional goodbye message"""
     if not phone:
         return False
@@ -644,9 +645,9 @@ def remove_from_whitelist(phone, send_goodbye=False, source='manual'):
                     f.write(num + "\n")
             
             # Log the removal
-            log_whitelist_event(phone, "removed", source)
+            log_whitelist_event(phone, "removed")
             
-            logger.info(f"📱 Removed {phone} from whitelist (source: {source})")
+            logger.info(f"📱 Removed {phone} from whitelist")
             
             # Send goodbye message if requested
             if send_goodbye:
@@ -696,6 +697,9 @@ def send_sms(to_number, message, bypass_quota=False):
         )
         
         result = resp.json()
+        
+        logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
+        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
         
         if resp.status_code == 200:
             if "data" in result and "messages" in result["data"]:
@@ -1066,223 +1070,483 @@ def save_usage(data):
     except Exception as e:
         logger.error(f"Failed to save usage data: {e}")
 
-# === Stripe Webhook Handler ===
-@app.route('/webhook/stripe', methods=['POST'])
-@app.route('/stripe/webhook', methods=['POST'])  # Alternative URL for compatibility
-@handle_errors
-def stripe_webhook():
-    """Handle Stripe webhook events for subscription management"""
+# === Stripe Functions ===
+def log_stripe_event(event_type, customer_id, subscription_id, phone, status, additional_data=None):
+    """Log Stripe webhook events for debugging"""
     try:
-        payload = request.get_data(as_text=True)
-        sig_header = request.headers.get('Stripe-Signature')
-        
-        logger.info(f"🔔 Received Stripe webhook request")
-        logger.info(f"📋 Payload length: {len(payload)} characters")
-        logger.info(f"📋 Signature header present: {'✅' if sig_header else '❌'}")
-        
-        if not STRIPE_WEBHOOK_SECRET:
-            logger.error("❌ STRIPE_WEBHOOK_SECRET not configured")
-            return jsonify({"error": "Webhook secret not configured"}), 500
-
-        if not sig_header:
-            logger.error("❌ Missing Stripe-Signature header")
-            return jsonify({"error": "Missing signature header"}), 400
-
-        try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, STRIPE_WEBHOOK_SECRET
-            )
-            logger.info(f"✅ Stripe webhook signature verified")
-        except ValueError as e:
-            logger.error(f"❌ Invalid payload in Stripe webhook: {e}")
-            return jsonify({"error": "Invalid payload"}), 400
-        except stripe.error.SignatureVerificationError as e:
-            logger.error(f"❌ Invalid signature in Stripe webhook: {e}")
-            return jsonify({"error": "Invalid signature"}), 400
-
-        logger.info(f"🔔 Processing Stripe webhook event: {event['type']}")
-
-        # Handle the event
-        if event['type'] == 'customer.subscription.created':
-            subscription = event['data']['object']
-            customer_id = subscription['customer']
-            
-            # Get customer details to find phone number
-            try:
-                customer = stripe.Customer.retrieve(customer_id)
-                phone = customer.get('phone')
-                
-                if phone:
-                    phone = normalize_phone_number(phone)
-                    logger.info(f"💳 New subscription created for customer {customer_id}, phone: {phone}")
-                    
-                    # Add to whitelist and send welcome message
-                    success = add_to_whitelist(phone, send_welcome=True, source='stripe_subscription')
-                    
-                    if success:
-                        logger.info(f"✅ Added {phone} to whitelist via Stripe webhook")
-                        
-                        # Log the subscription event
-                        try:
-                            with closing(sqlite3.connect(DB_PATH)) as conn:
-                                c = conn.cursor()
-                                c.execute("""
-                                    INSERT INTO subscription_events 
-                                    (phone, event_type, stripe_customer_id, stripe_subscription_id, timestamp)
-                                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                """, (phone, 'subscription_created', customer_id, subscription['id']))
-                                conn.commit()
-                        except Exception as db_error:
-                            logger.error(f"Failed to log subscription event: {db_error}")
-                    else:
-                        logger.error(f"Failed to add {phone} to whitelist")
-                else:
-                    logger.warning(f"No phone number found for customer {customer_id}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing new subscription: {e}")
-
-        elif event['type'] == 'customer.subscription.deleted':
-            subscription = event['data']['object']
-            customer_id = subscription['customer']
-            
-            # Get customer details to find phone number
-            try:
-                customer = stripe.Customer.retrieve(customer_id)
-                phone = customer.get('phone')
-                
-                if phone:
-                    phone = normalize_phone_number(phone)
-                    logger.info(f"❌ Subscription cancelled for customer {customer_id}, phone: {phone}")
-                    
-                    # Remove from whitelist
-                    success = remove_from_whitelist(phone, send_goodbye=True, source='stripe_cancellation')
-                    
-                    if success:
-                        logger.info(f"✅ Removed {phone} from whitelist via Stripe webhook")
-                        
-                        # Log the cancellation event
-                        try:
-                            with closing(sqlite3.connect(DB_PATH)) as conn:
-                                c = conn.cursor()
-                                c.execute("""
-                                    INSERT INTO subscription_events 
-                                    (phone, event_type, stripe_customer_id, stripe_subscription_id, timestamp)
-                                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                """, (phone, 'subscription_cancelled', customer_id, subscription['id']))
-                                conn.commit()
-                        except Exception as db_error:
-                            logger.error(f"Failed to log cancellation event: {db_error}")
-                    else:
-                        logger.error(f"Failed to remove {phone} from whitelist")
-                else:
-                    logger.warning(f"No phone number found for customer {customer_id}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing subscription cancellation: {e}")
-
-        elif event['type'] == 'customer.subscription.updated':
-            subscription = event['data']['object']
-            status = subscription['status']
-            customer_id = subscription['customer']
-            
-            logger.info(f"📝 Subscription updated for customer {customer_id}, status: {status}")
-            
-            # Handle subscription status changes
-            try:
-                customer = stripe.Customer.retrieve(customer_id)
-                phone = customer.get('phone')
-                
-                if phone:
-                    phone = normalize_phone_number(phone)
-                    
-                    if status in ['active', 'trialing']:
-                        # Ensure user is in whitelist
-                        add_to_whitelist(phone, send_welcome=False, source='stripe_update')
-                        logger.info(f"✅ Ensured {phone} is in whitelist (subscription active)")
-                    elif status in ['canceled', 'unpaid', 'past_due']:
-                        # Remove from whitelist if cancelled or unpaid
-                        if status == 'canceled':
-                            remove_from_whitelist(phone, send_goodbye=True, source='stripe_update')
-                            logger.info(f"❌ Removed {phone} from whitelist (subscription cancelled)")
-                        elif status in ['unpaid', 'past_due']:
-                            logger.info(f"⚠️ Subscription {status} for {phone}, but keeping access for now")
-                    
-                    # Log the update event
-                    try:
-                        with closing(sqlite3.connect(DB_PATH)) as conn:
-                            c = conn.cursor()
-                            c.execute("""
-                                INSERT INTO subscription_events 
-                                (phone, event_type, stripe_customer_id, stripe_subscription_id, event_data, timestamp)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                            """, (phone, 'subscription_updated', customer_id, subscription['id'], json.dumps({'status': status})))
-                            conn.commit()
-                    except Exception as db_error:
-                        logger.error(f"Failed to log subscription update: {db_error}")
-                        
-            except Exception as e:
-                logger.error(f"Error processing subscription update: {e}")
-
-        elif event['type'] == 'invoice.payment_failed':
-            invoice = event['data']['object']
-            customer_id = invoice['customer']
-            
-            logger.warning(f"💳 Payment failed for customer {customer_id}")
-            
-            # Could implement grace period logic here
-            try:
-                customer = stripe.Customer.retrieve(customer_id)
-                phone = customer.get('phone')
-                
-                if phone:
-                    phone = normalize_phone_number(phone)
-                    
-                    # Send payment failed notification
-                    payment_failed_msg = (
-                        "⚠️ Your Hey Alex payment failed. Please update your payment method "
-                        "to continue service. You can manage your subscription at heyalex.co"
-                    )
-                    
-                    try:
-                        send_sms(phone, payment_failed_msg, bypass_quota=True)
-                        logger.info(f"📧 Payment failed notification sent to {phone}")
-                    except Exception as sms_error:
-                        logger.error(f"Failed to send payment failed SMS: {sms_error}")
-                        
-            except Exception as e:
-                logger.error(f"Error processing payment failure: {e}")
-
-        elif event['type'] == 'invoice.payment_succeeded':
-            invoice = event['data']['object']
-            customer_id = invoice['customer']
-            
-            logger.info(f"✅ Payment succeeded for customer {customer_id}")
-            
-            # Ensure user has access
-            try:
-                customer = stripe.Customer.retrieve(customer_id)
-                phone = customer.get('phone')
-                
-                if phone:
-                    phone = normalize_phone_number(phone)
-                    add_to_whitelist(phone, send_welcome=False, source='stripe_payment')
-                    logger.info(f"✅ Ensured {phone} has access after successful payment")
-                    
-            except Exception as e:
-                logger.error(f"Error processing successful payment: {e}")
-
-        else:
-            logger.info(f"🔔 Unhandled webhook event type: {event['type']}")
-
-        logger.info(f"✅ Stripe webhook processed successfully: {event['type']}")
-        return jsonify({"status": "success"}), 200
-
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO subscription_events (event_type, stripe_customer_id, subscription_id, phone, status, event_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (event_type, customer_id, subscription_id, phone, status, json.dumps(additional_data or {})))
+            conn.commit()
+            logger.info(f"📋 Logged Stripe event: {event_type} for customer {customer_id}")
     except Exception as e:
-        logger.error(f"💥 Stripe webhook error: {e}")
-        return jsonify({"error": "Webhook processing failed"}), 500
+        logger.error(f"Error logging Stripe event: {e}")
 
-# === Main SMS Webhook ===
+def extract_phone_from_stripe_metadata(metadata):
+    """Extract phone number from Stripe customer metadata"""
+    phone_fields = ['phone', 'phone_number', 'mobile', 'cell', 'sms_number']
+    
+    for field in phone_fields:
+        if field in metadata and metadata[field]:
+            return normalize_phone_number(metadata[field])
+    
+    return None
+
+def handle_subscription_created(subscription):
+    """Handle new subscription creation"""
+    customer_id = subscription['customer']
+    subscription_id = subscription['id']
+    status = subscription['status']
+    
+    logger.info(f"🎉 New subscription created: {subscription_id} for customer {customer_id}")
+    
+    try:
+        # Get customer information from Stripe
+        customer = stripe.Customer.retrieve(customer_id)
+        
+        # Extract phone number from customer metadata or other fields
+        phone = extract_phone_from_stripe_metadata(customer.get('metadata', {}))
+        
+        if not phone and customer.get('phone'):
+            phone = normalize_phone_number(customer['phone'])
+        
+        if phone:
+            # Update user profile with subscription information
+            update_user_profile(
+                phone, 
+                stripe_customer_id=customer_id,
+                subscription_status=status,
+                subscription_id=subscription_id
+            )
+            
+            # Add to whitelist if not already there
+            add_to_whitelist(phone, send_welcome=True, source='stripe_subscription')
+            
+            # Log the event
+            log_stripe_event('subscription_created', customer_id, subscription_id, phone, status)
+            
+            logger.info(f"✅ Subscription activated for {phone}")
+        else:
+            logger.warning(f"⚠️ No phone number found for customer {customer_id}")
+            log_stripe_event('subscription_created', customer_id, subscription_id, None, status, 
+                           {'error': 'No phone number found'})
+        
+    except Exception as e:
+        logger.error(f"❌ Error handling subscription creation: {e}")
+        log_stripe_event('subscription_created', customer_id, subscription_id, None, 'error', 
+                        {'error': str(e)})
+
+def handle_subscription_deleted(subscription):
+    """Handle subscription cancellation"""
+    customer_id = subscription['customer']
+    subscription_id = subscription['id']
+    
+    logger.info(f"❌ Subscription cancelled: {subscription_id} for customer {customer_id}")
+    
+    try:
+        # Find user by customer ID
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT phone FROM user_profiles 
+                WHERE stripe_customer_id = ?
+            """, (customer_id,))
+            result = c.fetchone()
+            
+            if result:
+                phone = result[0]
+                
+                # Update subscription status
+                update_user_profile(phone, subscription_status='cancelled')
+                
+                # Remove from whitelist
+                remove_from_whitelist(phone, send_goodbye=True)
+                
+                # Log the event
+                log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
+                
+                logger.info(f"✅ Subscription cancelled for {phone}")
+            else:
+                logger.warning(f"⚠️ No user found for customer {customer_id}")
+                log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'cancelled',
+                               {'error': 'No user found'})
+        
+    except Exception as e:
+        logger.error(f"❌ Error handling subscription deletion: {e}")
+        log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'error',
+                        {'error': str(e)})
+
+# === ADMIN ENDPOINTS ===
+@app.route('/admin/users', methods=['GET'])
+def get_all_users():
+    """Admin endpoint to view all users with their profiles and onboarding status"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    up.phone, 
+                    up.first_name, 
+                    up.location, 
+                    up.onboarding_step,
+                    up.onboarding_completed,
+                    up.stripe_customer_id,
+                    up.subscription_status,
+                    up.created_date
+                FROM user_profiles up
+                ORDER BY up.created_date DESC
+            """)
+            
+            users = []
+            for row in c.fetchall():
+                users.append({
+                    'phone': row[0],
+                    'first_name': row[1],
+                    'location': row[2],
+                    'onboarding_step': row[3],
+                    'onboarding_completed': bool(row[4]),
+                    'stripe_customer_id': row[5],
+                    'subscription_status': row[6],
+                    'created_date': row[7]
+                })
+            
+            return jsonify({
+                'total_users': len(users),
+                'users': users
+            })
+            
+    except Exception as e:
+        logger.error(f"Error getting all users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/whitelist', methods=['GET'])
+def get_whitelist():
+    """View current whitelist"""
+    try:
+        whitelist = load_whitelist()
+        return jsonify({
+            'total_numbers': len(whitelist),
+            'numbers': list(whitelist)
+        })
+    except Exception as e:
+        logger.error(f"Error getting whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/whitelist/add', methods=['POST'])
+def admin_add_to_whitelist():
+    """Admin endpoint to manually add users to whitelist"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        send_welcome = data.get('send_welcome', True)
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        success = add_to_whitelist(phone, send_welcome=send_welcome, source='admin')
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Added {phone} to whitelist",
+                "welcome_sent": send_welcome
+            })
+        else:
+            return jsonify({"error": "Failed to add to whitelist"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error in admin add to whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/whitelist/remove', methods=['POST'])
+def admin_remove_from_whitelist():
+    """Admin endpoint to remove users from whitelist"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        send_goodbye = data.get('send_goodbye', False)
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        success = remove_from_whitelist(phone, send_goodbye=send_goodbye)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Removed {phone} from whitelist",
+                "goodbye_sent": send_goodbye
+            })
+        else:
+            return jsonify({"error": "Failed to remove from whitelist"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error in admin remove from whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/sms-logs', methods=['GET'])
+def get_sms_logs():
+    """View recent SMS delivery logs"""
+    try:
+        limit = request.args.get('limit', 20, type=int)
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT phone, message_content, delivery_status, message_id, timestamp
+                FROM sms_delivery_log
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (limit,))
+            
+            logs = []
+            for row in c.fetchall():
+                logs.append({
+                    'phone': row[0],
+                    'message_content': row[1][:100] + '...' if len(row[1]) > 100 else row[1],
+                    'delivery_status': row[2],
+                    'message_id': row[3],
+                    'timestamp': row[4]
+                })
+            
+            return jsonify({
+                'total_logs': len(logs),
+                'logs': logs
+            })
+            
+    except Exception as e:
+        logger.error(f"Error getting SMS logs: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/test-sms', methods=['POST'])
+def admin_test_sms():
+    """Admin endpoint to send test SMS"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        message = data.get('message', 'Test message from Hey Alex admin panel')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Send SMS bypassing quota
+        result = send_sms(phone, message, bypass_quota=True)
+        
+        if "error" not in result:
+            return jsonify({
+                "success": True,
+                "message": f"Test SMS sent to {phone}",
+                "clicksend_response": result
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Error in admin test SMS: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/reset-user', methods=['POST'])
+def admin_reset_user():
+    """Reset a user completely - remove from whitelist and database"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # Remove from whitelist
+        if remove_from_whitelist(phone):
+            actions_taken.append("Removed from whitelist")
+        
+        # Remove user profile and related data
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM user_profiles WHERE phone = ?", (phone,))
+            c.execute("DELETE FROM messages WHERE phone = ?", (phone,))
+            c.execute("DELETE FROM monthly_sms_usage WHERE phone = ?", (phone,))
+            c.execute("DELETE FROM onboarding_log WHERE phone = ?", (phone,))
+            c.execute("DELETE FROM sms_delivery_log WHERE phone = ?", (phone,))
+            conn.commit()
+            actions_taken.append("Removed from database")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Reset user {phone} completely",
+            "actions_taken": actions_taken
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/subscription-events', methods=['GET'])
+def get_subscription_events():
+    """View recent Stripe subscription events"""
+    try:
+        limit = request.args.get('limit', 20, type=int)
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT event_type, stripe_customer_id, subscription_id, phone, status, timestamp
+                FROM subscription_events
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (limit,))
+            
+            events = []
+            for row in c.fetchall():
+                events.append({
+                    'event_type': row[0],
+                    'stripe_customer_id': row[1],
+                    'subscription_id': row[2],
+                    'phone': row[3],
+                    'status': row[4],
+                    'timestamp': row[5]
+                })
+            
+            return jsonify({
+                'total_events': len(events),
+                'events': events
+            })
+            
+    except Exception as e:
+        logger.error(f"Error getting subscription events: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/test-stripe-flow', methods=['POST'])
+def test_stripe_flow():
+    """Test endpoint to simulate Stripe subscription events"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        event_type = data.get('event_type', 'customer.subscription.created')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        logger.info(f"🧪 Simulating Stripe event: {event_type} for {phone}")
+        
+        actions_taken = []
+        
+        if event_type == 'customer.subscription.created':
+            # Simulate new subscription
+            fake_customer_id = f"cus_test_{int(time.time())}"
+            fake_subscription_id = f"sub_test_{int(time.time())}"
+            
+            # Add to whitelist and send onboarding
+            success = add_to_whitelist(phone, send_welcome=True, source='test_stripe')
+            if success:
+                actions_taken.append("Added to whitelist")
+                actions_taken.append("Sent onboarding SMS")
+                actions_taken.append("Created user profile")
+            
+            # Log the simulated event
+            log_stripe_event(event_type, fake_customer_id, fake_subscription_id, phone, 'active')
+            actions_taken.append("Logged subscription event")
+            
+            return jsonify({
+                "success": True,
+                "message": f"Simulated subscription creation for {phone}",
+                "actions_taken": actions_taken
+            })
+        
+        elif event_type == 'customer.subscription.deleted':
+            # Simulate subscription cancellation
+            success = remove_from_whitelist(phone, send_goodbye=True)
+            if success:
+                actions_taken.append("Removed from whitelist")
+                actions_taken.append("Sent goodbye SMS")
+            
+            return jsonify({
+                "success": True,
+                "message": f"Simulated subscription cancellation for {phone}",
+                "actions_taken": actions_taken
+            })
+        
+        else:
+            return jsonify({"error": f"Unsupported event type: {event_type}"}), 400
+            
+    except Exception as e:
+        logger.error(f"Error in test Stripe flow: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# === STRIPE WEBHOOK ===
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events"""
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    if not sig_header:
+        logger.error("Missing Stripe signature header")
+        return jsonify({'error': 'Missing signature header'}), 400
+    
+    try:
+        # Verify webhook signature
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+        
+        logger.info(f"📨 Received Stripe webhook: {event['type']}")
+        
+        # Handle different event types
+        if event['type'] == 'customer.subscription.created':
+            handle_subscription_created(event['data']['object'])
+        
+        elif event['type'] == 'customer.subscription.deleted':
+            handle_subscription_deleted(event['data']['object'])
+        
+        elif event['type'] == 'customer.subscription.updated':
+            # Handle subscription updates (payment method changes, etc.)
+            subscription = event['data']['object']
+            logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
+        
+        elif event['type'] == 'invoice.payment_failed':
+            # Handle failed payments
+            invoice = event['data']['object']
+            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
+        
+        elif event['type'] == 'invoice.payment_succeeded':
+            # Handle successful payments
+            invoice = event['data']['object']
+            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
+        
+        else:
+            logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
+        
+        return jsonify({'status': 'success'}), 200
+        
+    except ValueError as e:
+        logger.error(f"❌ Invalid payload: {e}")
+        return jsonify({'error': 'Invalid payload'}), 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"❌ Invalid signature: {e}")
+        return jsonify({'error': 'Invalid signature'}), 400
+    except Exception as e:
+        logger.error(f"💥 Error processing Stripe webhook: {e}")
+        return jsonify({'error': 'Webhook processing failed'}), 500
+
+# === MAIN SMS WEBHOOK ===
 @app.route("/sms", methods=["POST"])
 @handle_errors  
 def sms_webhook():
@@ -1353,532 +1617,4 @@ def sms_webhook():
         try:
             send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
             save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"message": "Onboarding started for new user"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send onboarding start message: {e}")
-            return jsonify({"error": "Failed to start onboarding"}), 500
-    
-    elif not profile['onboarding_completed']:
-        # Profile exists but onboarding not complete
-        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
-        
-        try:
-            response_msg = handle_onboarding_response(sender, body)
-            
-            # Send response
-            result = send_sms(sender, response_msg)
-            
-            if "error" not in result:
-                logger.info(f"✅ Onboarding response sent to {sender}")
-                return jsonify({"message": "Onboarding response sent"}), 200
-            else:
-                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
-                return jsonify({"error": "Failed to send onboarding response"}), 500
-                
-        except Exception as e:
-            logger.error(f"💥 Onboarding error for {sender}: {e}")
-            fallback_msg = "Sorry, there was an error during setup. Please try again."
-            try:
-                send_sms(sender, fallback_msg, bypass_quota=True)
-                return jsonify({"message": "Onboarding fallback sent"}), 200
-            except Exception as fallback_error:
-                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
-                return jsonify({"error": "Onboarding failed"}), 500
-    
-    # User is fully onboarded - continue to normal processing
-    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
-    
-    # User is onboarded, process normal queries
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
-    # Get user context for personalized responses
-    user_context = get_user_context_for_queries(sender)
-    
-    try:
-        # Process based on intent
-        if intent and intent.type == "weather":
-            # Use user's location if no city specified and user is onboarded
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-        else:
-            # Use Claude for general queries with user context
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            # If Claude suggests a search, perform it
-            if "Let me search for" in response_msg:
-                search_term = body
-                # Add location context to search if available
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
-        
-        # Ensure response is not too long for SMS
-        if len(response_msg) > 1600:
-            response_msg = response_msg[:1597] + "..."
-        
-        # Save assistant response
-        response_time = int((time.time() - start_time) * 1000)
-        save_message(sender, "assistant", response_msg, intent_type, response_time)
-        
-        # Send main response
-        result = send_sms(sender, response_msg)
-        
-        if "error" not in result:
-            log_usage_analytics(sender, intent_type, True, response_time)
-            logger.info(f"✅ Response sent to {sender} in {response_time}ms")
-            return jsonify({"message": "Response sent successfully"}), 200
-        else:
-            log_usage_analytics(sender, intent_type, False, response_time)
-            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
-            return jsonify({"error": "Failed to send response"}), 500
-            
-    except Exception as e:
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(sender, intent_type, False, response_time)
-        logger.error(f"💥 Processing error for {sender}: {e}")
-        
-        # Send fallback response
-        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
-        try:
-            send_sms(sender, fallback_msg, bypass_quota=True)
-            return jsonify({"message": "Fallback response sent"}), 200
-        except Exception as fallback_error:
-            logger.error(f"Failed to send fallback message: {fallback_error}")
-            return jsonify({"error": "Processing failed"}), 500
-
-# === Admin Endpoints ===
-@app.route('/admin/whitelist/add', methods=['POST'])
-@handle_errors
-def admin_add_to_whitelist():
-    """Admin endpoint to manually add users to whitelist"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        send_welcome = data.get('send_welcome', True)
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        success = add_to_whitelist(phone, send_welcome=send_welcome, source='admin')
-        
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Added {phone} to whitelist",
-                "welcome_sent": send_welcome
-            })
-        else:
-            return jsonify({"error": "Failed to add to whitelist"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error in admin add to whitelist: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/users', methods=['GET'])
-@handle_errors
-def get_all_users():
-    """Admin endpoint to view all users with their profiles and onboarding status"""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    up.phone, 
-                    up.first_name, 
-                    up.location, 
-                    up.onboarding_step,
-                    up.onboarding_completed,
-                    up.created_date
-                FROM user_profiles up
-                ORDER BY up.created_date DESC
-            """)
-            
-            users = []
-            for row in c.fetchall():
-                users.append({
-                    'phone': row[0],
-                    'first_name': row[1],
-                    'location': row[2],
-                    'onboarding_step': row[3],
-                    'onboarding_completed': bool(row[4]),
-                    'created_date': row[5]
-                })
-            
-            return jsonify({
-                'total_users': len(users),
-                'users': users
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting all users: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/user/clear', methods=['POST'])
-@handle_errors
-def admin_clear_user():
-    """Admin endpoint to completely clear a user from all database tables"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        logger.info(f"🗑️ Starting complete user clear for {phone}")
-        
-        # Remove from whitelist file
-        try:
-            wl = load_whitelist()
-            if phone in wl:
-                wl.remove(phone)
-                with open(WHITELIST_FILE, "w") as f:
-                    for num in wl:
-                        f.write(num + "\n")
-                logger.info(f"✅ Removed {phone} from whitelist file")
-            else:
-                logger.info(f"📋 {phone} not in whitelist file")
-        except Exception as e:
-            logger.error(f"Error removing from whitelist: {e}")
-        
-        # Clear from all database tables
-        tables_cleared = []
-        
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Clear from each table
-            tables_to_clear = [
-                'messages',
-                'user_profiles', 
-                'onboarding_log',
-                'whitelist_events',
-                'sms_delivery_log',
-                'monthly_sms_usage',
-                'usage_analytics',
-                'subscription_events'
-            ]
-            
-            for table in tables_to_clear:
-                try:
-                    c.execute(f"DELETE FROM {table} WHERE phone = ?", (phone,))
-                    deleted_count = c.rowcount
-                    if deleted_count > 0:
-                        tables_cleared.append(f"{table}: {deleted_count} records")
-                        logger.info(f"🗑️ Cleared {deleted_count} records from {table}")
-                except Exception as e:
-                    logger.error(f"Error clearing {table}: {e}")
-            
-            conn.commit()
-        
-        # Log the complete clear event
-        log_whitelist_event(phone, "cleared_completely", "admin")
-        
-        logger.info(f"✅ Complete user clear finished for {phone}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Completely cleared user {phone} from all systems",
-            "phone": phone,
-            "tables_cleared": tables_cleared
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in admin clear user: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/user/status', methods=['GET'])
-@handle_errors
-def admin_user_status():
-    """Admin endpoint to check a user's status across all systems"""
-    try:
-        phone = request.args.get('phone')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Check whitelist status
-        wl = load_whitelist()
-        in_whitelist = phone in wl
-        
-        # Check database records
-        status = {
-            "phone": phone,
-            "in_whitelist": in_whitelist,
-            "database_records": {}
-        }
-        
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Check each table
-            tables_to_check = [
-                ('messages', 'SELECT COUNT(*) FROM messages WHERE phone = ?'),
-                ('user_profiles', 'SELECT * FROM user_profiles WHERE phone = ?'),
-                ('onboarding_log', 'SELECT COUNT(*) FROM onboarding_log WHERE phone = ?'),
-                ('whitelist_events', 'SELECT COUNT(*) FROM whitelist_events WHERE phone = ?'),
-                ('sms_delivery_log', 'SELECT COUNT(*) FROM sms_delivery_log WHERE phone = ?'),
-                ('monthly_sms_usage', 'SELECT COUNT(*) FROM monthly_sms_usage WHERE phone = ?'),
-                ('usage_analytics', 'SELECT COUNT(*) FROM usage_analytics WHERE phone = ?'),
-                ('subscription_events', 'SELECT COUNT(*) FROM subscription_events WHERE phone = ?')
-            ]
-            
-            for table_name, query in tables_to_check:
-                try:
-                    if table_name == 'user_profiles':
-                        # Get full profile for user_profiles
-                        c.execute(query, (phone,))
-                        result = c.fetchone()
-                        if result:
-                            status["database_records"][table_name] = {
-                                "phone": result[1],
-                                "first_name": result[2],
-                                "location": result[3],
-                                "onboarding_step": result[4],
-                                "onboarding_completed": bool(result[5]),
-                                "created_date": result[6],
-                                "updated_date": result[7]
-                            }
-                        else:
-                            status["database_records"][table_name] = None
-                    else:
-                        # Get count for other tables
-                        c.execute(query, (phone,))
-                        count = c.fetchone()[0]
-                        status["database_records"][table_name] = count
-                        
-                except Exception as e:
-                    logger.error(f"Error checking {table_name}: {e}")
-                    status["database_records"][table_name] = f"Error: {e}"
-        
-        return jsonify(status)
-        
-    except Exception as e:
-        logger.error(f"Error in admin user status: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/test-stripe-flow', methods=['POST'])
-@handle_errors
-def admin_test_stripe_flow():
-    """Admin endpoint to simulate Stripe webhook events for testing"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        event_type = data.get('event_type', 'customer.subscription.created')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Create mock Stripe event
-        mock_customer_id = f"cus_test_{phone.replace('+', '')}"
-        mock_subscription_id = f"sub_test_{phone.replace('+', '')}"
-        
-        logger.info(f"🧪 Simulating Stripe event: {event_type} for {phone}")
-        
-        if event_type == 'customer.subscription.created':
-            # Simulate new subscription
-            success = add_to_whitelist(phone, send_welcome=True, source='stripe_test')
-            
-            if success:
-                # Log the test subscription event
-                try:
-                    with closing(sqlite3.connect(DB_PATH)) as conn:
-                        c = conn.cursor()
-                        c.execute("""
-                            INSERT INTO subscription_events 
-                            (phone, event_type, stripe_customer_id, stripe_subscription_id, event_data, timestamp)
-                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        """, (phone, 'test_subscription_created', mock_customer_id, mock_subscription_id, json.dumps({'test': True})))
-                        conn.commit()
-                except Exception as db_error:
-                    logger.error(f"Failed to log test subscription event: {db_error}")
-                
-                return jsonify({
-                    "success": True,
-                    "message": f"Simulated subscription creation for {phone}",
-                    "actions_taken": [
-                        "Added to whitelist",
-                        "Sent onboarding SMS",
-                        "Created user profile",
-                        "Logged subscription event"
-                    ]
-                })
-            else:
-                return jsonify({"error": "Failed to add to whitelist"}), 500
-                
-        elif event_type == 'customer.subscription.deleted':
-            # Simulate subscription cancellation
-            success = remove_from_whitelist(phone, send_goodbye=True, source='stripe_test')
-            
-            if success:
-                # Log the test cancellation event
-                try:
-                    with closing(sqlite3.connect(DB_PATH)) as conn:
-                        c = conn.cursor()
-                        c.execute("""
-                            INSERT INTO subscription_events 
-                            (phone, event_type, stripe_customer_id, stripe_subscription_id, event_data, timestamp)
-                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        """, (phone, 'test_subscription_cancelled', mock_customer_id, mock_subscription_id, json.dumps({'test': True})))
-                        conn.commit()
-                except Exception as db_error:
-                    logger.error(f"Failed to log test cancellation event: {db_error}")
-                
-                return jsonify({
-                    "success": True,
-                    "message": f"Simulated subscription cancellation for {phone}",
-                    "actions_taken": [
-                        "Removed from whitelist",
-                        "Sent goodbye SMS",
-                        "Logged cancellation event"
-                    ]
-                })
-            else:
-                return jsonify({"error": "Failed to remove from whitelist"}), 500
-        
-        else:
-            return jsonify({"error": f"Unsupported test event type: {event_type}"}), 400
-        
-    except Exception as e:
-        logger.error(f"Error in test Stripe flow: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/subscription-events', methods=['GET'])
-@handle_errors
-def get_subscription_events():
-    """Admin endpoint to view subscription events"""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    phone, 
-                    event_type, 
-                    stripe_customer_id, 
-                    stripe_subscription_id, 
-                    event_data,
-                    timestamp
-                FROM subscription_events
-                ORDER BY timestamp DESC
-                LIMIT 50
-            """)
-            
-            events = []
-            for row in c.fetchall():
-                events.append({
-                    'phone': row[0],
-                    'event_type': row[1],
-                    'stripe_customer_id': row[2],
-                    'stripe_subscription_id': row[3],
-                    'event_data': row[4],
-                    'timestamp': row[5]
-                })
-            
-            return jsonify({
-                'total_events': len(events),
-                'events': events
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting subscription events: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/fix-database-constraint', methods=['POST'])
-@handle_errors
-def fix_database_constraint():
-    """Fix the whitelist_events table constraint to allow more action types"""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Drop the old constraint and recreate the table with expanded actions
-            logger.info("🔧 Fixing whitelist_events table constraint...")
-            
-            # Create a new table with expanded constraints
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_events_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('added','removed','cleared_completely','stripe_subscription','stripe_cancellation','stripe_update','stripe_payment','admin','stripe_test','manual')),
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                source TEXT DEFAULT 'manual'
-            );
-            """)
-            
-            # Copy existing data if any exists
-            try:
-                c.execute("""
-                INSERT INTO whitelist_events_new (id, phone, action, timestamp, source)
-                SELECT id, phone, action, timestamp, source FROM whitelist_events
-                """)
-            except Exception as copy_error:
-                logger.warning(f"No existing data to copy: {copy_error}")
-            
-            # Drop old table and rename new one
-            c.execute("DROP TABLE IF EXISTS whitelist_events")
-            c.execute("ALTER TABLE whitelist_events_new RENAME TO whitelist_events")
-            
-            # Recreate the index
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_whitelist_events_phone 
-            ON whitelist_events(phone, timestamp DESC);
-            """)
-            
-            conn.commit()
-            
-            logger.info("✅ Database constraint fixed!")
-            
-            return jsonify({
-                "success": True,
-                "message": "Database constraint fixed - whitelist_events table now supports all action types"
-            })
-            
-    except Exception as e:
-        logger.error(f"Error fixing database constraint: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# === Health Check ===
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Simple health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "version": APP_VERSION,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
-# === Home Route ===
-@app.route('/')
-def home():
-    """Basic home route"""
-    return jsonify({
-        "service": "Hey Alex SMS Assistant",
-        "version": APP_VERSION,
-        "status": "running"
-    })
-
-# Initialize database on startup
-init_db()
-
-if __name__ == "__main__":
-    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
-    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            return jsonify({"
