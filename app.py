@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 CHANGELOG = {
+    "3.2": "Fixed subscription webhook handling - now processes invoice.payment_succeeded events to auto-whitelist new subscribers",
     "3.1": "Added 'END SUBSCRIPTION' command for proper Stripe subscription cancellation, integrated into onboarding flow",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
@@ -1223,13 +1224,65 @@ def stripe_webhook():
             subscription = event['data']['object']
             logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
         
-        elif event['type'] == 'invoice.payment_failed':
-            invoice = event['data']['object']
-            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
-        
         elif event['type'] == 'invoice.payment_succeeded':
             invoice = event['data']['object']
             logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
+            
+            # Handle first payment for new subscriptions
+            if invoice.get('billing_reason') in ['subscription_create', 'subscription_cycle']:
+                customer_id = invoice['customer']
+                subscription_id = invoice.get('subscription')
+                
+                if subscription_id:
+                    logger.info(f"🎉 Processing new subscription via invoice: {subscription_id}")
+                    
+                    try:
+                        customer = stripe.Customer.retrieve(customer_id)
+                        
+                        # Try to get phone from customer object or invoice
+                        phone = None
+                        if customer.get('phone'):
+                            phone = normalize_phone_number(customer['phone'])
+                        elif invoice.get('customer_phone'):
+                            phone = normalize_phone_number(invoice['customer_phone'])
+                        
+                        if phone:
+                            # Check if user already exists (avoid duplicates)
+                            existing_profile = get_user_profile(phone)
+                            
+                            if not existing_profile:
+                                update_user_profile(
+                                    phone,
+                                    stripe_customer_id=customer_id,
+                                    subscription_status='active',
+                                    subscription_id=subscription_id
+                                )
+                                
+                                add_to_whitelist(phone, send_welcome=True, source='stripe_invoice')
+                                log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, phone, 'active')
+                                
+                                logger.info(f"✅ New subscription activated via invoice for {phone}")
+                            else:
+                                logger.info(f"📝 User {phone} already exists, updating subscription info")
+                                update_user_profile(
+                                    phone,
+                                    stripe_customer_id=customer_id,
+                                    subscription_status='active',
+                                    subscription_id=subscription_id
+                                )
+                        else:
+                            logger.warning(f"⚠️ No phone number found for customer {customer_id} in invoice webhook")
+                            log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, None, 'active',
+                                           {'error': 'No phone number found', 'customer_phone': invoice.get('customer_phone')})
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Error handling invoice subscription creation: {e}")
+                        log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, None, 'error',
+                                        {'error': str(e)})
+        
+        elif event['type'] == 'invoice.payment_failed':
+            invoice = event['data']['object']
+            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
         
         else:
             logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
