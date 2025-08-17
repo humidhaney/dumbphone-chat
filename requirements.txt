@@ -14,8 +14,9 @@ anthropic==0.28.1
 # Payment Processing
 stripe==7.5.0
 
-# Database - SQLite (Built-in) + PostgreSQL Support
-psycopg[binary]==3.2.3
+# Database - PostgreSQL Support (psycopg v3)
+psycopg==3.2.3
+psycopg-binary==3.2.3
 
 # Additional Database Tools (Optional)
 # Uncomment if you need database migrations or ORM
