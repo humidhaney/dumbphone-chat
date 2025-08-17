@@ -1490,6 +1490,240 @@ def get_all_users():
         logger.error(f"Error getting all users: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/admin/user/clear', methods=['POST'])
+@handle_errors
+def admin_clear_user():
+    """Admin endpoint to completely clear a user from all database tables"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        logger.info(f"🗑️ Starting complete user clear for {phone}")
+        
+        # Remove from whitelist file
+        try:
+            wl = load_whitelist()
+            if phone in wl:
+                wl.remove(phone)
+                with open(WHITELIST_FILE, "w") as f:
+                    for num in wl:
+                        f.write(num + "\n")
+                logger.info(f"✅ Removed {phone} from whitelist file")
+            else:
+                logger.info(f"📋 {phone} not in whitelist file")
+        except Exception as e:
+            logger.error(f"Error removing from whitelist: {e}")
+        
+        # Clear from all database tables
+        tables_cleared = []
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Clear from each table
+            tables_to_clear = [
+                'messages',
+                'user_profiles', 
+                'onboarding_log',
+                'whitelist_events',
+                'sms_delivery_log',
+                'monthly_sms_usage',
+                'usage_analytics',
+                'subscription_events'
+            ]
+            
+            for table in tables_to_clear:
+                try:
+                    c.execute(f"DELETE FROM {table} WHERE phone = ?", (phone,))
+                    deleted_count = c.rowcount
+                    if deleted_count > 0:
+                        tables_cleared.append(f"{table}: {deleted_count} records")
+                        logger.info(f"🗑️ Cleared {deleted_count} records from {table}")
+                except Exception as e:
+                    logger.error(f"Error clearing {table}: {e}")
+            
+            conn.commit()
+        
+        # Log the complete clear event
+        log_whitelist_event(phone, "cleared_completely", "admin")
+        
+        logger.info(f"✅ Complete user clear finished for {phone}")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Completely cleared user {phone} from all systems",
+            "phone": phone,
+            "tables_cleared": tables_cleared
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in admin clear user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/user/status', methods=['GET'])
+@handle_errors
+def admin_user_status():
+    """Admin endpoint to check a user's status across all systems"""
+    try:
+        phone = request.args.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Check whitelist status
+        wl = load_whitelist()
+        in_whitelist = phone in wl
+        
+        # Check database records
+        status = {
+            "phone": phone,
+            "in_whitelist": in_whitelist,
+            "database_records": {}
+        }
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Check each table
+            tables_to_check = [
+                ('messages', 'SELECT COUNT(*) FROM messages WHERE phone = ?'),
+                ('user_profiles', 'SELECT * FROM user_profiles WHERE phone = ?'),
+                ('onboarding_log', 'SELECT COUNT(*) FROM onboarding_log WHERE phone = ?'),
+                ('whitelist_events', 'SELECT COUNT(*) FROM whitelist_events WHERE phone = ?'),
+                ('sms_delivery_log', 'SELECT COUNT(*) FROM sms_delivery_log WHERE phone = ?'),
+                ('monthly_sms_usage', 'SELECT COUNT(*) FROM monthly_sms_usage WHERE phone = ?'),
+                ('usage_analytics', 'SELECT COUNT(*) FROM usage_analytics WHERE phone = ?'),
+                ('subscription_events', 'SELECT COUNT(*) FROM subscription_events WHERE phone = ?')
+            ]
+            
+            for table_name, query in tables_to_check:
+                try:
+                    if table_name == 'user_profiles':
+                        # Get full profile for user_profiles
+                        c.execute(query, (phone,))
+                        result = c.fetchone()
+                        if result:
+                            status["database_records"][table_name] = {
+                                "phone": result[1],
+                                "first_name": result[2],
+                                "location": result[3],
+                                "onboarding_step": result[4],
+                                "onboarding_completed": bool(result[5]),
+                                "created_date": result[6],
+                                "updated_date": result[7]
+                            }
+                        else:
+                            status["database_records"][table_name] = None
+                    else:
+                        # Get count for other tables
+                        c.execute(query, (phone,))
+                        count = c.fetchone()[0]
+                        status["database_records"][table_name] = count
+                        
+                except Exception as e:
+                    logger.error(f"Error checking {table_name}: {e}")
+                    status["database_records"][table_name] = f"Error: {e}"
+        
+        return jsonify(status)
+        
+    except Exception as e:
+        logger.error(f"Error in admin user status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/test-stripe-flow', methods=['POST'])
+@handle_errors
+def admin_test_stripe_flow():
+    """Admin endpoint to simulate Stripe webhook events for testing"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        event_type = data.get('event_type', 'customer.subscription.created')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Create mock Stripe event
+        mock_customer_id = f"cus_test_{phone.replace('+', '')}"
+        mock_subscription_id = f"sub_test_{phone.replace('+', '')}"
+        
+        logger.info(f"🧪 Simulating Stripe event: {event_type} for {phone}")
+        
+        if event_type == 'customer.subscription.created':
+            # Simulate new subscription
+            success = add_to_whitelist(phone, send_welcome=True, source='stripe_test')
+            
+            if success:
+                # Log the test subscription event
+                try:
+                    with closing(sqlite3.connect(DB_PATH)) as conn:
+                        c = conn.cursor()
+                        c.execute("""
+                            INSERT INTO subscription_events 
+                            (phone, event_type, stripe_customer_id, stripe_subscription_id, event_data, timestamp)
+                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (phone, 'test_subscription_created', mock_customer_id, mock_subscription_id, json.dumps({'test': True})))
+                        conn.commit()
+                except Exception as db_error:
+                    logger.error(f"Failed to log test subscription event: {db_error}")
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"Simulated subscription creation for {phone}",
+                    "actions_taken": [
+                        "Added to whitelist",
+                        "Sent onboarding SMS",
+                        "Created user profile",
+                        "Logged subscription event"
+                    ]
+                })
+            else:
+                return jsonify({"error": "Failed to add to whitelist"}), 500
+                
+        elif event_type == 'customer.subscription.deleted':
+            # Simulate subscription cancellation
+            success = remove_from_whitelist(phone, send_goodbye=True, source='stripe_test')
+            
+            if success:
+                # Log the test cancellation event
+                try:
+                    with closing(sqlite3.connect(DB_PATH)) as conn:
+                        c = conn.cursor()
+                        c.execute("""
+                            INSERT INTO subscription_events 
+                            (phone, event_type, stripe_customer_id, stripe_subscription_id, event_data, timestamp)
+                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (phone, 'test_subscription_cancelled', mock_customer_id, mock_subscription_id, json.dumps({'test': True})))
+                        conn.commit()
+                except Exception as db_error:
+                    logger.error(f"Failed to log test cancellation event: {db_error}")
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"Simulated subscription cancellation for {phone}",
+                    "actions_taken": [
+                        "Removed from whitelist",
+                        "Sent goodbye SMS",
+                        "Logged cancellation event"
+                    ]
+                })
+            else:
+                return jsonify({"error": "Failed to remove from whitelist"}), 500
+        
+        else:
+            return jsonify({"error": f"Unsupported test event type: {event_type}"}), 400
+        
+    except Exception as e:
+        logger.error(f"Error in test Stripe flow: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/subscription-events', methods=['GET'])
 @handle_errors
 def get_subscription_events():
