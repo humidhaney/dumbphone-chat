@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 CHANGELOG = {
+    "3.1": "Fixed PostgreSQL imports - updated from psycopg2 to psycopg3 for compatibility",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
     "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
@@ -144,10 +145,10 @@ def handle_errors(f):
 # === PostgreSQL Connection Manager ===
 @contextmanager
 def get_db_connection():
-    """Context manager for PostgreSQL connections"""
+    """Context manager for PostgreSQL connections using psycopg3"""
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
         yield conn
     except Exception as e:
         if conn:
