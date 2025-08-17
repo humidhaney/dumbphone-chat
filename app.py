@@ -47,17 +47,6 @@ CHANGELOG = {
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
     "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
     "2.7": "Added complete Stripe webhook integration for automatic subscription management and user lifecycle",
-    "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
-    "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
-    "2.4": "Fixed content filter false positives for philosophical questions, improved spam detection accuracy",
-    "2.3": "Added ClickSend contact list sync, enhanced broadcasting capabilities, and contact management features",
-    "2.2": "Added comprehensive monthly SMS usage tracking with 300 message quota per 30-day period, quota management system, and usage analytics",
-    "2.1": "Major upgrade: Enhanced cultural query detection, improved restaurant intent filtering, enhanced SMS debugging with ClickSend status monitoring",
-    "1.4": "Fixed search capability claims - Claude now properly routes searches instead of denying search ability",
-    "1.3": "Updated welcome message with personality and clear examples, ready for testing",
-    "1.2": "Fixed search follow-ups, enhanced context awareness, prevented search promise loops",
-    "1.1": "Enhanced fact-checking, fixed intent detection order, improved Claude context isolation",
-    "1.0": "Initial release with SMS assistant functionality"
 }
 
 # === Config & API Keys ===
@@ -96,12 +85,6 @@ STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
     logger.info("✅ Stripe API initialized successfully")
-    logger.info(f"🔑 Stripe Keys Status:")
-    logger.info(f"  STRIPE_SECRET_KEY: {'✅ Set' if STRIPE_SECRET_KEY else '❌ Missing'}")
-    logger.info(f"  STRIPE_WEBHOOK_SECRET: {'✅ Set' if STRIPE_WEBHOOK_SECRET else '❌ Missing'}")
-    logger.info(f"  STRIPE_PUBLISHABLE_KEY: {'✅ Set' if STRIPE_PUBLISHABLE_KEY else '❌ Missing'}")
-else:
-    logger.warning("STRIPE_SECRET_KEY not found")
 
 # Initialize Anthropic client
 anthropic_client = None
@@ -110,23 +93,18 @@ if ANTHROPIC_API_KEY:
         import anthropic as anthropic_lib
         anthropic_lib.api_key = ANTHROPIC_API_KEY
         anthropic_client = anthropic_lib
-        logger.info("Anthropic client initialized successfully (module-level)")
+        logger.info("✅ Anthropic client initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Anthropic: {e}")
-        anthropic_client = None
-else:
-    logger.warning("ANTHROPIC_API_KEY not found")
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
-MONTHLY_USAGE_FILE = "monthly_usage.json"
-USAGE_LIMIT = 200
 MONTHLY_LIMIT = 300
 RESET_DAYS = 30
 
 # SMS Response Limits
-MAX_SMS_LENGTH = 720  # Increased from 500 to 720 characters
-CLICKSEND_MAX_LENGTH = 1600  # ClickSend absolute limit
+MAX_SMS_LENGTH = 720
+CLICKSEND_MAX_LENGTH = 1600
 
 # WELCOME MESSAGE
 WELCOME_MSG = (
@@ -150,18 +128,6 @@ ONBOARDING_LOCATION_MSG = (
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
     "You get 300 messages per month. Try asking \"weather today\" to start!"
-)
-
-# QUOTA WARNING MESSAGES
-QUOTA_WARNING_MSG = (
-    "⚠️ Hey! You've used {count} of your 300 monthly messages. "
-    "You have {remaining} messages left this month. Your count resets every 30 days."
-)
-
-QUOTA_EXCEEDED_MSG = (
-    "🚫 You've reached your monthly limit of 300 messages. "
-    "Your quota will reset in {days_remaining} days. "
-    "Thanks for using Hey Alex! We'll be here when your quota refreshes."
 )
 
 # === Error Handling Decorator ===
@@ -198,18 +164,14 @@ def normalize_phone_number(phone):
     if not phone:
         return None
     
-    # Remove all non-digit characters
     digits_only = re.sub(r'\D', '', phone)
     
-    # Add country code if missing (assume US)
     if len(digits_only) == 10:
         digits_only = '1' + digits_only
     
-    # Format as +1XXXXXXXXXX
     if len(digits_only) == 11 and digits_only.startswith('1'):
         return '+' + digits_only
     
-    # If it's already formatted correctly or other country
     if phone.startswith('+'):
         return phone
     
@@ -220,24 +182,21 @@ def truncate_response(response_msg, max_length=MAX_SMS_LENGTH):
     if len(response_msg) <= max_length:
         return response_msg
     
-    # Try to truncate at a sentence boundary
-    truncated = response_msg[:max_length - 3]  # Leave room for "..."
+    truncated = response_msg[:max_length - 3]
     
-    # Look for the last sentence ending
     sentence_ends = ['.', '!', '?']
     last_sentence_end = -1
     
     for end_char in sentence_ends:
         pos = truncated.rfind(end_char)
-        if pos > last_sentence_end and pos > max_length * 0.7:  # Don't truncate too early
+        if pos > last_sentence_end and pos > max_length * 0.7:
             last_sentence_end = pos
     
     if last_sentence_end > 0:
         return truncated[:last_sentence_end + 1]
     else:
-        # No good sentence boundary, truncate at word boundary
         last_space = truncated.rfind(' ')
-        if last_space > max_length * 0.8:  # Only if we don't lose too much
+        if last_space > max_length * 0.8:
             return truncated[:last_space] + "..."
         else:
             return truncated + "..."
@@ -293,12 +252,7 @@ def init_db():
                 );
                 """)
                 
-                c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
-                ON user_profiles(phone);
-                """)
-                
-                # Onboarding log
+                # Other tables
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS onboarding_log (
                     id SERIAL PRIMARY KEY,
@@ -309,7 +263,6 @@ def init_db():
                 );
                 """)
                 
-                # Whitelist events
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS whitelist_events (
                     id SERIAL PRIMARY KEY,
@@ -320,7 +273,6 @@ def init_db():
                 );
                 """)
                 
-                # SMS delivery log
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS sms_delivery_log (
                     id SERIAL PRIMARY KEY,
@@ -333,7 +285,6 @@ def init_db():
                 );
                 """)
                 
-                # Usage analytics
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS usage_analytics (
                     id SERIAL PRIMARY KEY,
@@ -345,7 +296,6 @@ def init_db():
                 );
                 """)
                 
-                # Monthly SMS usage
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS monthly_sms_usage (
                     id SERIAL PRIMARY KEY,
@@ -360,7 +310,6 @@ def init_db():
                 );
                 """)
                 
-                # Stripe subscription events
                 c.execute("""
                 CREATE TABLE IF NOT EXISTS subscription_events (
                     id SERIAL PRIMARY KEY,
@@ -371,43 +320,6 @@ def init_db():
                     status VARCHAR(50),
                     event_data TEXT,
                     processed BOOLEAN DEFAULT TRUE,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Fact check incidents
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS fact_check_incidents (
-                    id SERIAL PRIMARY KEY,
-                    phone VARCHAR(20) NOT NULL,
-                    query TEXT NOT NULL,
-                    response TEXT NOT NULL,
-                    incident_type VARCHAR(50) DEFAULT 'potential_hallucination',
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                # Conversation context
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS conversation_context (
-                    id SERIAL PRIMARY KEY,
-                    phone VARCHAR(20) NOT NULL,
-                    context_key VARCHAR(100) NOT NULL,
-                    context_value TEXT NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(phone, context_key)
-                );
-                """)
-                
-                # ClickSend sync log
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS clicksend_sync_log (
-                    id SERIAL PRIMARY KEY,
-                    list_id INTEGER,
-                    list_name VARCHAR(200),
-                    contacts_synced INTEGER,
-                    sync_status VARCHAR(50),
-                    sync_details TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """)
@@ -424,24 +336,12 @@ def init_db():
                 
                 logger.info(f"📊 PostgreSQL database initialized successfully")
                 logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
-                logger.info(f"📏 SMS response limit set to {MAX_SMS_LENGTH} characters")
-                
-                # Show recent users for debugging
-                if user_count > 0:
-                    c.execute("""
-                        SELECT phone, first_name, location, onboarding_completed, created_date 
-                        FROM user_profiles 
-                        ORDER BY created_date DESC 
-                        LIMIT 5
-                    """)
-                    recent_users = c.fetchall()
-                    logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
                 
     except Exception as e:
         logger.error(f"💥 PostgreSQL database initialization error: {e}")
         raise
 
-# === Onboarding System ===
+# === User Profile Functions ===
 def get_user_profile(phone):
     """Get user profile and onboarding status"""
     try:
@@ -495,7 +395,6 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
         with get_db_connection() as conn:
             with conn.cursor() as c:
                 
-                # Build dynamic update query
                 update_parts = []
                 params = []
                 
@@ -544,6 +443,22 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
         logger.error(f"Error updating user profile for {phone}: {e}")
         return False
 
+def is_user_onboarded(phone):
+    """Check if user has completed onboarding"""
+    profile = get_user_profile(phone)
+    return profile and profile['onboarding_completed']
+
+def get_user_context_for_queries(phone):
+    """Get user context to personalize responses"""
+    profile = get_user_profile(phone)
+    if profile and profile['onboarding_completed']:
+        return {
+            'first_name': profile['first_name'],
+            'location': profile['location'],
+            'personalized': True
+        }
+    return {'personalized': False}
+
 def log_onboarding_step(phone, step, response):
     """Log onboarding step response"""
     try:
@@ -571,16 +486,13 @@ def handle_onboarding_response(phone, message):
         # Collecting first name
         first_name = message.strip().title()
         
-        # Basic validation for first name
         if len(first_name) < 1 or len(first_name) > 50:
             return "Please enter a valid first name."
         
-        # Remove any non-alphabetic characters except spaces, hyphens, apostrophes
         clean_name = re.sub(r"[^a-zA-Z\s\-']", "", first_name)
         if not clean_name:
             return "Please enter a valid first name using only letters."
         
-        # Update profile with first name and move to step 2
         update_user_profile(phone, first_name=clean_name, onboarding_step=2)
         log_onboarding_step(phone, 1, clean_name)
         
@@ -591,18 +503,15 @@ def handle_onboarding_response(phone, message):
         return response
         
     elif current_step == 2:
-        # Collecting location (city or zip code)
+        # Collecting location
         location = message.strip().title()
         
-        # Basic validation for location
         if len(location) < 2 or len(location) > 100:
             return "Please enter a valid city name or zip code."
         
-        # Update profile and complete onboarding
         update_user_profile(phone, location=location, onboarding_step=3, onboarding_completed=True)
         log_onboarding_step(phone, 2, location)
         
-        # Get the user's name for the completion message
         updated_profile = get_user_profile(phone)
         first_name = updated_profile['first_name'] if updated_profile else "there"
         
@@ -613,25 +522,8 @@ def handle_onboarding_response(phone, message):
         return response
     
     else:
-        # Shouldn't happen, but handle gracefully
         logger.warning(f"Unexpected onboarding step {current_step} for {phone}")
         return "There was an error with your setup. You can now ask me questions!"
-
-def is_user_onboarded(phone):
-    """Check if user has completed onboarding"""
-    profile = get_user_profile(phone)
-    return profile and profile['onboarding_completed']
-
-def get_user_context_for_queries(phone):
-    """Get user context to personalize responses"""
-    profile = get_user_profile(phone)
-    if profile and profile['onboarding_completed']:
-        return {
-            'first_name': profile['first_name'],
-            'location': profile['location'],
-            'personalized': True
-        }
-    return {'personalized': False}
 
 # === Whitelist Management ===
 def load_whitelist():
@@ -663,7 +555,6 @@ def add_to_whitelist(phone, send_welcome=True, source='manual'):
     phone = normalize_phone_number(phone)
     wl = load_whitelist()
     
-    # Check if this is a new user
     is_new_user = phone not in wl
     
     if is_new_user:
@@ -671,21 +562,16 @@ def add_to_whitelist(phone, send_welcome=True, source='manual'):
             with open(WHITELIST_FILE, "a") as f:
                 f.write(phone + "\n")
             
-            # Log the new user addition
             log_whitelist_event(phone, "added", source)
-            
             logger.info(f"📱 Added new user {phone} to whitelist (source: {source})")
             
-            # Create user profile for onboarding
             create_user_profile(phone)
             
-            # Send welcome message to start onboarding for new users
             if send_welcome:
                 try:
                     result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
                     if "error" not in result:
                         logger.info(f"🎉 Onboarding started for new user {phone}")
-                        # Log the welcome message
                         save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
                     else:
                         logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
@@ -715,12 +601,9 @@ def remove_from_whitelist(phone, send_goodbye=False):
                 for num in wl:
                     f.write(num + "\n")
             
-            # Log the removal
             log_whitelist_event(phone, "removed")
-            
             logger.info(f"📱 Removed {phone} from whitelist")
             
-            # Send goodbye message if requested
             if send_goodbye:
                 goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
                 try:
@@ -746,7 +629,6 @@ def send_sms(to_number, message, bypass_quota=False):
     url = "https://rest.clicksend.com/v3/sms/send"
     headers = {"Content-Type": "application/json"}
     
-    # Apply ClickSend's absolute limit (1600 chars)
     if len(message) > CLICKSEND_MAX_LENGTH:
         message = message[:CLICKSEND_MAX_LENGTH - 3] + "..."
         logger.warning(f"📏 Message truncated to ClickSend limit: {CLICKSEND_MAX_LENGTH} chars")
@@ -771,9 +653,6 @@ def send_sms(to_number, message, bypass_quota=False):
         
         result = resp.json()
         
-        logger.info(f"📋 ClickSend Response Status: {resp.status_code}")
-        logger.info(f"📋 ClickSend Response Body: {json.dumps(result, indent=2)}")
-        
         if resp.status_code == 200:
             if "data" in result and "messages" in result["data"]:
                 messages = result["data"]["messages"]
@@ -783,11 +662,7 @@ def send_sms(to_number, message, bypass_quota=False):
                     msg_parts = messages[0].get("message_parts", 1)
                     
                     logger.info(f"✅ SMS queued successfully to {to_number} ({msg_parts} parts)")
-                    
                     log_sms_delivery(to_number, message, result, msg_status, msg_id)
-                    
-                    if not bypass_quota:
-                        track_monthly_sms_usage(to_number, is_outgoing=True)
             
             return result
         else:
@@ -850,68 +725,6 @@ def log_usage_analytics(phone, intent_type, success, response_time_ms):
                 conn.commit()
     except Exception as e:
         logger.error(f"Error logging usage analytics: {e}")
-
-def get_current_period_dates():
-    now = datetime.now(timezone.utc)
-    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    period_end = period_start + timedelta(days=30)
-    return period_start.date(), period_end.date()
-
-def track_monthly_sms_usage(phone, is_outgoing=True):
-    if not is_outgoing:
-        return True, {}, None
-    
-    period_start, period_end = get_current_period_dates()
-    
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                
-                c.execute("""
-                    SELECT id, message_count, quota_warnings_sent, quota_exceeded
-                    FROM monthly_sms_usage
-                    WHERE phone = %s AND period_start = %s
-                """, (phone, period_start))
-                
-                result = c.fetchone()
-                
-                if result:
-                    usage_id, current_count, warnings_sent, quota_exceeded = result['id'], result['message_count'], result['quota_warnings_sent'], result['quota_exceeded']
-                    new_count = current_count + 1
-                    
-                    c.execute("""
-                        UPDATE monthly_sms_usage 
-                        SET message_count = %s, last_message_date = CURRENT_TIMESTAMP
-                        WHERE id = %s
-                    """, (new_count, usage_id))
-                else:
-                    new_count = 1
-                    warnings_sent = 0
-                    quota_exceeded = False
-                    
-                    c.execute("""
-                        INSERT INTO monthly_sms_usage 
-                        (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
-                
-                conn.commit()
-                
-                usage_info = {
-                    "phone": phone,
-                    "current_count": new_count,
-                    "monthly_limit": MONTHLY_LIMIT,
-                    "remaining": max(0, MONTHLY_LIMIT - new_count),
-                    "period_start": period_start.isoformat(),
-                    "period_end": period_end.isoformat(),
-                    "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
-                }
-                
-                return True, usage_info, None
-                
-    except Exception as e:
-        logger.error(f"Error tracking monthly SMS usage: {e}")
-        return True, {}, None
 
 # === Content Filter ===
 class ContentFilter:
@@ -1018,7 +831,6 @@ def web_search(q, num=3, search_type="general"):
         data = r.json()
         logger.info(f"✅ Search response received")
         
-        # Check for API errors in response
         if 'error' in data:
             logger.error(f"❌ SerpAPI error: {data['error']}")
             return "Search service error. Please try again later."
@@ -1027,7 +839,6 @@ def web_search(q, num=3, search_type="general"):
         logger.error(f"💥 Search exception: {e}")
         return "Search service temporarily unavailable. Try again later."
 
-    # Process results - return longer, more detailed responses
     org = data.get("organic_results", [])
     if org:
         top = org[0]
@@ -1038,7 +849,6 @@ def web_search(q, num=3, search_type="general"):
         if snippet:
             result += f" — {snippet}"
         
-        # Allow longer search results (up to our new 720 char limit)
         return truncate_response(result, MAX_SMS_LENGTH)
     
     return f"No results found for '{q}'."
@@ -1054,7 +864,6 @@ def ask_claude(phone, user_msg):
     try:
         history = load_history(phone, limit=4)
         
-        # Updated system context for longer responses
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
@@ -1084,10 +893,9 @@ IMPORTANT GUIDELINES:
                 "content": user_msg
             })
             
-            # Increased max_tokens for longer responses
             data = {
                 "model": "claude-3-haiku-20240307",
-                "max_tokens": 250,  # Increased from 150 to 250
+                "max_tokens": 250,
                 "temperature": 0.3,
                 "system": system_context,
                 "messages": messages
@@ -1135,7 +943,6 @@ IMPORTANT GUIDELINES:
                 search_result = web_search(search_term, search_type="general")
                 return search_result
         
-        # Apply intelligent truncation to Claude responses
         truncated_reply = truncate_response(reply, MAX_SMS_LENGTH)
         
         if len(truncated_reply) < len(reply):
@@ -1149,24 +956,6 @@ IMPORTANT GUIDELINES:
     except Exception as e:
         logger.error(f"💥 Claude integration error for {phone}: {e}")
         return "I'm having trouble processing that question. Let me try to search for that information instead."
-
-# === Rate Limiting ===
-def can_send(sender):
-    return True, ""  # Simplified for demo
-
-def load_usage():
-    try:
-        with open(USAGE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_usage(data):
-    try:
-        with open(USAGE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save usage data: {e}")
 
 # === Stripe Functions ===
 def log_stripe_event(event_type, customer_id, subscription_id, phone, status, additional_data=None):
@@ -1202,17 +991,14 @@ def handle_subscription_created(subscription):
     logger.info(f"🎉 New subscription created: {subscription_id} for customer {customer_id}")
     
     try:
-        # Get customer information from Stripe
         customer = stripe.Customer.retrieve(customer_id)
         
-        # Extract phone number from customer metadata or other fields
         phone = extract_phone_from_stripe_metadata(customer.get('metadata', {}))
         
         if not phone and customer.get('phone'):
             phone = normalize_phone_number(customer['phone'])
         
         if phone:
-            # Update user profile with subscription information
             update_user_profile(
                 phone, 
                 stripe_customer_id=customer_id,
@@ -1220,10 +1006,7 @@ def handle_subscription_created(subscription):
                 subscription_id=subscription_id
             )
             
-            # Add to whitelist if not already there
             add_to_whitelist(phone, send_welcome=True, source='stripe_subscription')
-            
-            # Log the event
             log_stripe_event('subscription_created', customer_id, subscription_id, phone, status)
             
             logger.info(f"✅ Subscription activated for {phone}")
@@ -1245,7 +1028,6 @@ def handle_subscription_deleted(subscription):
     logger.info(f"❌ Subscription cancelled: {subscription_id} for customer {customer_id}")
     
     try:
-        # Find user by customer ID
         with get_db_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
@@ -1257,13 +1039,8 @@ def handle_subscription_deleted(subscription):
                 if result:
                     phone = result['phone']
                     
-                    # Update subscription status
                     update_user_profile(phone, subscription_status='cancelled')
-                    
-                    # Remove from whitelist
                     remove_from_whitelist(phone, send_goodbye=True)
-                    
-                    # Log the event
                     log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
                     
                     logger.info(f"✅ Subscription cancelled for {phone}")
@@ -1278,44 +1055,6 @@ def handle_subscription_deleted(subscription):
                         {'error': str(e)})
 
 # === ADMIN ENDPOINTS ===
-@app.route('/admin/users', methods=['GET'])
-def get_all_users():
-    """Admin endpoint to view all users with their profiles and onboarding status"""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT 
-                        phone, first_name, location, onboarding_step,
-                        onboarding_completed, stripe_customer_id, subscription_status, created_date
-                    FROM user_profiles
-                    ORDER BY created_date DESC
-                """)
-                
-                users = []
-                for row in c.fetchall():
-                    users.append({
-                        'phone': row['phone'],
-                        'first_name': row['first_name'],
-                        'location': row['location'],
-                        'onboarding_step': row['onboarding_step'],
-                        'onboarding_completed': bool(row['onboarding_completed']),
-                        'stripe_customer_id': row['stripe_customer_id'],
-                        'subscription_status': row['subscription_status'],
-                        'created_date': row['created_date'].isoformat() if row['created_date'] else None
-                    })
-                
-                return jsonify({
-                    'total_users': len(users),
-                    'users': users,
-                    'database_type': 'PostgreSQL',
-                    'sms_char_limit': MAX_SMS_LENGTH
-                })
-                
-    except Exception as e:
-        logger.error(f"Error getting all users: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/admin/restore-user', methods=['POST'])
 def admin_restore_user():
     """Admin endpoint to restore a user's complete profile"""
@@ -1337,20 +1076,18 @@ def admin_restore_user():
         
         actions_taken = []
         
-        # 1. Add to whitelist (without sending welcome)
+        # Add to whitelist
         success = add_to_whitelist(phone, send_welcome=False, source='admin_restore')
         if success:
             actions_taken.append("Added to whitelist")
         
-        # 2. Create/update user profile with complete onboarding
+        # Create/update user profile
         try:
             with get_db_connection() as conn:
                 with conn.cursor() as c:
                     
-                    # Delete existing profile if any
                     c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
                     
-                    # Insert complete profile
                     c.execute("""
                         INSERT INTO user_profiles 
                         (phone, first_name, location, onboarding_step, onboarding_completed, 
@@ -1361,7 +1098,6 @@ def admin_restore_user():
                     conn.commit()
                     actions_taken.append("Created complete user profile")
                     
-                    # Log the restoration
                     c.execute("""
                         INSERT INTO onboarding_log (phone, step, response, timestamp)
                         VALUES (%s, 999, %s, CURRENT_TIMESTAMP)
@@ -1374,7 +1110,7 @@ def admin_restore_user():
             logger.error(f"Database error restoring user: {db_error}")
             return jsonify({"error": f"Database error: {str(db_error)}"}), 500
         
-        # 3. Send confirmation SMS
+        # Send confirmation SMS
         confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
         
         try:
@@ -1407,145 +1143,237 @@ def admin_restore_user():
         logger.error(f"Error restoring user: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/admin/whitelist', methods=['GET'])
-def get_whitelist():
-    """View current whitelist"""
+# === STRIPE WEBHOOK ===
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events"""
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    if not sig_header:
+        logger.error("Missing Stripe signature header")
+        return jsonify({'error': 'Missing signature header'}), 400
+    
     try:
-        whitelist = load_whitelist()
-        return jsonify({
-            'total_numbers': len(whitelist),
-            'numbers': list(whitelist),
-            'database_type': 'PostgreSQL',
-            'sms_char_limit': MAX_SMS_LENGTH
-        })
-    except Exception as e:
-        logger.error(f"Error getting whitelist: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/whitelist/add', methods=['POST'])
-def admin_add_to_whitelist():
-    """Admin endpoint to manually add users to whitelist"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        send_welcome = data.get('send_welcome', True)
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
         
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
+        logger.info(f"📨 Received Stripe webhook: {event['type']}")
         
-        phone = normalize_phone_number(phone)
+        if event['type'] == 'customer.subscription.created':
+            handle_subscription_created(event['data']['object'])
         
-        success = add_to_whitelist(phone, send_welcome=send_welcome, source='admin')
+        elif event['type'] == 'customer.subscription.deleted':
+            handle_subscription_deleted(event['data']['object'])
         
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Added {phone} to whitelist",
-                "welcome_sent": send_welcome,
-                "database_type": "PostgreSQL",
-                "sms_char_limit": MAX_SMS_LENGTH
-            })
+        elif event['type'] == 'customer.subscription.updated':
+            subscription = event['data']['object']
+            logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
+        
+        elif event['type'] == 'invoice.payment_failed':
+            invoice = event['data']['object']
+            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
+        
+        elif event['type'] == 'invoice.payment_succeeded':
+            invoice = event['data']['object']
+            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
+        
         else:
-            return jsonify({"error": "Failed to add to whitelist"}), 500
-            
+            logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
+        
+        return jsonify({'status': 'success'}), 200
+        
+    except ValueError as e:
+        logger.error(f"❌ Invalid payload: {e}")
+        return jsonify({'error': 'Invalid payload'}), 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"❌ Invalid signature: {e}")
+        return jsonify({'error': 'Invalid signature'}), 400
     except Exception as e:
-        logger.error(f"Error in admin add to whitelist: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"💥 Error processing Stripe webhook: {e}")
+        return jsonify({'error': 'Webhook processing failed'}), 500
 
-@app.route('/admin/whitelist/remove', methods=['POST'])
-def admin_remove_from_whitelist():
-    """Admin endpoint to remove users from whitelist"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        send_goodbye = data.get('send_goodbye', False)
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        success = remove_from_whitelist(phone, send_goodbye=send_goodbye)
-        
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Removed {phone} from whitelist",
-                "goodbye_sent": send_goodbye
-            })
-        else:
-            return jsonify({"error": "Failed to remove from whitelist"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error in admin remove from whitelist: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/reset-user', methods=['POST'])
-def admin_reset_user():
-    """Reset a user completely - remove from whitelist and database"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        actions_taken = []
-        
-        # Remove from whitelist
-        if remove_from_whitelist(phone):
-            actions_taken.append("Removed from whitelist")
-        
-        # Remove user profile and related data
+# === MAIN SMS WEBHOOK ===
+@app.route("/sms", methods=["POST"])
+@handle_errors  
+def sms_webhook():
+    start_time = time.time()
+    
+    sender = request.form.get("from")
+    body = (request.form.get("body") or "").strip()
+    
+    logger.info(f"📱 SMS received from {sender}: {repr(body)}")
+    
+    if not sender:
+        return jsonify({"error": "Missing 'from' field"}), 400
+    
+    if not body:
+        return jsonify({"message": "Empty message received"}), 200
+    
+    # Check whitelist
+    whitelist = load_whitelist()
+    if sender not in whitelist:
+        logger.warning(f"🚫 Unauthorized sender: {sender}")
+        return jsonify({"message": "Unauthorized sender"}), 403
+    
+    # Content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        logger.warning(f"🚫 Content filtered for {sender}: {filter_reason}")
+        return jsonify({"message": "Content filtered"}), 400
+    
+    # Save user message
+    save_message(sender, "user", body)
+    
+    # Handle special commands
+    if body.lower() in ['stop', 'quit', 'unsubscribe']:
+        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
         try:
-            with get_db_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM sms_delivery_log WHERE phone = %s", (phone,))
-                    conn.commit()
-                    actions_taken.append("Removed from database")
-        except Exception as db_error:
-            logger.error(f"Database error resetting user: {db_error}")
-            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+            send_sms(sender, response_msg, bypass_quota=True)
+            return jsonify({"message": "Unsubscribe processed"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send unsubscribe message: {e}")
+            return jsonify({"error": "Failed to process unsubscribe"}), 500
+    
+    if body.lower() in ['start', 'subscribe', 'resume']:
+        if is_user_onboarded(sender):
+            response_msg = WELCOME_MSG
+        else:
+            create_user_profile(sender)
+            response_msg = ONBOARDING_NAME_MSG
         
-        return jsonify({
-            "success": True,
-            "message": f"Reset user {phone} completely",
-            "actions_taken": actions_taken
-        })
+        try:
+            send_sms(sender, response_msg, bypass_quota=True)
+            save_message(sender, "assistant", response_msg, "start_command", 0)
+            return jsonify({"message": "Start message sent"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send start message: {e}")
+            return jsonify({"error": "Failed to send start message"}), 500
+    
+    # Check if user needs to complete onboarding
+    profile = get_user_profile(sender)
+    logger.info(f"👤 User profile for {sender}: {profile}")
+    
+    if not profile:
+        logger.info(f"📝 No profile found for {sender}, creating new profile")
+        create_user_profile(sender)
         
-    except Exception as e:
-        logger.error(f"Error resetting user: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/sms-logs', methods=['GET'])
-def get_sms_logs():
-    """View recent SMS delivery logs"""
-    try:
-        limit = request.args.get('limit', 20, type=int)
+        try:
+            send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
+            save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+            return jsonify({"message": "Onboarding started for new user"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send onboarding start message: {e}")
+            return jsonify({"error": "Failed to start onboarding"}), 500
+    
+    elif not profile['onboarding_completed']:
+        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
         
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT phone, message_content, delivery_status, message_id, timestamp
-                    FROM sms_delivery_log
-                    ORDER BY timestamp DESC
-                    LIMIT %s
-                """, (limit,))
+        try:
+            response_msg = handle_onboarding_response(sender, body)
+            result = send_sms(sender, response_msg)
+            
+            if "error" not in result:
+                logger.info(f"✅ Onboarding response sent to {sender}")
+                return jsonify({"message": "Onboarding response sent"}), 200
+            else:
+                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
+                return jsonify({"error": "Failed to send onboarding response"}), 500
                 
-                logs = []
-                for row in c.fetchall():
-                    content_preview = row['message_content'][:100] + '...' if len(row['message_content']) > 100 else row['message_content']
-                    logs.append({
-                        'phone': row['phone'],
-                        'message_content': content_preview,
-                        'message_length': len(row['message_content']),
-                        'delivery_status': row['delivery_status'],
-                        'message_id': row['message_id'],
-                        'timestamp': row['timestamp'].isoformat() if row['timestamp'] else None
-                    })
+        except Exception as e:
+            logger.error(f"💥 Onboarding error for {sender}: {e}")
+            fallback_msg = "Sorry, there was an error during setup. Please try again."
+            try:
+                send_sms(sender, fallback_msg, bypass_quota=True)
+                return jsonify({"message": "Onboarding fallback sent"}), 200
+            except Exception as fallback_error:
+                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
+                return jsonify({"error": "Onboarding failed"}), 500
+    
+    # User is fully onboarded - continue to normal processing
+    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
+    
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
+    
+    user_context = get_user_context_for_queries(sender)
+    
+    try:
+        if intent and intent.type == "weather":
+            if user_context['personalized']:
+                city = user_context['location']
+                logger.info(f"🌍 Using user's saved location: {city}")
+                query = f"weather forecast {city}"
+                response_msg = web_search(query, search_type="general")
+                first_name = user_context['first_name']
+                response_msg = f"Hi {first_name}! " + response_msg
+            else:
+                response_msg = web_search("weather forecast", search_type="general")
+        else:
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            if "Let me search for" in response_msg:
+                search_term = body
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
+        
+        original_length = len(response_msg)
+        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
+        
+        if original_length > len(response_msg):
+            logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
+        
+        response_time = int((time.time() - start_time) * 1000)
+        save_message(sender, "assistant", response_msg, intent_type, response_time)
+        
+        result = send_sms(sender, response_msg)
+        
+        if "error" not in result:
+            log_usage_analytics(sender, intent_type, True, response_time)
+            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars)")
+            return jsonify({"message": "Response sent successfully"}), 200
+        else:
+            log_usage_analytics(sender, intent_type, False, response_time)
+            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
+            return jsonify({"error": "Failed to send response"}), 500
+            
+    except Exception as e:
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        logger.error(f"💥 Processing error for {sender}: {e}")
+        
+        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
+        try:
+            send_sms(sender, fallback_msg, bypass_quota=True)
+            return jsonify({"message": "Fallback response sent"}), 200
+        except Exception as fallback_error:
+            logger.error(f"Failed to send fallback message: {fallback_error}")
+            return jsonify({"error": "Processing failed"}), 500
+
+# === HEALTH CHECK ===
+@app.route('/')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'version': APP_VERSION,
+        'latest_changes': CHANGELOG[APP_VERSION],
+        'database_type': 'PostgreSQL',
+        'sms_char_limit': MAX_SMS_LENGTH,
+        'clicksend_max_limit': CLICKSEND_MAX_LENGTH
+    })
+
+# Initialize database on startup
+init_db()
+
+if __name__ == "__main__":
+    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
+    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
+    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
