@@ -41,8 +41,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.6"
+APP_VERSION = "3.9"
 CHANGELOG = {
+    "3.9": "Updated to single-command closure: 'END SERVICE' → 'CLOSE ACCOUNT' flow with carrier-friendly language throughout",
+    "3.8": "Fixed carrier blocking: Changed cancellation language from 'cancel/subscription' to 'end service' to avoid SMS filtering",
+    "3.7": "Added /admin/test-sms endpoint for debugging SMS delivery issues",
     "3.6": "Added admin debug endpoints: /admin/users, /admin/subscription-events, /admin/user/<phone>, /admin/link-stripe",
     "3.5": "Optimized SMS responses: Removed intro phrases and confirmations to maximize valuable content within character limits",
     "3.4": "Fixed cancellation flow: Use 'Cancel Chat' → 'CONFIRM CANCEL' (avoids ClickSend STOP). Added cancellation instructions to onboarding.",
@@ -134,7 +137,7 @@ ONBOARDING_LOCATION_MSG = (
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
     "You get 300 messages per month. Try asking \"weather today\" to start! "
-    "If you ever wish to Cancel this service just write \"Cancel Chat\" and I will start the process."
+    "If you ever wish to close your account just write \"END SERVICE\" and I will help you."
 )
 
 # === Error Handling Decorator ===
@@ -1190,6 +1193,38 @@ def admin_get_user(phone):
         logger.error(f"Error getting user {phone}: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/admin/test-sms', methods=['POST'])
+def admin_test_sms():
+    """Admin endpoint to send test SMS directly"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        message = data.get('message', 'Test message from Hey Alex admin')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Send SMS directly
+        result = send_sms(phone, message, bypass_quota=True)
+        
+        if "error" not in result:
+            return jsonify({
+                "success": True,
+                "message": f"Test SMS sent to {phone}",
+                "clicksend_response": result
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Error sending test SMS: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/link-stripe', methods=['POST'])
 def admin_link_stripe():
     """Admin endpoint to manually link Stripe customer to user profile"""
@@ -1479,71 +1514,71 @@ def sms_webhook():
             logger.error(f"Failed to send unsubscribe message: {e}")
             return jsonify({"error": "Failed to process unsubscribe"}), 500
     
-    if body.lower() == 'cancel chat':
-        # Handle subscription cancellation request
+    if body.upper() == 'END SERVICE':
+        # Handle account closure request with carrier-friendly language
         try:
             profile = get_user_profile(sender)
             if not profile:
-                response_msg = "No account found. If you have billing questions, contact support."
+                response_msg = "No account found. If you have questions, contact support."
                 send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No profile found for cancellation"}), 200
+                return jsonify({"message": "No profile found for closure"}), 200
             
             stripe_customer_id = profile.get('stripe_customer_id')
             subscription_status = profile.get('subscription_status')
             first_name = profile.get('first_name', 'there')
             
             if not stripe_customer_id or subscription_status in ['cancelled', 'inactive']:
-                response_msg = f"Hi {first_name}! No active subscription found to cancel. If you have billing questions, contact support."
+                response_msg = f"Hi {first_name}! No active account found to close. If you have questions, contact support."
                 send_sms(sender, response_msg, bypass_quota=True)
                 return jsonify({"message": "No active subscription"}), 200
             
-            # Send confirmation request
+            # Send confirmation request with carrier-friendly language
             response_msg = (
-                f"Hi {first_name}! Are you sure you want to cancel your Hey Alex subscription? "
-                "This will stop all billing and remove access to the service. "
-                "Reply \"CONFIRM CANCEL\" to proceed or anything else to keep your subscription."
+                f"Hi {first_name}! Are you sure you want to close your Hey Alex account? "
+                "This will stop future payments and remove access. "
+                "Reply \"CLOSE ACCOUNT\" to proceed or anything else to keep your service."
             )
             
             # Mark user as pending cancellation
-            update_user_profile(sender, subscription_status='pending_cancellation')
+            update_user_profile(sender, subscription_status='pending_closure')
             
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "cancellation_request", 0)
+            save_message(sender, "assistant", response_msg, "closure_request", 0)
             
-            logger.info(f"🤔 Cancellation request initiated for {sender} ({first_name})")
-            return jsonify({"message": "Cancellation confirmation requested"}), 200
+            logger.info(f"🤔 Account closure request initiated for {sender} ({first_name})")
+            return jsonify({"message": "Account closure confirmation requested"}), 200
             
         except Exception as e:
-            logger.error(f"💥 Error processing cancellation request for {sender}: {e}")
+            logger.error(f"💥 Error processing account closure request for {sender}: {e}")
             response_msg = "There was an error processing your request. Please contact support."
             try:
                 send_sms(sender, response_msg, bypass_quota=True)
             except:
                 pass
-            return jsonify({"error": "Cancellation request failed"}), 500
+            return jsonify({"error": "Account closure request failed"}), 500
     
-    if body.upper() == 'CONFIRM CANCEL':
-        # Handle final subscription cancellation
+    if body.upper() == 'CLOSE ACCOUNT':
+        # Handle final account closure with carrier-friendly language
         try:
             profile = get_user_profile(sender)
             if not profile:
-                response_msg = "No account found. If you have billing questions, contact support."
+                response_msg = "No account found. If you have questions, contact support."
                 send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No profile found for cancellation"}), 200
+                return jsonify({"message": "No profile found for closure"}), 200
             
             stripe_customer_id = profile.get('stripe_customer_id')
             subscription_status = profile.get('subscription_status')
             first_name = profile.get('first_name', 'there')
             
-            if subscription_status != 'pending_cancellation':
-                response_msg = f"Hi {first_name}! No pending cancellation found. To cancel, first write \"Cancel Chat\"."
+            if subscription_status != 'pending_closure':
+                response_msg = f"Hi {first_name}! No pending request found. To close account, first write \"END SERVICE\"."
                 send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No pending cancellation"}), 200
+                return jsonify({"message": "No pending closure"}), 200
             
             if not stripe_customer_id:
-                response_msg = f"Hi {first_name}! No active subscription found to cancel."
+                response_msg = f"Hi {first_name}! No active account found to close."
                 send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No subscription to cancel"}), 200
+                return jsonify({"message": "No subscription to close"}), 200
             
             # Cancel subscription in Stripe
             success, message = cancel_stripe_subscription(stripe_customer_id)
@@ -1551,33 +1586,33 @@ def sms_webhook():
             if success:
                 # Remove from whitelist and update profile
                 remove_from_whitelist(sender, send_goodbye=False)
-                update_user_profile(sender, subscription_status='cancelled')
+                update_user_profile(sender, subscription_status='closed')
                 
                 response_msg = (
-                    f"✅ Your Hey Alex subscription has been cancelled, {first_name}. "
-                    "No further charges will occur. Thanks for using Hey Alex! "
-                    "You can resubscribe anytime at heyalex.co"
+                    f"✅ Your Hey Alex account has been closed, {first_name}. "
+                    "No future payments will occur. Thanks for using Hey Alex! "
+                    "You can restart anytime at heyalex.co"
                 )
-                logger.info(f"🚫 Successfully cancelled subscription for {sender} ({first_name})")
+                logger.info(f"🚫 Successfully closed account for {sender} ({first_name})")
             else:
                 response_msg = (
-                    f"❌ There was an issue cancelling your subscription, {first_name}. "
+                    f"❌ There was an issue closing your account, {first_name}. "
                     "Please contact support for assistance."
                 )
-                logger.error(f"❌ Failed to cancel subscription for {sender}: {message}")
+                logger.error(f"❌ Failed to close account for {sender}: {message}")
             
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "cancellation_complete", 0)
-            return jsonify({"message": "Cancellation processed", "success": success}), 200
+            save_message(sender, "assistant", response_msg, "account_closed", 0)
+            return jsonify({"message": "Account closure processed", "success": success}), 200
             
         except Exception as e:
-            logger.error(f"💥 Error processing final cancellation for {sender}: {e}")
-            response_msg = "There was an error processing your cancellation. Please contact support."
+            logger.error(f"💥 Error processing final closure for {sender}: {e}")
+            response_msg = "There was an error processing your request. Please contact support."
             try:
                 send_sms(sender, response_msg, bypass_quota=True)
             except:
                 pass
-            return jsonify({"error": "Cancellation processing failed"}), 500
+            return jsonify({"error": "Account closure failed"}), 500
     
     if body.lower() in ['start', 'subscribe', 'resume']:
         if is_user_onboarded(sender):
