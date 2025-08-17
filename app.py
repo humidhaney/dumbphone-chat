@@ -527,18 +527,54 @@ def get_user_context_for_queries(phone):
     return {'personalized': False}
 
 def log_whitelist_event(phone, action, source='manual'):
-    """Log whitelist addition/removal events"""
+    """Log whitelist addition/removal events with safe constraint handling"""
     try:
+        # Map any problematic actions to valid ones for backwards compatibility
+        action_mapping = {
+            'cleared_completely': 'removed',
+            'stripe_subscription': 'added', 
+            'stripe_cancellation': 'removed',
+            'stripe_update': 'added',
+            'stripe_payment': 'added',
+            'stripe_test': 'added'
+        }
+        
+        # Use original action first, fallback to mapping if constraint fails
+        safe_action = action
+        
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
-            c.execute("""
-                INSERT INTO whitelist_events (phone, action, source, timestamp)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """, (phone, action, source))
-            conn.commit()
-            logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
+            try:
+                c.execute("""
+                    INSERT INTO whitelist_events (phone, action, source, timestamp)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, (phone, safe_action, source))
+                conn.commit()
+                logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source})")
+            except sqlite3.IntegrityError as constraint_error:
+                # If constraint fails, try mapped action
+                if action in action_mapping:
+                    safe_action = action_mapping[action]
+                    c.execute("""
+                        INSERT INTO whitelist_events (phone, action, source, timestamp)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (phone, safe_action, source))
+                    conn.commit()
+                    logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source}, mapped from: {action})")
+                else:
+                    # If no mapping available, log as generic action
+                    safe_action = 'added' if any(word in action.lower() for word in ['add', 'creat', 'subscri']) else 'removed'
+                    c.execute("""
+                        INSERT INTO whitelist_events (phone, action, source, timestamp)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (phone, safe_action, source))
+                    conn.commit()
+                    logger.info(f"📋 Logged whitelist event: {safe_action} for {phone} (source: {source}, generic mapping from: {action})")
+                    
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
+        # Don't let logging errors break the main flow
+        pass
 
 # === Enhanced Whitelist Management ===
 def load_whitelist():
@@ -1763,6 +1799,60 @@ def get_subscription_events():
             
     except Exception as e:
         logger.error(f"Error getting subscription events: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/fix-database-constraint', methods=['POST'])
+@handle_errors
+def fix_database_constraint():
+    """Fix the whitelist_events table constraint to allow more action types"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Drop the old constraint and recreate the table with expanded actions
+            logger.info("🔧 Fixing whitelist_events table constraint...")
+            
+            # Create a new table with expanded constraints
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_events_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('added','removed','cleared_completely','stripe_subscription','stripe_cancellation','stripe_update','stripe_payment','admin','stripe_test','manual')),
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source TEXT DEFAULT 'manual'
+            );
+            """)
+            
+            # Copy existing data if any exists
+            try:
+                c.execute("""
+                INSERT INTO whitelist_events_new (id, phone, action, timestamp, source)
+                SELECT id, phone, action, timestamp, source FROM whitelist_events
+                """)
+            except Exception as copy_error:
+                logger.warning(f"No existing data to copy: {copy_error}")
+            
+            # Drop old table and rename new one
+            c.execute("DROP TABLE IF EXISTS whitelist_events")
+            c.execute("ALTER TABLE whitelist_events_new RENAME TO whitelist_events")
+            
+            # Recreate the index
+            c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_whitelist_events_phone 
+            ON whitelist_events(phone, timestamp DESC);
+            """)
+            
+            conn.commit()
+            
+            logger.info("✅ Database constraint fixed!")
+            
+            return jsonify({
+                "success": True,
+                "message": "Database constraint fixed - whitelist_events table now supports all action types"
+            })
+            
+    except Exception as e:
+        logger.error(f"Error fixing database constraint: {e}")
         return jsonify({"error": str(e)}), 500
 
 # === Health Check ===
