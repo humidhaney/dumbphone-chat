@@ -1261,6 +1261,78 @@ def admin_reset_user():
         logger.error(f"Error resetting user: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/admin/check-user', methods=['POST'])
+def admin_check_user():
+    """Admin endpoint to check user status and recent activity"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        user_info = {}
+        
+        # Check if in whitelist
+        whitelist = load_whitelist()
+        user_info['in_whitelist'] = phone in whitelist
+        
+        # Get user profile
+        profile = get_user_profile(phone)
+        user_info['profile'] = profile
+        
+        # Get recent messages
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("""
+                        SELECT role, content, intent_type, ts
+                        FROM messages
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 5
+                    """, (phone,))
+                    messages = c.fetchall()
+                    user_info['recent_messages'] = [dict(msg) for msg in messages]
+                    
+                    # Get recent SMS delivery logs
+                    c.execute("""
+                        SELECT message_content, delivery_status, message_id, timestamp
+                        FROM sms_delivery_log
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 3
+                    """, (phone,))
+                    sms_logs = c.fetchall()
+                    user_info['recent_sms_delivery'] = [dict(log) for log in sms_logs]
+                    
+                    # Get subscription events
+                    c.execute("""
+                        SELECT event_type, status, timestamp
+                        FROM subscription_events
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 3
+                    """, (phone,))
+                    events = c.fetchall()
+                    user_info['subscription_events'] = [dict(event) for event in events]
+                    
+        except Exception as db_error:
+            logger.error(f"Database error checking user: {db_error}")
+            user_info['db_error'] = str(db_error)
+        
+        return jsonify({
+            "success": True,
+            "phone": phone,
+            "user_info": user_info
+        })
+        
+    except Exception as e:
+        logger.error(f"Error checking user: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/restore-user', methods=['POST'])
 def admin_restore_user():
     """Admin endpoint to restore a user's complete profile"""
