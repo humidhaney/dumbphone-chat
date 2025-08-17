@@ -1599,8 +1599,8 @@ def sms_webhook():
                 c.execute("SELECT 1")
                 logger.info(f"✅ Database connection test successful")
                 
-                # Check if we can write to the database
-                c.execute("INSERT INTO messages (phone, role, content) VALUES (?, 'test', 'connection_test')", (sender,))
+                # Check if we can write to the database (using valid role)
+                c.execute("INSERT INTO messages (phone, role, content) VALUES (?, 'user', 'connection_test')", (sender,))
                 test_id = c.lastrowid
                 c.execute("DELETE FROM messages WHERE id = ?", (test_id,))
                 conn.commit()
@@ -2030,7 +2030,7 @@ def test_database_operations(phone):
         
         # Test 4: Save message
         try:
-            save_message(phone, "test", "test message")
+            save_message(phone, "user", "test message")
             results['save_message'] = "✅ Success"
         except Exception as e:
             results['save_message'] = f"❌ Exception: {e}"
