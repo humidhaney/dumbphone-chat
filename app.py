@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 CHANGELOG = {
+    "2.8": "Added comprehensive debugging and user profile recovery system to prevent onboarding loops",
     "2.7": "Enhanced news detection and Google News integration with SerpAPI, improved topic-specific news searches",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
     "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
@@ -147,6 +148,136 @@ def handle_errors(f):
             logger.error(f"Error in {f.__name__}: {str(e)}", exc_info=True)
             return {"error": "Internal server error"}, 500
     return decorated_function
+
+# === Helper Functions ===
+def normalize_phone_number(phone):
+    """Normalize phone number to consistent format"""
+    if not phone:
+        return None
+    
+    # Remove all non-digit characters
+    digits_only = re.sub(r'\D', '', phone)
+    
+    # Add country code if missing (assume US)
+    if len(digits_only) == 10:
+        digits_only = '1' + digits_only
+    
+    # Format as +1XXXXXXXXXX
+    if len(digits_only) == 11 and digits_only.startswith('1'):
+        return '+' + digits_only
+    
+    # If it's already formatted correctly or other country
+    if phone.startswith('+'):
+        return phone
+    
+    return '+' + digits_only
+
+def load_whitelist():
+    try:
+        with open(WHITELIST_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+# === Debug Functions ===
+def debug_database_state():
+    """Debug function to check database state"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Check user profiles
+            c.execute("SELECT COUNT(*) FROM user_profiles")
+            profile_count = c.fetchone()[0]
+            
+            c.execute("SELECT phone, first_name, onboarding_completed FROM user_profiles LIMIT 10")
+            profiles = c.fetchall()
+            
+            # Check messages
+            c.execute("SELECT COUNT(*) FROM messages")
+            message_count = c.fetchone()[0]
+            
+            # Check whitelist content
+            whitelist = load_whitelist()
+            
+            logger.info(f"🔍 DATABASE DEBUG:")
+            logger.info(f"  Database path: {DB_PATH}")
+            logger.info(f"  User profiles: {profile_count}")
+            logger.info(f"  Messages: {message_count}")
+            logger.info(f"  Whitelist entries: {len(whitelist)}")
+            logger.info(f"  Sample profiles: {profiles}")
+            logger.info(f"  Whitelist content: {list(whitelist)[:5]}")  # First 5 entries
+            
+            return {
+                'profile_count': profile_count,
+                'message_count': message_count,
+                'whitelist_count': len(whitelist),
+                'profiles': profiles,
+                'whitelist': list(whitelist)
+            }
+            
+    except Exception as e:
+        logger.error(f"💥 Database debug error: {e}")
+        return None
+
+def debug_phone_lookup(phone):
+    """Debug function to check phone number lookup"""
+    try:
+        normalized = normalize_phone_number(phone)
+        logger.info(f"🔍 PHONE DEBUG:")
+        logger.info(f"  Original: {phone}")
+        logger.info(f"  Normalized: {normalized}")
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Try exact match
+            c.execute("SELECT phone, first_name FROM user_profiles WHERE phone = ?", (phone,))
+            exact_match = c.fetchone()
+            
+            # Try normalized match
+            c.execute("SELECT phone, first_name FROM user_profiles WHERE phone = ?", (normalized,))
+            normalized_match = c.fetchone()
+            
+            # Get all phone numbers to compare
+            c.execute("SELECT phone FROM user_profiles")
+            all_phones = [row[0] for row in c.fetchall()]
+            
+            logger.info(f"  Exact match: {exact_match}")
+            logger.info(f"  Normalized match: {normalized_match}")
+            logger.info(f"  All phones in DB: {all_phones}")
+            
+            return {
+                'original': phone,
+                'normalized': normalized,
+                'exact_match': exact_match,
+                'normalized_match': normalized_match,
+                'all_phones': all_phones
+            }
+            
+    except Exception as e:
+        logger.error(f"💥 Phone debug error: {e}")
+        return None
+
+def check_existing_user_before_onboarding(sender):
+    """Check if user exists before starting onboarding"""
+    # Check whitelist first
+    whitelist = load_whitelist()
+    if sender not in whitelist:
+        logger.info(f"📝 {sender} not in whitelist, this should be a new user")
+        return False
+    
+    # Debug database state
+    debug_state = debug_database_state()
+    if debug_state and debug_state['profile_count'] > 0:
+        logger.info(f"📊 Database has {debug_state['profile_count']} profiles, investigating...")
+        
+        # Check if this specific user exists
+        profile_debug = debug_phone_lookup(sender)
+        if profile_debug:
+            logger.info(f"🔍 Phone lookup results: {profile_debug}")
+    
+    return False
 
 # === Intent Detection ===
 @dataclass
@@ -551,8 +682,9 @@ def enhanced_web_search(q, num=3, search_type="general"):
 
 # === User Profile & Onboarding System ===
 def get_user_profile(phone):
-    """Get user profile and onboarding status"""
+    """Enhanced get_user_profile with debugging and phone format flexibility"""
     try:
+        # First try the original phone number
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -563,14 +695,41 @@ def get_user_profile(phone):
             result = c.fetchone()
             
             if result:
+                logger.info(f"✅ Found profile for {phone} (exact match)")
                 return {
                     'first_name': result[0],
                     'location': result[1],
                     'onboarding_step': result[2],
                     'onboarding_completed': bool(result[3])
                 }
-            else:
-                return None
+            
+            # If not found, try normalized phone number
+            normalized = normalize_phone_number(phone)
+            if normalized != phone:
+                c.execute("""
+                    SELECT first_name, location, onboarding_step, onboarding_completed
+                    FROM user_profiles
+                    WHERE phone = ?
+                """, (normalized,))
+                result = c.fetchone()
+                
+                if result:
+                    logger.info(f"✅ Found profile for {phone} (normalized as {normalized})")
+                    return {
+                        'first_name': result[0],
+                        'location': result[1],
+                        'onboarding_step': result[2],
+                        'onboarding_completed': bool(result[3])
+                    }
+            
+            # If still not found, log debug info for whitelisted users
+            whitelist = load_whitelist()
+            if phone in whitelist or normalized in whitelist:
+                logger.warning(f"❌ Whitelisted user {phone} has no profile - may need recovery")
+                debug_phone_lookup(phone)
+            
+            return None
+            
     except Exception as e:
         logger.error(f"Error getting user profile for {phone}: {e}")
         return None
@@ -578,6 +737,7 @@ def get_user_profile(phone):
 def create_user_profile(phone):
     """Create new user profile for onboarding"""
     try:
+        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -595,6 +755,7 @@ def create_user_profile(phone):
 def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, onboarding_completed=None):
     """Update user profile information"""
     try:
+        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             
@@ -638,6 +799,7 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
 def log_onboarding_step(phone, step, response):
     """Log onboarding step response"""
     try:
+        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -727,6 +889,7 @@ def get_user_context_for_queries(phone):
 def log_whitelist_event(phone, action):
     """Log whitelist addition/removal events"""
     try:
+        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -737,36 +900,6 @@ def log_whitelist_event(phone, action):
             logger.info(f"📋 Logged whitelist event: {action} for {phone}")
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
-
-# === Helper Functions ===
-def normalize_phone_number(phone):
-    """Normalize phone number to consistent format"""
-    if not phone:
-        return None
-    
-    # Remove all non-digit characters
-    digits_only = re.sub(r'\D', '', phone)
-    
-    # Add country code if missing (assume US)
-    if len(digits_only) == 10:
-        digits_only = '1' + digits_only
-    
-    # Format as +1XXXXXXXXXX
-    if len(digits_only) == 11 and digits_only.startswith('1'):
-        return '+' + digits_only
-    
-    # If it's already formatted correctly or other country
-    if phone.startswith('+'):
-        return phone
-    
-    return '+' + digits_only
-
-def load_whitelist():
-    try:
-        with open(WHITELIST_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return set()
 
 def add_to_whitelist(phone, send_welcome=True):
     """Enhanced whitelist addition with automatic welcome message and onboarding"""
@@ -959,7 +1092,7 @@ def init_db():
             
             conn.commit()
             
-            # Check for existing data
+            # Check for existing data and log detailed info
             c.execute("SELECT COUNT(*) FROM user_profiles")
             user_count = c.fetchone()[0]
             
@@ -968,6 +1101,17 @@ def init_db():
             
             logger.info(f"📊 Database initialized successfully")
             logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
+            
+            # If we have data, show some samples for debugging
+            if user_count > 0:
+                c.execute("""
+                    SELECT phone, first_name, location, onboarding_completed, created_date 
+                    FROM user_profiles 
+                    ORDER BY created_date DESC 
+                    LIMIT 5
+                """)
+                recent_users = c.fetchall()
+                logger.info(f"📊 Recent users: {recent_users}")
             
     except Exception as e:
         logger.error(f"💥 Database initialization error: {e}")
@@ -979,6 +1123,7 @@ def send_sms(to_number, message, bypass_quota=False):
         logger.error("ClickSend credentials not configured")
         return {"error": "SMS service not configured"}
     
+    to_number = normalize_phone_number(to_number)
     url = "https://rest.clicksend.com/v3/sms/send"
     headers = {"Content-Type": "application/json"}
     
@@ -1029,6 +1174,7 @@ def send_sms(to_number, message, bypass_quota=False):
         return {"error": f"SMS send failed: {str(e)}"}
 
 def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
+    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1038,6 +1184,7 @@ def log_sms_delivery(phone, message_content, clicksend_response, delivery_status
         conn.commit()
 
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
+    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1047,6 +1194,7 @@ def save_message(phone, role, content, intent_type=None, response_time_ms=None):
         conn.commit()
 
 def load_history(phone, limit=4):
+    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1060,6 +1208,7 @@ def load_history(phone, limit=4):
     return [{"role": r, "content": t} for (r, t) in reversed(rows)]
 
 def log_usage_analytics(phone, intent_type, success, response_time_ms):
+    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1078,6 +1227,7 @@ def track_monthly_sms_usage(phone, is_outgoing=True):
     if not is_outgoing:
         return True, {}, None
     
+    phone = normalize_phone_number(phone)
     period_start, period_end = get_current_period_dates()
     
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -1313,6 +1463,9 @@ def sms_webhook():
     if not body:
         return jsonify({"message": "Empty message received"}), 200
     
+    # Normalize sender phone number
+    sender = normalize_phone_number(sender)
+    
     # Check whitelist
     whitelist = load_whitelist()
     if sender not in whitelist:
@@ -1355,19 +1508,28 @@ def sms_webhook():
             logger.error(f"Failed to send start message: {e}")
             return jsonify({"error": "Failed to send start message"}), 500
     
-    # Check if user needs to complete onboarding
+    # Enhanced user profile checking with debugging
     profile = get_user_profile(sender)
     logger.info(f"👤 User profile for {sender}: {profile}")
     
+    # Special case: If user is in whitelist but has no profile, it might be a recovery case
     if not profile:
-        # No profile exists - create one and start onboarding
-        logger.info(f"📝 No profile found for {sender}, creating new profile")
+        logger.warning(f"🔍 User {sender} in whitelist but no profile found - checking for recovery case")
+        debug_state = debug_database_state()
+        
+        # If we have other users in the database, this might be a lookup issue
+        if debug_state and debug_state['profile_count'] > 0:
+            logger.warning(f"📊 Database has {debug_state['profile_count']} profiles, but lookup failed for {sender}")
+            debug_phone_lookup(sender)
+        
+        # Create new profile and start onboarding
+        logger.info(f"📝 Creating new profile for {sender}")
         create_user_profile(sender)
         
         try:
             send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
             save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"message": "Onboarding started for new user"}), 200
+            return jsonify({"message": "Onboarding started"}), 200
         except Exception as e:
             logger.error(f"Failed to send onboarding start message: {e}")
             return jsonify({"error": "Failed to start onboarding"}), 500
@@ -1518,7 +1680,70 @@ def sms_webhook():
             logger.error(f"Failed to send fallback message: {fallback_error}")
             return jsonify({"error": "Processing failed"}), 500
 
-# === Admin Endpoints ===
+# === Debug and Admin Endpoints ===
+@app.route('/debug/user/<phone>', methods=['GET'])
+def debug_user(phone):
+    """Debug endpoint to check a specific user"""
+    try:
+        phone = normalize_phone_number(phone)
+        
+        # Get debug info
+        db_state = debug_database_state()
+        phone_debug = debug_phone_lookup(phone)
+        profile = get_user_profile(phone)
+        
+        return jsonify({
+            'phone': phone,
+            'database_state': db_state,
+            'phone_debug': phone_debug,
+            'profile': profile,
+            'in_whitelist': phone in load_whitelist()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/recover-user', methods=['POST'])
+def recover_user():
+    """Recover a user who lost their profile"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        first_name = data.get('first_name', 'User')
+        location = data.get('location', 'Unknown')
+        
+        if not phone:
+            return jsonify({'error': 'Phone required'}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        # Add to whitelist if not already there
+        add_to_whitelist(phone, send_welcome=False)
+        
+        # Create or update profile as completed
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT OR REPLACE INTO user_profiles 
+                (phone, first_name, location, onboarding_step, onboarding_completed, created_date, updated_date)
+                VALUES (?, ?, ?, 3, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (phone, first_name, location))
+            conn.commit()
+        
+        logger.info(f"🔧 Recovered user {phone}: {first_name} in {location}")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Recovered user {phone}',
+            'phone': phone,
+            'first_name': first_name,
+            'location': location
+        })
+        
+    except Exception as e:
+        logger.error(f"Error recovering user: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
@@ -1585,7 +1810,7 @@ def get_all_users():
         logger.error(f"Error getting all users: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Test endpoint for news functionality ===
+# === Test Endpoints ===
 @app.route('/test/news', methods=['GET'])
 def test_news():
     """Test endpoint to verify news functionality"""
@@ -1640,6 +1865,15 @@ def test_intent():
         logger.error(f"Error in intent test: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/debug/database', methods=['GET'])
+def debug_database():
+    """Debug endpoint to check database state"""
+    try:
+        debug_state = debug_database_state()
+        return jsonify(debug_state)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # Initialize database on startup
 init_db()
 
@@ -1659,5 +1893,9 @@ if __name__ == "__main__":
             logger.error(f"❌ News functionality test failed: {e}")
     else:
         logger.warning("⚠️ SERPAPI_API_KEY not set - news functionality will be limited")
+    
+    # Debug startup state
+    logger.info("🔍 Startup Debug Information:")
+    debug_database_state()
     
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
