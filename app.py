@@ -1600,8 +1600,8 @@ def sms_webhook():
     try:
         if is_longer_request:
             # Get the last user query for context
-            last_query = get_conversation_context(sender, "last_query")
-            if last_query:
+            last_query = get_last_user_query(sender)
+            if last_query and last_query.lower() != "longer":
                 # Re-process the last query with longer response
                 longer_query = f"Provide detailed information about: {last_query}"
                 if user_context['personalized']:
