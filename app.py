@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 CHANGELOG = {
+    "3.4": "Fixed cancellation flow: Use 'Cancel Chat' → 'CONFIRM CANCEL' (avoids ClickSend STOP). Added cancellation instructions to onboarding.",
     "3.3": "Added STOP → CANCEL flow: Users can now cancel Stripe subscriptions via SMS with STOP then CANCEL commands",
     "3.2": "Added admin endpoints: /admin/reset-user and /admin/whitelist/remove for user management",
     "3.1": "Fixed PostgreSQL imports - updated from psycopg2 to psycopg3 for compatibility",
@@ -130,7 +131,8 @@ ONBOARDING_LOCATION_MSG = (
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 300 messages per month. Try asking \"weather today\" to start!"
+    "You get 300 messages per month. Try asking \"weather today\" to start! "
+    "If you ever wish to Cancel this service just write \"Cancel Chat\" and I will start the process."
 )
 
 # === Error Handling Decorator ===
@@ -1351,26 +1353,16 @@ def sms_webhook():
     
     # Handle special commands
     if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        # Check if user has an active subscription
-        profile = get_user_profile(sender)
-        if profile and profile.get('stripe_customer_id') and profile.get('subscription_status') not in ['cancelled', 'inactive']:
-            response_msg = (
-                "⏸️ You've been temporarily unsubscribed from Hey Alex SMS. "
-                "To permanently CANCEL your paid subscription and stop all billing, reply CANCEL. "
-                "To resume SMS without cancelling, text START anytime."
-            )
-        else:
-            response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
-        
+        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
         try:
             send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Stop processed"}), 200
+            return jsonify({"message": "Unsubscribe processed"}), 200
         except Exception as e:
-            logger.error(f"Failed to send stop message: {e}")
-            return jsonify({"error": "Failed to process stop"}), 500
+            logger.error(f"Failed to send unsubscribe message: {e}")
+            return jsonify({"error": "Failed to process unsubscribe"}), 500
     
-    if body.upper() == 'CANCEL':
-        # Handle subscription cancellation
+    if body.lower() == 'cancel chat':
+        # Handle subscription cancellation request
         try:
             profile = get_user_profile(sender)
             if not profile:
@@ -1380,11 +1372,60 @@ def sms_webhook():
             
             stripe_customer_id = profile.get('stripe_customer_id')
             subscription_status = profile.get('subscription_status')
+            first_name = profile.get('first_name', 'there')
             
             if not stripe_customer_id or subscription_status in ['cancelled', 'inactive']:
-                response_msg = "No active subscription found to cancel. If you have billing questions, contact support."
+                response_msg = f"Hi {first_name}! No active subscription found to cancel. If you have billing questions, contact support."
                 send_sms(sender, response_msg, bypass_quota=True)
                 return jsonify({"message": "No active subscription"}), 200
+            
+            # Send confirmation request
+            response_msg = (
+                f"Hi {first_name}! Are you sure you want to cancel your Hey Alex subscription? "
+                "This will stop all billing and remove access to the service. "
+                "Reply \"CONFIRM CANCEL\" to proceed or anything else to keep your subscription."
+            )
+            
+            # Mark user as pending cancellation
+            update_user_profile(sender, subscription_status='pending_cancellation')
+            
+            send_sms(sender, response_msg, bypass_quota=True)
+            save_message(sender, "assistant", response_msg, "cancellation_request", 0)
+            
+            logger.info(f"🤔 Cancellation request initiated for {sender} ({first_name})")
+            return jsonify({"message": "Cancellation confirmation requested"}), 200
+            
+        except Exception as e:
+            logger.error(f"💥 Error processing cancellation request for {sender}: {e}")
+            response_msg = "There was an error processing your request. Please contact support."
+            try:
+                send_sms(sender, response_msg, bypass_quota=True)
+            except:
+                pass
+            return jsonify({"error": "Cancellation request failed"}), 500
+    
+    if body.upper() == 'CONFIRM CANCEL':
+        # Handle final subscription cancellation
+        try:
+            profile = get_user_profile(sender)
+            if not profile:
+                response_msg = "No account found. If you have billing questions, contact support."
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "No profile found for cancellation"}), 200
+            
+            stripe_customer_id = profile.get('stripe_customer_id')
+            subscription_status = profile.get('subscription_status')
+            first_name = profile.get('first_name', 'there')
+            
+            if subscription_status != 'pending_cancellation':
+                response_msg = f"Hi {first_name}! No pending cancellation found. To cancel, first write \"Cancel Chat\"."
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "No pending cancellation"}), 200
+            
+            if not stripe_customer_id:
+                response_msg = f"Hi {first_name}! No active subscription found to cancel."
+                send_sms(sender, response_msg, bypass_quota=True)
+                return jsonify({"message": "No subscription to cancel"}), 200
             
             # Cancel subscription in Stripe
             success, message = cancel_stripe_subscription(stripe_customer_id)
@@ -1395,23 +1436,24 @@ def sms_webhook():
                 update_user_profile(sender, subscription_status='cancelled')
                 
                 response_msg = (
-                    "✅ Your Hey Alex subscription has been cancelled. "
+                    f"✅ Your Hey Alex subscription has been cancelled, {first_name}. "
                     "No further charges will occur. Thanks for using Hey Alex! "
                     "You can resubscribe anytime at heyalex.co"
                 )
-                logger.info(f"🚫 Successfully cancelled subscription for {sender}")
+                logger.info(f"🚫 Successfully cancelled subscription for {sender} ({first_name})")
             else:
                 response_msg = (
-                    "❌ There was an issue cancelling your subscription. "
+                    f"❌ There was an issue cancelling your subscription, {first_name}. "
                     "Please contact support for assistance."
                 )
                 logger.error(f"❌ Failed to cancel subscription for {sender}: {message}")
             
             send_sms(sender, response_msg, bypass_quota=True)
+            save_message(sender, "assistant", response_msg, "cancellation_complete", 0)
             return jsonify({"message": "Cancellation processed", "success": success}), 200
             
         except Exception as e:
-            logger.error(f"💥 Error processing cancellation for {sender}: {e}")
+            logger.error(f"💥 Error processing final cancellation for {sender}: {e}")
             response_msg = "There was an error processing your cancellation. Please contact support."
             try:
                 send_sms(sender, response_msg, bypass_quota=True)
