@@ -2,8 +2,9 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import sqlite3
-from contextlib import closing
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
 import calendar
@@ -21,6 +22,7 @@ import io
 import stripe
 import hmac
 import hashlib
+from urllib.parse import urlparse
 
 # Load env vars
 load_dotenv()
@@ -39,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 CHANGELOG = {
+    "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
     "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
     "2.7": "Added complete Stripe webhook integration for automatic subscription management and user lifecycle",
@@ -63,12 +66,27 @@ CLICKSEND_API_KEY = os.getenv("CLICKSEND_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
+# PostgreSQL Database Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 # Debug API key availability
 logger.info(f"🔑 API Keys Status:")
 logger.info(f"  CLICKSEND_USERNAME: {'✅ Set' if CLICKSEND_USERNAME else '❌ Missing'}")
 logger.info(f"  CLICKSEND_API_KEY: {'✅ Set' if CLICKSEND_API_KEY else '❌ Missing'}")
 logger.info(f"  ANTHROPIC_API_KEY: {'✅ Set' if ANTHROPIC_API_KEY else '❌ Missing'}")
 logger.info(f"  SERPAPI_API_KEY: {'✅ Set' if SERPAPI_API_KEY else '❌ Missing'}")
+logger.info(f"  DATABASE_URL: {'✅ Set' if DATABASE_URL else '❌ Missing'}")
+
+if not DATABASE_URL:
+    logger.error("🚨 DATABASE_URL not found! PostgreSQL connection required.")
+    raise Exception("DATABASE_URL environment variable must be set for PostgreSQL connection")
+
+# Parse DATABASE_URL to show connection info (without password)
+try:
+    parsed = urlparse(DATABASE_URL)
+    logger.info(f"🗄️ PostgreSQL: {parsed.hostname}:{parsed.port}/{parsed.path[1:]} (user: {parsed.username})")
+except Exception as e:
+    logger.error(f"Error parsing DATABASE_URL: {e}")
 
 # Stripe Configuration
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -105,9 +123,8 @@ MONTHLY_USAGE_FILE = "monthly_usage.json"
 USAGE_LIMIT = 200
 MONTHLY_LIMIT = 300
 RESET_DAYS = 30
-DB_PATH = os.getenv("DB_PATH", "chat.db")
 
-# SMS Response Limits - UPDATED for longer responses
+# SMS Response Limits
 MAX_SMS_LENGTH = 720  # Increased from 500 to 720 characters
 CLICKSEND_MAX_LENGTH = 1600  # ClickSend absolute limit
 
@@ -157,6 +174,23 @@ def handle_errors(f):
             logger.error(f"Error in {f.__name__}: {str(e)}", exc_info=True)
             return {"error": "Internal server error"}, 500
     return decorated_function
+
+# === PostgreSQL Connection Manager ===
+@contextmanager
+def get_db_connection():
+    """Context manager for PostgreSQL connections"""
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        yield conn
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Database connection error: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
 
 # === Helper Functions ===
 def normalize_phone_number(phone):
@@ -211,223 +245,227 @@ def truncate_response(response_msg, max_length=MAX_SMS_LENGTH):
 # === Database Initialization ===
 def init_db():
     try:
-        logger.info(f"🗄️ Initializing database at: {DB_PATH}")
+        logger.info(f"🗄️ Initializing PostgreSQL database")
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Check if database exists and has data
-            c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            existing_tables = [row[0] for row in c.fetchall()]
-            logger.info(f"📊 Existing tables: {existing_tables}")
-            
-            # Messages table
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                content TEXT NOT NULL,
-                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                intent_type TEXT,
-                response_time_ms INTEGER
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
-            ON messages(phone, ts DESC);
-            """)
-            
-            # User profiles table for onboarding
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                first_name TEXT,
-                location TEXT,
-                onboarding_step INTEGER DEFAULT 0,
-                onboarding_completed BOOLEAN DEFAULT FALSE,
-                stripe_customer_id TEXT,
-                subscription_status TEXT,
-                subscription_id TEXT,
-                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
-            ON user_profiles(phone);
-            """)
-            
-            # Onboarding log
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS onboarding_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                step INTEGER NOT NULL,
-                response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Whitelist events
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                source TEXT DEFAULT 'manual'
-            );
-            """)
-            
-            # SMS delivery log
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_content TEXT NOT NULL,
-                clicksend_response TEXT,
-                delivery_status TEXT,
-                message_id TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Usage analytics
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS usage_analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                intent_type TEXT,
-                success BOOLEAN,
-                response_time_ms INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Monthly SMS usage
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                message_count INTEGER DEFAULT 1,
-                period_start DATE NOT NULL,
-                period_end DATE NOT NULL,
-                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                quota_warnings_sent INTEGER DEFAULT 0,
-                quota_exceeded BOOLEAN DEFAULT FALSE,
-                UNIQUE(phone, period_start)
-            );
-            """)
-            
-            # Stripe subscription events
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS subscription_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                stripe_customer_id TEXT,
-                subscription_id TEXT,
-                phone TEXT,
-                status TEXT,
-                event_data TEXT,
-                processed BOOLEAN DEFAULT TRUE,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Fact check incidents
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS fact_check_incidents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                query TEXT NOT NULL,
-                response TEXT NOT NULL,
-                incident_type TEXT DEFAULT 'potential_hallucination',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Conversation context
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_context (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                context_key TEXT NOT NULL,
-                context_value TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(phone, context_key)
-            );
-            """)
-            
-            # ClickSend sync log
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS clicksend_sync_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                list_id INTEGER,
-                list_name TEXT,
-                contacts_synced INTEGER,
-                sync_status TEXT,
-                sync_details TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            conn.commit()
-            logger.info(f"📊 All database tables created/verified")
-            
-            # Check for existing data
-            c.execute("SELECT COUNT(*) FROM user_profiles")
-            user_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM messages")  
-            message_count = c.fetchone()[0]
-            
-            logger.info(f"📊 Database initialized successfully")
-            logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
-            logger.info(f"📏 SMS response limit set to {MAX_SMS_LENGTH} characters")
-            
-            # Show recent users for debugging
-            if user_count > 0:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                
+                # Check existing tables
                 c.execute("""
-                    SELECT phone, first_name, location, onboarding_completed, created_date 
-                    FROM user_profiles 
-                    ORDER BY created_date DESC 
-                    LIMIT 5
+                    SELECT table_name FROM information_schema.tables 
+                    WHERE table_schema = 'public'
                 """)
-                recent_users = c.fetchall()
-                logger.info(f"📊 Recent users: {recent_users}")
-            
+                existing_tables = [row['table_name'] for row in c.fetchall()]
+                logger.info(f"📊 Existing tables: {existing_tables}")
+                
+                # Messages table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    role VARCHAR(20) NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    intent_type VARCHAR(50),
+                    response_time_ms INTEGER
+                );
+                """)
+                
+                c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
+                ON messages(phone, ts DESC);
+                """)
+                
+                # User profiles table
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) UNIQUE NOT NULL,
+                    first_name VARCHAR(100),
+                    location VARCHAR(200),
+                    onboarding_step INTEGER DEFAULT 0,
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    stripe_customer_id VARCHAR(100),
+                    subscription_status VARCHAR(50),
+                    subscription_id VARCHAR(100),
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
+                ON user_profiles(phone);
+                """)
+                
+                # Onboarding log
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS onboarding_log (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    step INTEGER NOT NULL,
+                    response TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Whitelist events
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist_events (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    action VARCHAR(20) NOT NULL CHECK(action IN ('added','removed')),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source VARCHAR(50) DEFAULT 'manual'
+                );
+                """)
+                
+                # SMS delivery log
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    message_content TEXT NOT NULL,
+                    clicksend_response TEXT,
+                    delivery_status VARCHAR(50),
+                    message_id VARCHAR(100),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Usage analytics
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS usage_analytics (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    intent_type VARCHAR(50),
+                    success BOOLEAN,
+                    response_time_ms INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Monthly SMS usage
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    message_count INTEGER DEFAULT 1,
+                    period_start DATE NOT NULL,
+                    period_end DATE NOT NULL,
+                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    quota_warnings_sent INTEGER DEFAULT 0,
+                    quota_exceeded BOOLEAN DEFAULT FALSE,
+                    UNIQUE(phone, period_start)
+                );
+                """)
+                
+                # Stripe subscription events
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type VARCHAR(100) NOT NULL,
+                    stripe_customer_id VARCHAR(100),
+                    subscription_id VARCHAR(100),
+                    phone VARCHAR(20),
+                    status VARCHAR(50),
+                    event_data TEXT,
+                    processed BOOLEAN DEFAULT TRUE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Fact check incidents
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS fact_check_incidents (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    query TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    incident_type VARCHAR(50) DEFAULT 'potential_hallucination',
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                # Conversation context
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_context (
+                    id SERIAL PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    context_key VARCHAR(100) NOT NULL,
+                    context_value TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(phone, context_key)
+                );
+                """)
+                
+                # ClickSend sync log
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS clicksend_sync_log (
+                    id SERIAL PRIMARY KEY,
+                    list_id INTEGER,
+                    list_name VARCHAR(200),
+                    contacts_synced INTEGER,
+                    sync_status VARCHAR(50),
+                    sync_details TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                
+                conn.commit()
+                logger.info(f"📊 All PostgreSQL tables created/verified")
+                
+                # Check for existing data
+                c.execute("SELECT COUNT(*) as count FROM user_profiles")
+                user_count = c.fetchone()['count']
+                
+                c.execute("SELECT COUNT(*) as count FROM messages")  
+                message_count = c.fetchone()['count']
+                
+                logger.info(f"📊 PostgreSQL database initialized successfully")
+                logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
+                logger.info(f"📏 SMS response limit set to {MAX_SMS_LENGTH} characters")
+                
+                # Show recent users for debugging
+                if user_count > 0:
+                    c.execute("""
+                        SELECT phone, first_name, location, onboarding_completed, created_date 
+                        FROM user_profiles 
+                        ORDER BY created_date DESC 
+                        LIMIT 5
+                    """)
+                    recent_users = c.fetchall()
+                    logger.info(f"📊 Recent users: {[dict(user) for user in recent_users]}")
+                
     except Exception as e:
-        logger.error(f"💥 Database initialization error: {e}")
+        logger.error(f"💥 PostgreSQL database initialization error: {e}")
         raise
 
 # === Onboarding System ===
 def get_user_profile(phone):
     """Get user profile and onboarding status"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT first_name, location, onboarding_step, onboarding_completed, stripe_customer_id, subscription_status
-                FROM user_profiles
-                WHERE phone = ?
-            """, (phone,))
-            result = c.fetchone()
-            
-            if result:
-                return {
-                    'first_name': result[0],
-                    'location': result[1],
-                    'onboarding_step': result[2],
-                    'onboarding_completed': bool(result[3]),
-                    'stripe_customer_id': result[4],
-                    'subscription_status': result[5]
-                }
-            else:
-                return None
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT first_name, location, onboarding_step, onboarding_completed, 
+                           stripe_customer_id, subscription_status
+                    FROM user_profiles
+                    WHERE phone = %s
+                """, (phone,))
+                result = c.fetchone()
+                
+                if result:
+                    return {
+                        'first_name': result['first_name'],
+                        'location': result['location'],
+                        'onboarding_step': result['onboarding_step'],
+                        'onboarding_completed': bool(result['onboarding_completed']),
+                        'stripe_customer_id': result['stripe_customer_id'],
+                        'subscription_status': result['subscription_status']
+                    }
+                else:
+                    return None
     except Exception as e:
         logger.error(f"Error getting user profile for {phone}: {e}")
         return None
@@ -435,16 +473,16 @@ def get_user_profile(phone):
 def create_user_profile(phone):
     """Create new user profile for onboarding"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR IGNORE INTO user_profiles 
-                (phone, onboarding_step, onboarding_completed)
-                VALUES (?, 1, FALSE)
-            """, (phone,))
-            conn.commit()
-            logger.info(f"📝 Created user profile for {phone}")
-            return True
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO user_profiles (phone, onboarding_step, onboarding_completed)
+                    VALUES (%s, 1, FALSE)
+                    ON CONFLICT (phone) DO NOTHING
+                """, (phone,))
+                conn.commit()
+                logger.info(f"📝 Created user profile for {phone}")
+                return True
     except Exception as e:
         logger.error(f"Error creating user profile for {phone}: {e}")
         return False
@@ -454,54 +492,54 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
                        subscription_status=None, subscription_id=None):
     """Update user profile information"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            
-            # Build dynamic update query
-            update_parts = []
-            params = []
-            
-            if first_name is not None:
-                update_parts.append("first_name = ?")
-                params.append(first_name)
-            
-            if location is not None:
-                update_parts.append("location = ?")
-                params.append(location)
-            
-            if onboarding_step is not None:
-                update_parts.append("onboarding_step = ?")
-                params.append(onboarding_step)
-            
-            if onboarding_completed is not None:
-                update_parts.append("onboarding_completed = ?")
-                params.append(onboarding_completed)
-            
-            if stripe_customer_id is not None:
-                update_parts.append("stripe_customer_id = ?")
-                params.append(stripe_customer_id)
-            
-            if subscription_status is not None:
-                update_parts.append("subscription_status = ?")
-                params.append(subscription_status)
-            
-            if subscription_id is not None:
-                update_parts.append("subscription_id = ?")
-                params.append(subscription_id)
-            
-            update_parts.append("updated_date = CURRENT_TIMESTAMP")
-            params.append(phone)
-            
-            query = f"""
-                UPDATE user_profiles 
-                SET {', '.join(update_parts)}
-                WHERE phone = ?
-            """
-            
-            c.execute(query, params)
-            conn.commit()
-            logger.info(f"📝 Updated user profile for {phone}")
-            return True
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                
+                # Build dynamic update query
+                update_parts = []
+                params = []
+                
+                if first_name is not None:
+                    update_parts.append("first_name = %s")
+                    params.append(first_name)
+                
+                if location is not None:
+                    update_parts.append("location = %s")
+                    params.append(location)
+                
+                if onboarding_step is not None:
+                    update_parts.append("onboarding_step = %s")
+                    params.append(onboarding_step)
+                
+                if onboarding_completed is not None:
+                    update_parts.append("onboarding_completed = %s")
+                    params.append(onboarding_completed)
+                
+                if stripe_customer_id is not None:
+                    update_parts.append("stripe_customer_id = %s")
+                    params.append(stripe_customer_id)
+                
+                if subscription_status is not None:
+                    update_parts.append("subscription_status = %s")
+                    params.append(subscription_status)
+                
+                if subscription_id is not None:
+                    update_parts.append("subscription_id = %s")
+                    params.append(subscription_id)
+                
+                update_parts.append("updated_date = CURRENT_TIMESTAMP")
+                params.append(phone)
+                
+                query = f"""
+                    UPDATE user_profiles 
+                    SET {', '.join(update_parts)}
+                    WHERE phone = %s
+                """
+                
+                c.execute(query, params)
+                conn.commit()
+                logger.info(f"📝 Updated user profile for {phone}")
+                return True
     except Exception as e:
         logger.error(f"Error updating user profile for {phone}: {e}")
         return False
@@ -509,13 +547,13 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
 def log_onboarding_step(phone, step, response):
     """Log onboarding step response"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO onboarding_log (phone, step, response)
-                VALUES (?, ?, ?)
-            """, (phone, step, response))
-            conn.commit()
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO onboarding_log (phone, step, response)
+                    VALUES (%s, %s, %s)
+                """, (phone, step, response))
+                conn.commit()
     except Exception as e:
         logger.error(f"Error logging onboarding step: {e}")
 
@@ -606,14 +644,14 @@ def load_whitelist():
 def log_whitelist_event(phone, action, source='manual'):
     """Log whitelist addition/removal events"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO whitelist_events (phone, action, timestamp, source)
-                VALUES (?, ?, CURRENT_TIMESTAMP, ?)
-            """, (phone, action, source))
-            conn.commit()
-            logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO whitelist_events (phone, action, source)
+                    VALUES (%s, %s, %s)
+                """, (phone, action, source))
+                conn.commit()
+                logger.info(f"📋 Logged whitelist event: {action} for {phone} (source: {source})")
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
 
@@ -761,44 +799,57 @@ def send_sms(to_number, message, bypass_quota=False):
         return {"error": f"SMS send failed: {str(e)}"}
 
 def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO sms_delivery_log (phone, message_content, clicksend_response, delivery_status, message_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (phone, message_content, json.dumps(clicksend_response), delivery_status, message_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging SMS delivery: {e}")
 
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
-            VALUES (?, ?, ?, ?, ?)
-        """, (phone, role, content, intent_type, response_time_ms))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (phone, role, content, intent_type, response_time_ms))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving message: {e}")
 
 def load_history(phone, limit=4):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE phone = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (phone, limit))
-        rows = c.fetchall()
-    return [{"role": r, "content": t} for (r, t) in reversed(rows)]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT role, content
+                    FROM messages
+                    WHERE phone = %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                """, (phone, limit))
+                rows = c.fetchall()
+                return [{"role": row['role'], "content": row['content']} for row in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Error loading history: {e}")
+        return []
 
 def log_usage_analytics(phone, intent_type, success, response_time_ms):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
-            VALUES (?, ?, ?, ?)
-        """, (phone, intent_type, success, response_time_ms))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO usage_analytics (phone, intent_type, success, response_time_ms)
+                    VALUES (%s, %s, %s, %s)
+                """, (phone, intent_type, success, response_time_ms))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging usage analytics: {e}")
 
 def get_current_period_dates():
     now = datetime.now(timezone.utc)
@@ -812,52 +863,55 @@ def track_monthly_sms_usage(phone, is_outgoing=True):
     
     period_start, period_end = get_current_period_dates()
     
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        
-        c.execute("""
-            SELECT id, message_count, quota_warnings_sent, quota_exceeded
-            FROM monthly_sms_usage
-            WHERE phone = ? AND period_start = ?
-        """, (phone, period_start))
-        
-        result = c.fetchone()
-        
-        if result:
-            usage_id, current_count, warnings_sent, quota_exceeded = result
-            new_count = current_count + 1
-            
-            c.execute("""
-                UPDATE monthly_sms_usage 
-                SET message_count = ?, last_message_date = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (new_count, usage_id))
-        else:
-            new_count = 1
-            warnings_sent = 0
-            quota_exceeded = False
-            
-            c.execute("""
-                INSERT INTO monthly_sms_usage 
-                (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
-            
-            usage_id = c.lastrowid
-        
-        conn.commit()
-        
-        usage_info = {
-            "phone": phone,
-            "current_count": new_count,
-            "monthly_limit": MONTHLY_LIMIT,
-            "remaining": max(0, MONTHLY_LIMIT - new_count),
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-            "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
-        }
-        
-        return True, usage_info, None
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                
+                c.execute("""
+                    SELECT id, message_count, quota_warnings_sent, quota_exceeded
+                    FROM monthly_sms_usage
+                    WHERE phone = %s AND period_start = %s
+                """, (phone, period_start))
+                
+                result = c.fetchone()
+                
+                if result:
+                    usage_id, current_count, warnings_sent, quota_exceeded = result['id'], result['message_count'], result['quota_warnings_sent'], result['quota_exceeded']
+                    new_count = current_count + 1
+                    
+                    c.execute("""
+                        UPDATE monthly_sms_usage 
+                        SET message_count = %s, last_message_date = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    """, (new_count, usage_id))
+                else:
+                    new_count = 1
+                    warnings_sent = 0
+                    quota_exceeded = False
+                    
+                    c.execute("""
+                        INSERT INTO monthly_sms_usage 
+                        (phone, message_count, period_start, period_end, quota_warnings_sent, quota_exceeded)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (phone, new_count, period_start, period_end, warnings_sent, quota_exceeded))
+                
+                conn.commit()
+                
+                usage_info = {
+                    "phone": phone,
+                    "current_count": new_count,
+                    "monthly_limit": MONTHLY_LIMIT,
+                    "remaining": max(0, MONTHLY_LIMIT - new_count),
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "days_remaining": (period_end - datetime.now(timezone.utc).date()).days
+                }
+                
+                return True, usage_info, None
+                
+    except Exception as e:
+        logger.error(f"Error tracking monthly SMS usage: {e}")
+        return True, {}, None
 
 # === Content Filter ===
 class ContentFilter:
@@ -1118,14 +1172,14 @@ def save_usage(data):
 def log_stripe_event(event_type, customer_id, subscription_id, phone, status, additional_data=None):
     """Log Stripe webhook events for debugging"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO subscription_events (event_type, stripe_customer_id, subscription_id, phone, status, event_data)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (event_type, customer_id, subscription_id, phone, status, json.dumps(additional_data or {})))
-            conn.commit()
-            logger.info(f"📋 Logged Stripe event: {event_type} for customer {customer_id}")
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO subscription_events (event_type, stripe_customer_id, subscription_id, phone, status, event_data)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (event_type, customer_id, subscription_id, phone, status, json.dumps(additional_data or {})))
+                conn.commit()
+                logger.info(f"📋 Logged Stripe event: {event_type} for customer {customer_id}")
     except Exception as e:
         logger.error(f"Error logging Stripe event: {e}")
 
@@ -1192,31 +1246,31 @@ def handle_subscription_deleted(subscription):
     
     try:
         # Find user by customer ID
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT phone FROM user_profiles 
-                WHERE stripe_customer_id = ?
-            """, (customer_id,))
-            result = c.fetchone()
-            
-            if result:
-                phone = result[0]
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT phone FROM user_profiles 
+                    WHERE stripe_customer_id = %s
+                """, (customer_id,))
+                result = c.fetchone()
                 
-                # Update subscription status
-                update_user_profile(phone, subscription_status='cancelled')
-                
-                # Remove from whitelist
-                remove_from_whitelist(phone, send_goodbye=True)
-                
-                # Log the event
-                log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
-                
-                logger.info(f"✅ Subscription cancelled for {phone}")
-            else:
-                logger.warning(f"⚠️ No user found for customer {customer_id}")
-                log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'cancelled',
-                               {'error': 'No user found'})
+                if result:
+                    phone = result['phone']
+                    
+                    # Update subscription status
+                    update_user_profile(phone, subscription_status='cancelled')
+                    
+                    # Remove from whitelist
+                    remove_from_whitelist(phone, send_goodbye=True)
+                    
+                    # Log the event
+                    log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
+                    
+                    logger.info(f"✅ Subscription cancelled for {phone}")
+                else:
+                    logger.warning(f"⚠️ No user found for customer {customer_id}")
+                    log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'cancelled',
+                                   {'error': 'No user found'})
         
     except Exception as e:
         logger.error(f"❌ Error handling subscription deletion: {e}")
@@ -1228,43 +1282,129 @@ def handle_subscription_deleted(subscription):
 def get_all_users():
     """Admin endpoint to view all users with their profiles and onboarding status"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    up.phone, 
-                    up.first_name, 
-                    up.location, 
-                    up.onboarding_step,
-                    up.onboarding_completed,
-                    up.stripe_customer_id,
-                    up.subscription_status,
-                    up.created_date
-                FROM user_profiles up
-                ORDER BY up.created_date DESC
-            """)
-            
-            users = []
-            for row in c.fetchall():
-                users.append({
-                    'phone': row[0],
-                    'first_name': row[1],
-                    'location': row[2],
-                    'onboarding_step': row[3],
-                    'onboarding_completed': bool(row[4]),
-                    'stripe_customer_id': row[5],
-                    'subscription_status': row[6],
-                    'created_date': row[7]
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT 
+                        phone, first_name, location, onboarding_step,
+                        onboarding_completed, stripe_customer_id, subscription_status, created_date
+                    FROM user_profiles
+                    ORDER BY created_date DESC
+                """)
+                
+                users = []
+                for row in c.fetchall():
+                    users.append({
+                        'phone': row['phone'],
+                        'first_name': row['first_name'],
+                        'location': row['location'],
+                        'onboarding_step': row['onboarding_step'],
+                        'onboarding_completed': bool(row['onboarding_completed']),
+                        'stripe_customer_id': row['stripe_customer_id'],
+                        'subscription_status': row['subscription_status'],
+                        'created_date': row['created_date'].isoformat() if row['created_date'] else None
+                    })
+                
+                return jsonify({
+                    'total_users': len(users),
+                    'users': users,
+                    'database_type': 'PostgreSQL',
+                    'sms_char_limit': MAX_SMS_LENGTH
                 })
-            
-            return jsonify({
-                'total_users': len(users),
-                'users': users,
-                'sms_char_limit': MAX_SMS_LENGTH
-            })
-            
+                
     except Exception as e:
         logger.error(f"Error getting all users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/restore-user', methods=['POST'])
+def admin_restore_user():
+    """Admin endpoint to restore a user's complete profile"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        first_name = data.get('first_name')
+        location = data.get('location')
+        stripe_customer_id = data.get('stripe_customer_id')
+        subscription_status = data.get('subscription_status', 'active')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        if not first_name or not location:
+            return jsonify({"error": "first_name and location are required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # 1. Add to whitelist (without sending welcome)
+        success = add_to_whitelist(phone, send_welcome=False, source='admin_restore')
+        if success:
+            actions_taken.append("Added to whitelist")
+        
+        # 2. Create/update user profile with complete onboarding
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    # Delete existing profile if any
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    
+                    # Insert complete profile
+                    c.execute("""
+                        INSERT INTO user_profiles 
+                        (phone, first_name, location, onboarding_step, onboarding_completed, 
+                         stripe_customer_id, subscription_status, created_date, updated_date)
+                        VALUES (%s, %s, %s, 3, TRUE, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (phone, first_name, location, stripe_customer_id, subscription_status))
+                    
+                    conn.commit()
+                    actions_taken.append("Created complete user profile")
+                    
+                    # Log the restoration
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, 999, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"RESTORED: {first_name} in {location}"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged profile restoration")
+                    
+        except Exception as db_error:
+            logger.error(f"Database error restoring user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        # 3. Send confirmation SMS
+        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
+        
+        try:
+            result = send_sms(phone, confirmation_msg, bypass_quota=True)
+            if "error" not in result:
+                actions_taken.append("Sent confirmation SMS")
+                save_message(phone, "assistant", confirmation_msg, "profile_restored", 0)
+            else:
+                actions_taken.append(f"Failed to send SMS: {result['error']}")
+        except Exception as sms_error:
+            actions_taken.append(f"SMS error: {str(sms_error)}")
+        
+        logger.info(f"👤 Restored user profile: {first_name} ({phone}) in {location}")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Restored user profile for {first_name} ({phone})",
+            "actions_taken": actions_taken,
+            "profile": {
+                "phone": phone,
+                "first_name": first_name,
+                "location": location,
+                "onboarding_completed": True,
+                "stripe_customer_id": stripe_customer_id,
+                "subscription_status": subscription_status
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error restoring user: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/admin/whitelist', methods=['GET'])
@@ -1275,6 +1415,7 @@ def get_whitelist():
         return jsonify({
             'total_numbers': len(whitelist),
             'numbers': list(whitelist),
+            'database_type': 'PostgreSQL',
             'sms_char_limit': MAX_SMS_LENGTH
         })
     except Exception as e:
@@ -1301,6 +1442,7 @@ def admin_add_to_whitelist():
                 "success": True,
                 "message": f"Added {phone} to whitelist",
                 "welcome_sent": send_welcome,
+                "database_type": "PostgreSQL",
                 "sms_char_limit": MAX_SMS_LENGTH
             })
         else:
@@ -1338,83 +1480,6 @@ def admin_remove_from_whitelist():
         logger.error(f"Error in admin remove from whitelist: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/admin/sms-logs', methods=['GET'])
-def get_sms_logs():
-    """View recent SMS delivery logs"""
-    try:
-        limit = request.args.get('limit', 20, type=int)
-        
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT phone, message_content, delivery_status, message_id, timestamp
-                FROM sms_delivery_log
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
-            
-            logs = []
-            for row in c.fetchall():
-                content_preview = row[1][:100] + '...' if len(row[1]) > 100 else row[1]
-                logs.append({
-                    'phone': row[0],
-                    'message_content': content_preview,
-                    'message_length': len(row[1]),
-                    'delivery_status': row[2],
-                    'message_id': row[3],
-                    'timestamp': row[4]
-                })
-            
-            return jsonify({
-                'total_logs': len(logs),
-                'logs': logs,
-                'sms_char_limit': MAX_SMS_LENGTH
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting SMS logs: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/test-sms', methods=['POST'])
-def admin_test_sms():
-    """Admin endpoint to send test SMS"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        message = data.get('message', f'Test message from Hey Alex admin panel - now supporting up to {MAX_SMS_LENGTH} characters for longer, more detailed responses!')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Truncate message if needed
-        original_length = len(message)
-        message = truncate_response(message, MAX_SMS_LENGTH)
-        
-        # Send SMS bypassing quota
-        result = send_sms(phone, message, bypass_quota=True)
-        
-        if "error" not in result:
-            return jsonify({
-                "success": True,
-                "message": f"Test SMS sent to {phone}",
-                "message_length": len(message),
-                "original_length": original_length,
-                "truncated": original_length > len(message),
-                "sms_char_limit": MAX_SMS_LENGTH,
-                "clicksend_response": result
-            })
-        else:
-            return jsonify({
-                "success": False,
-                "error": result["error"]
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"Error in admin test SMS: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/admin/reset-user', methods=['POST'])
 def admin_reset_user():
     """Reset a user completely - remove from whitelist and database"""
@@ -1434,15 +1499,19 @@ def admin_reset_user():
             actions_taken.append("Removed from whitelist")
         
         # Remove user profile and related data
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM user_profiles WHERE phone = ?", (phone,))
-            c.execute("DELETE FROM messages WHERE phone = ?", (phone,))
-            c.execute("DELETE FROM monthly_sms_usage WHERE phone = ?", (phone,))
-            c.execute("DELETE FROM onboarding_log WHERE phone = ?", (phone,))
-            c.execute("DELETE FROM sms_delivery_log WHERE phone = ?", (phone,))
-            conn.commit()
-            actions_taken.append("Removed from database")
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM sms_delivery_log WHERE phone = %s", (phone,))
+                    conn.commit()
+                    actions_taken.append("Removed from database")
+        except Exception as db_error:
+            logger.error(f"Database error resetting user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
         
         return jsonify({
             "success": True,
@@ -1454,352 +1523,29 @@ def admin_reset_user():
         logger.error(f"Error resetting user: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/admin/subscription-events', methods=['GET'])
-def get_subscription_events():
-    """View recent Stripe subscription events"""
+@app.route('/admin/sms-logs', methods=['GET'])
+def get_sms_logs():
+    """View recent SMS delivery logs"""
     try:
         limit = request.args.get('limit', 20, type=int)
         
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT event_type, stripe_customer_id, subscription_id, phone, status, timestamp
-                FROM subscription_events
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
-            
-            events = []
-            for row in c.fetchall():
-                events.append({
-                    'event_type': row[0],
-                    'stripe_customer_id': row[1],
-                    'subscription_id': row[2],
-                    'phone': row[3],
-                    'status': row[4],
-                    'timestamp': row[5]
-                })
-            
-            return jsonify({
-                'total_events': len(events),
-                'events': events
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting subscription events: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/test-stripe-flow', methods=['POST'])
-def test_stripe_flow():
-    """Test endpoint to simulate Stripe subscription events"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        event_type = data.get('event_type', 'customer.subscription.created')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        logger.info(f"🧪 Simulating Stripe event: {event_type} for {phone}")
-        
-        actions_taken = []
-        
-        if event_type == 'customer.subscription.created':
-            # Simulate new subscription
-            fake_customer_id = f"cus_test_{int(time.time())}"
-            fake_subscription_id = f"sub_test_{int(time.time())}"
-            
-            # Add to whitelist and send onboarding
-            success = add_to_whitelist(phone, send_welcome=True, source='test_stripe')
-            if success:
-                actions_taken.append("Added to whitelist")
-                actions_taken.append("Sent onboarding SMS")
-                actions_taken.append("Created user profile")
-            
-            # Log the simulated event
-            log_stripe_event(event_type, fake_customer_id, fake_subscription_id, phone, 'active')
-            actions_taken.append("Logged subscription event")
-            
-            return jsonify({
-                "success": True,
-                "message": f"Simulated subscription creation for {phone}",
-                "actions_taken": actions_taken,
-                "sms_char_limit": MAX_SMS_LENGTH
-            })
-        
-        elif event_type == 'customer.subscription.deleted':
-            # Simulate subscription cancellation
-            success = remove_from_whitelist(phone, send_goodbye=True)
-            if success:
-                actions_taken.append("Removed from whitelist")
-                actions_taken.append("Sent goodbye SMS")
-            
-            return jsonify({
-                "success": True,
-                "message": f"Simulated subscription cancellation for {phone}",
-                "actions_taken": actions_taken
-            })
-        
-        else:
-            return jsonify({"error": f"Unsupported event type: {event_type}"}), 400
-            
-    except Exception as e:
-        logger.error(f"Error in test Stripe flow: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# === STRIPE WEBHOOK ===
-@app.route('/webhook/stripe', methods=['POST'])
-def stripe_webhook():
-    """Handle Stripe webhook events"""
-    payload = request.data
-    sig_header = request.headers.get('Stripe-Signature')
-    
-    if not sig_header:
-        logger.error("Missing Stripe signature header")
-        return jsonify({'error': 'Missing signature header'}), 400
-    
-    try:
-        # Verify webhook signature
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-        
-        logger.info(f"📨 Received Stripe webhook: {event['type']}")
-        
-        # Handle different event types
-        if event['type'] == 'customer.subscription.created':
-            handle_subscription_created(event['data']['object'])
-        
-        elif event['type'] == 'customer.subscription.deleted':
-            handle_subscription_deleted(event['data']['object'])
-        
-        elif event['type'] == 'customer.subscription.updated':
-            # Handle subscription updates (payment method changes, etc.)
-            subscription = event['data']['object']
-            logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
-        
-        elif event['type'] == 'invoice.payment_failed':
-            # Handle failed payments
-            invoice = event['data']['object']
-            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
-        
-        elif event['type'] == 'invoice.payment_succeeded':
-            # Handle successful payments
-            invoice = event['data']['object']
-            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
-        
-        else:
-            logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
-        
-        return jsonify({'status': 'success'}), 200
-        
-    except ValueError as e:
-        logger.error(f"❌ Invalid payload: {e}")
-        return jsonify({'error': 'Invalid payload'}), 400
-    except stripe.error.SignatureVerificationError as e:
-        logger.error(f"❌ Invalid signature: {e}")
-        return jsonify({'error': 'Invalid signature'}), 400
-    except Exception as e:
-        logger.error(f"💥 Error processing Stripe webhook: {e}")
-        return jsonify({'error': 'Webhook processing failed'}), 500
-
-# === MAIN SMS WEBHOOK ===
-@app.route("/sms", methods=["POST"])
-@handle_errors  
-def sms_webhook():
-    start_time = time.time()
-    
-    sender = request.form.get("from")
-    body = (request.form.get("body") or "").strip()
-    
-    logger.info(f"📱 SMS received from {sender}: {repr(body)}")
-    
-    if not sender:
-        return jsonify({"error": "Missing 'from' field"}), 400
-    
-    if not body:
-        return jsonify({"message": "Empty message received"}), 200
-    
-    # Check whitelist
-    whitelist = load_whitelist()
-    if sender not in whitelist:
-        logger.warning(f"🚫 Unauthorized sender: {sender}")
-        return jsonify({"message": "Unauthorized sender"}), 403
-    
-    # Content filtering
-    is_valid, filter_reason = content_filter.is_valid_query(body)
-    if not is_valid:
-        logger.warning(f"🚫 Content filtered for {sender}: {filter_reason}")
-        return jsonify({"message": "Content filtered"}), 400
-    
-    # Save user message
-    save_message(sender, "user", body)
-    
-    # Handle special commands
-    if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
-        try:
-            send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Unsubscribe processed"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send unsubscribe message: {e}")
-            return jsonify({"error": "Failed to process unsubscribe"}), 500
-    
-    if body.lower() in ['start', 'subscribe', 'resume']:
-        # Check if user is already onboarded
-        if is_user_onboarded(sender):
-            response_msg = WELCOME_MSG
-        else:
-            # Start or restart onboarding
-            create_user_profile(sender)
-            response_msg = ONBOARDING_NAME_MSG
-        
-        try:
-            send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "start_command", 0)
-            return jsonify({"message": "Start message sent"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send start message: {e}")
-            return jsonify({"error": "Failed to send start message"}), 500
-    
-    # Check if user needs to complete onboarding
-    profile = get_user_profile(sender)
-    logger.info(f"👤 User profile for {sender}: {profile}")
-    
-    if not profile:
-        # No profile exists - create one and start onboarding
-        logger.info(f"📝 No profile found for {sender}, creating new profile")
-        create_user_profile(sender)
-        
-        try:
-            send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
-            save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"message": "Onboarding started for new user"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send onboarding start message: {e}")
-            return jsonify({"error": "Failed to start onboarding"}), 500
-    
-    elif not profile['onboarding_completed']:
-        # Profile exists but onboarding not complete
-        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
-        
-        try:
-            response_msg = handle_onboarding_response(sender, body)
-            
-            # Send response
-            result = send_sms(sender, response_msg)
-            
-            if "error" not in result:
-                logger.info(f"✅ Onboarding response sent to {sender}")
-                return jsonify({"message": "Onboarding response sent"}), 200
-            else:
-                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
-                return jsonify({"error": "Failed to send onboarding response"}), 500
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT phone, message_content, delivery_status, message_id, timestamp
+                    FROM sms_delivery_log
+                    ORDER BY timestamp DESC
+                    LIMIT %s
+                """, (limit,))
                 
-        except Exception as e:
-            logger.error(f"💥 Onboarding error for {sender}: {e}")
-            fallback_msg = "Sorry, there was an error during setup. Please try again."
-            try:
-                send_sms(sender, fallback_msg, bypass_quota=True)
-                return jsonify({"message": "Onboarding fallback sent"}), 200
-            except Exception as fallback_error:
-                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
-                return jsonify({"error": "Onboarding failed"}), 500
-    
-    # User is fully onboarded - continue to normal processing
-    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
-    
-    # User is onboarded, process normal queries
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
-    # Get user context for personalized responses
-    user_context = get_user_context_for_queries(sender)
-    
-    try:
-        # Process based on intent
-        if intent and intent.type == "weather":
-            # Use user's location if no city specified and user is onboarded
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-        else:
-            # Use Claude for general queries with user context
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            # If Claude suggests a search, perform it
-            if "Let me search for" in response_msg:
-                search_term = body
-                # Add location context to search if available
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
-        
-        # Apply intelligent truncation for SMS limits
-        original_length = len(response_msg)
-        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-        
-        if original_length > len(response_msg):
-            logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
-        
-        # Save assistant response
-        response_time = int((time.time() - start_time) * 1000)
-        save_message(sender, "assistant", response_msg, intent_type, response_time)
-        
-        # Send main response
-        result = send_sms(sender, response_msg)
-        
-        if "error" not in result:
-            log_usage_analytics(sender, intent_type, True, response_time)
-            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars)")
-            return jsonify({"message": "Response sent successfully"}), 200
-        else:
-            log_usage_analytics(sender, intent_type, False, response_time)
-            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
-            return jsonify({"error": "Failed to send response"}), 500
-            
-    except Exception as e:
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(sender, intent_type, False, response_time)
-        logger.error(f"💥 Processing error for {sender}: {e}")
-        
-        # Send fallback response
-        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
-        try:
-            send_sms(sender, fallback_msg, bypass_quota=True)
-            return jsonify({"message": "Fallback response sent"}), 200
-        except Exception as fallback_error:
-            logger.error(f"Failed to send fallback message: {fallback_error}")
-            return jsonify({"error": "Processing failed"}), 500
-
-# === HEALTH CHECK ===
-@app.route('/')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'version': APP_VERSION,
-        'latest_changes': CHANGELOG[APP_VERSION],
-        'sms_char_limit': MAX_SMS_LENGTH,
-        'clicksend_max_limit': CLICKSEND_MAX_LENGTH
-    })
-
-# Initialize database on startup
-init_db()
-
-if __name__ == "__main__":
-    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
-    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
-    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+                logs = []
+                for row in c.fetchall():
+                    content_preview = row['message_content'][:100] + '...' if len(row['message_content']) > 100 else row['message_content']
+                    logs.append({
+                        'phone': row['phone'],
+                        'message_content': content_preview,
+                        'message_length': len(row['message_content']),
+                        'delivery_status': row['delivery_status'],
+                        'message_id': row['message_id'],
+                        'timestamp': row['timestamp'].isoformat() if row['timestamp'] else None
+                    })
