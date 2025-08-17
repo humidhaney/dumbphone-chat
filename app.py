@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 CHANGELOG = {
+    "3.2": "Added admin endpoints: /admin/reset-user and /admin/whitelist/remove for user management",
     "3.1": "Fixed PostgreSQL imports - updated from psycopg2 to psycopg3 for compatibility",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
