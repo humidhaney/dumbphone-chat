@@ -192,9 +192,22 @@ def init_db():
             
             logger.info("✅ SQLite tables created successfully")
         
-        # Check for existing data
-        user_count = execute_query("SELECT COUNT(*) FROM user_profiles", fetchone=True)[0]
-        message_count = execute_query("SELECT COUNT(*) FROM messages", fetchone=True)[0]
+        # Check for existing data - use explicit column names for psycopg3
+        user_result = execute_query("SELECT COUNT(*) as count FROM user_profiles", fetchone=True)
+        message_result = execute_query("SELECT COUNT(*) as count FROM messages", fetchone=True)
+        
+        if USE_POSTGRES and PSYCOPG_VERSION == 3:
+            # psycopg3 with dict_row returns dict-like results
+            user_count = user_result['count']
+            message_count = message_result['count']
+        elif USE_POSTGRES:
+            # psycopg2 with RealDictCursor returns dict-like results
+            user_count = user_result['count']
+            message_count = message_result['count']
+        else:
+            # SQLite returns tuple
+            user_count = user_result[0]
+            message_count = message_result[0]
         
         logger.info(f"📊 Database initialized successfully")
         logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
@@ -216,8 +229,16 @@ def home():
 def health_check():
     """Health check endpoint with database status"""
     try:
-        # Test database connection
-        user_count = execute_query("SELECT COUNT(*) FROM user_profiles", fetchone=True)[0]
+        # Test database connection - use explicit column name
+        user_result = execute_query("SELECT COUNT(*) as count FROM user_profiles", fetchone=True)
+        
+        if USE_POSTGRES:
+            # Both psycopg2 and psycopg3 return dict-like results with proper cursor factory
+            user_count = user_result['count']
+        else:
+            # SQLite returns tuple
+            user_count = user_result[0]
+            
         db_status = "✅ Connected"
     except Exception as e:
         db_status = f"❌ Error: {str(e)}"
@@ -263,7 +284,7 @@ def test_database():
                 VALUES (?, ?, ?, ?)
             """, (test_phone, "Test User", "Test City", True))
         
-        # Get user profile
+        # Get user profile - use explicit column names
         profile = execute_query("""
             SELECT first_name, location, onboarding_completed
             FROM user_profiles
@@ -274,16 +295,7 @@ def test_database():
             WHERE phone = ?
         """, (test_phone,), fetchone=True)
         
-        # Save test message
-        execute_query("""
-            INSERT INTO messages (phone, role, content)
-            VALUES (%s, %s, %s)
-        """ if USE_POSTGRES else """
-            INSERT INTO messages (phone, role, content)
-            VALUES (?, ?, ?)
-        """, (test_phone, "user", "test message"))
-        
-        # Load history
+        # Load history - use explicit column names
         history = execute_query("""
             SELECT role, content
             FROM messages
@@ -298,11 +310,21 @@ def test_database():
             LIMIT 1
         """, (test_phone,), fetchall=True)
         
+        # Format results based on database type
+        if USE_POSTGRES:
+            # Both psycopg2 and psycopg3 return dict-like results
+            profile_dict = dict(profile)
+            history_list = [dict(h) for h in history]
+        else:
+            # SQLite returns tuples
+            profile_dict = {"first_name": profile[0], "location": profile[1], "onboarding_completed": bool(profile[2])}
+            history_list = [{"role": h[0], "content": h[1]} for h in history]
+        
         return jsonify({
             "status": "success",
             "database_type": f"PostgreSQL (psycopg{PSYCOPG_VERSION})" if USE_POSTGRES else "SQLite",
-            "test_profile": dict(profile) if USE_POSTGRES else {"first_name": profile[0], "location": profile[1], "onboarding_completed": bool(profile[2])},
-            "test_history": [dict(h) if USE_POSTGRES else {"role": h[0], "content": h[1]} for h in history]
+            "test_profile": profile_dict,
+            "test_history": history_list
         })
         
     except Exception as e:
