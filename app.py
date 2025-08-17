@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 CHANGELOG = {
+    "3.3": "CRITICAL: Moved whitelist from file to database - fixes users being removed on every deployment",
     "3.2": "Fixed subscription webhook handling - now processes invoice.payment_succeeded events to auto-whitelist new subscribers",
     "3.1": "Added 'END SUBSCRIPTION' command for proper Stripe subscription cancellation, integrated into onboarding flow",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
@@ -523,11 +524,25 @@ def handle_onboarding_response(phone, message):
 
 # === Whitelist Management ===
 def load_whitelist():
+    """Load whitelist from database instead of file"""
     try:
-        with open(WHITELIST_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return set()
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT DISTINCT phone FROM user_profiles 
+                    WHERE subscription_status = 'active' 
+                    AND onboarding_completed = TRUE
+                """)
+                results = c.fetchall()
+                return set(row['phone'] for row in results)
+    except Exception as e:
+        logger.error(f"Error loading whitelist from database: {e}")
+        # Fallback to file-based whitelist
+        try:
+            with open(WHITELIST_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            return set()
 
 def log_whitelist_event(phone, action, source='manual'):
     """Log whitelist addition/removal events"""
@@ -544,77 +559,90 @@ def log_whitelist_event(phone, action, source='manual'):
         logger.error(f"Error logging whitelist event: {e}")
 
 def add_to_whitelist(phone, send_welcome=True, source='manual'):
-    """Enhanced whitelist addition with automatic welcome message and onboarding"""
+    """Enhanced whitelist addition - uses database as primary source"""
     if not phone:
         return False
         
     phone = normalize_phone_number(phone)
-    wl = load_whitelist()
     
-    is_new_user = phone not in wl
+    # Always log the whitelist event
+    log_whitelist_event(phone, "added", source)
+    logger.info(f"📱 Added user {phone} to whitelist (source: {source})")
     
-    if is_new_user:
+    # Create user profile if it doesn't exist
+    existing_profile = get_user_profile(phone)
+    if not existing_profile:
+        create_user_profile(phone)
+    
+    # Update subscription status to active (this effectively whitelists them)
+    update_user_profile(phone, subscription_status='active')
+    
+    # Also add to file for backward compatibility
+    try:
+        wl = set()
         try:
+            with open(WHITELIST_FILE, "r") as f:
+                wl = set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            pass
+        
+        if phone not in wl:
             with open(WHITELIST_FILE, "a") as f:
                 f.write(phone + "\n")
-            
-            log_whitelist_event(phone, "added", source)
-            logger.info(f"📱 Added new user {phone} to whitelist (source: {source})")
-            
-            create_user_profile(phone)
-            
-            if send_welcome:
-                try:
-                    result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
-                    if "error" not in result:
-                        logger.info(f"🎉 Onboarding started for new user {phone}")
-                        save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-                    else:
-                        logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
-                except Exception as sms_error:
-                    logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Failed to add {phone} to whitelist: {e}")
-            return False
-    else:
-        logger.info(f"📱 {phone} already in whitelist")
-        return True
+    except Exception as e:
+        logger.warning(f"Failed to update whitelist file: {e}")
+    
+    if send_welcome and not existing_profile:
+        try:
+            result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+            if "error" not in result:
+                logger.info(f"🎉 Onboarding started for new user {phone}")
+                save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+            else:
+                logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
+        except Exception as sms_error:
+            logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
+    
+    return True
 
 def remove_from_whitelist(phone, send_goodbye=False):
-    """Enhanced whitelist removal with optional goodbye message"""
+    """Enhanced whitelist removal - updates database"""
     if not phone:
         return False
         
     phone = normalize_phone_number(phone)
-    wl = load_whitelist()
     
-    if phone in wl:
+    # Update database
+    update_user_profile(phone, subscription_status='cancelled')
+    log_whitelist_event(phone, "removed")
+    logger.info(f"📱 Removed {phone} from whitelist")
+    
+    # Also remove from file for backward compatibility
+    try:
+        wl = set()
         try:
+            with open(WHITELIST_FILE, "r") as f:
+                wl = set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            pass
+        
+        if phone in wl:
             wl.remove(phone)
             with open(WHITELIST_FILE, "w") as f:
                 for num in wl:
                     f.write(num + "\n")
-            
-            log_whitelist_event(phone, "removed")
-            logger.info(f"📱 Removed {phone} from whitelist")
-            
-            if send_goodbye:
-                goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
-                try:
-                    send_sms(phone, goodbye_msg, bypass_quota=True)
-                    logger.info(f"👋 Goodbye message sent to {phone}")
-                except Exception as sms_error:
-                    logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Failed to remove {phone} from whitelist: {e}")
-            return False
-    else:
-        logger.info(f"📱 {phone} not in whitelist")
-        return True
+    except Exception as e:
+        logger.warning(f"Failed to update whitelist file: {e}")
+    
+    if send_goodbye:
+        goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
+        try:
+            send_sms(phone, goodbye_msg, bypass_quota=True)
+            logger.info(f"👋 Goodbye message sent to {phone}")
+        except Exception as sms_error:
+            logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
+    
+    return True
 
 # === SMS Functions ===
 def send_sms(to_number, message, bypass_quota=False):
