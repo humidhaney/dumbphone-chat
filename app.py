@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 CHANGELOG = {
+    "3.2": "COST OPTIMIZATION: Reduced to 200 messages/month with 160-char limit for sustainable pricing ($12/month cost vs $20 revenue)",
     "3.1": "Added comprehensive admin endpoints: remove-user, reset-user, and restore-user for complete user management",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
@@ -100,11 +101,11 @@ if ANTHROPIC_API_KEY:
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
-MONTHLY_LIMIT = 300
+MONTHLY_LIMIT = 200
 RESET_DAYS = 30
 
 # SMS Response Limits
-MAX_SMS_LENGTH = 720
+MAX_SMS_LENGTH = 160
 CLICKSEND_MAX_LENGTH = 1600
 
 # WELCOME MESSAGE
@@ -128,7 +129,7 @@ ONBOARDING_LOCATION_MSG = (
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 300 messages per month. Try asking \"weather today\" to start!"
+    "You get 200 messages per month. Try asking \"weather today\" to start!"
 )
 
 # === Error Handling Decorator ===
@@ -868,13 +869,13 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- You can now provide responses up to {MAX_SMS_LENGTH} characters (increased from 500)
-- Give more detailed, thorough answers while staying within the character limit
-- Be friendly and helpful with comprehensive information
+- Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part)
+- Be concise but helpful - provide key information quickly
+- Be friendly and conversational but brief
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Be conversational and provide valuable, complete answers"""
+- Prioritize the most important information first in short responses"""
         
         try:
             headers = {
@@ -1643,6 +1644,7 @@ def health_check():
         'latest_changes': CHANGELOG[APP_VERSION],
         'database_type': 'PostgreSQL',
         'sms_char_limit': MAX_SMS_LENGTH,
+        'monthly_message_limit': MONTHLY_LIMIT,
         'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
         'admin_endpoints': [
             '/admin/remove-user',
@@ -1658,6 +1660,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
     logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
-    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
+    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters (1 SMS part)")
+    logger.info(f"📊 Monthly message limit: {MONTHLY_LIMIT} messages")
     logger.info(f"🔧 Admin endpoints available: /admin/remove-user, /admin/reset-user, /admin/restore-user")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
