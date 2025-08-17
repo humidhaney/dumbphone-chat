@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import psycopg
-from psycopg.rows import dict_row
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
@@ -41,11 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.3"
+APP_VERSION = "3.1"
 CHANGELOG = {
-    "3.3": "CRITICAL: Moved whitelist from file to database - fixes users being removed on every deployment",
-    "3.2": "Fixed subscription webhook handling - now processes invoice.payment_succeeded events to auto-whitelist new subscribers",
-    "3.1": "Added 'END SUBSCRIPTION' command for proper Stripe subscription cancellation, integrated into onboarding flow",
+    "3.1": "Added comprehensive admin endpoints: remove-user, reset-user, and restore-user for complete user management",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
     "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
@@ -109,6 +107,14 @@ RESET_DAYS = 30
 MAX_SMS_LENGTH = 720
 CLICKSEND_MAX_LENGTH = 1600
 
+# WELCOME MESSAGE
+WELCOME_MSG = (
+    "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
+    "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
+    "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
+    "Try asking \"weather today\" to get started."
+)
+
 # ONBOARDING MESSAGES
 ONBOARDING_NAME_MSG = (
     "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant. "
@@ -122,16 +128,7 @@ ONBOARDING_LOCATION_MSG = (
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 300 messages per month. Try asking \"weather today\" to start! "
-    "\n\n💡 To cancel anytime, just text \"END SUBSCRIPTION\""
-)
-
-# WELCOME MESSAGE (for returning users)
-WELCOME_MSG = (
-    "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
-    "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
-    "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
-    "Try asking \"weather today\" to get started. To cancel anytime, text \"END SUBSCRIPTION\""
+    "You get 300 messages per month. Try asking \"weather today\" to start!"
 )
 
 # === Error Handling Decorator ===
@@ -151,7 +148,7 @@ def get_db_connection():
     """Context manager for PostgreSQL connections"""
     conn = None
     try:
-        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         yield conn
     except Exception as e:
         if conn:
@@ -353,14 +350,21 @@ def get_user_profile(phone):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT first_name, location, onboarding_step, onboarding_completed, 
-                           stripe_customer_id, subscription_status, subscription_id
+                           stripe_customer_id, subscription_status
                     FROM user_profiles
                     WHERE phone = %s
                 """, (phone,))
                 result = c.fetchone()
                 
                 if result:
-                    return dict(result)
+                    return {
+                        'first_name': result['first_name'],
+                        'location': result['location'],
+                        'onboarding_step': result['onboarding_step'],
+                        'onboarding_completed': bool(result['onboarding_completed']),
+                        'stripe_customer_id': result['stripe_customer_id'],
+                        'subscription_status': result['subscription_status']
+                    }
                 else:
                     return None
     except Exception as e:
@@ -524,25 +528,11 @@ def handle_onboarding_response(phone, message):
 
 # === Whitelist Management ===
 def load_whitelist():
-    """Load whitelist from database instead of file"""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT DISTINCT phone FROM user_profiles 
-                    WHERE subscription_status = 'active' 
-                    AND onboarding_completed = TRUE
-                """)
-                results = c.fetchall()
-                return set(row['phone'] for row in results)
-    except Exception as e:
-        logger.error(f"Error loading whitelist from database: {e}")
-        # Fallback to file-based whitelist
-        try:
-            with open(WHITELIST_FILE, "r") as f:
-                return set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            return set()
+        with open(WHITELIST_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
 
 def log_whitelist_event(phone, action, source='manual'):
     """Log whitelist addition/removal events"""
@@ -559,90 +549,77 @@ def log_whitelist_event(phone, action, source='manual'):
         logger.error(f"Error logging whitelist event: {e}")
 
 def add_to_whitelist(phone, send_welcome=True, source='manual'):
-    """Enhanced whitelist addition - uses database as primary source"""
+    """Enhanced whitelist addition with automatic welcome message and onboarding"""
     if not phone:
         return False
         
     phone = normalize_phone_number(phone)
+    wl = load_whitelist()
     
-    # Always log the whitelist event
-    log_whitelist_event(phone, "added", source)
-    logger.info(f"📱 Added user {phone} to whitelist (source: {source})")
+    is_new_user = phone not in wl
     
-    # Create user profile if it doesn't exist
-    existing_profile = get_user_profile(phone)
-    if not existing_profile:
-        create_user_profile(phone)
-    
-    # Update subscription status to active (this effectively whitelists them)
-    update_user_profile(phone, subscription_status='active')
-    
-    # Also add to file for backward compatibility
-    try:
-        wl = set()
+    if is_new_user:
         try:
-            with open(WHITELIST_FILE, "r") as f:
-                wl = set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            pass
-        
-        if phone not in wl:
             with open(WHITELIST_FILE, "a") as f:
                 f.write(phone + "\n")
-    except Exception as e:
-        logger.warning(f"Failed to update whitelist file: {e}")
-    
-    if send_welcome and not existing_profile:
-        try:
-            result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
-            if "error" not in result:
-                logger.info(f"🎉 Onboarding started for new user {phone}")
-                save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            else:
-                logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
-        except Exception as sms_error:
-            logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
-    
-    return True
+            
+            log_whitelist_event(phone, "added", source)
+            logger.info(f"📱 Added new user {phone} to whitelist (source: {source})")
+            
+            create_user_profile(phone)
+            
+            if send_welcome:
+                try:
+                    result = send_sms(phone, ONBOARDING_NAME_MSG, bypass_quota=True)
+                    if "error" not in result:
+                        logger.info(f"🎉 Onboarding started for new user {phone}")
+                        save_message(phone, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+                    else:
+                        logger.error(f"Failed to send onboarding SMS to {phone}: {result['error']}")
+                except Exception as sms_error:
+                    logger.error(f"Failed to send onboarding SMS to {phone}: {sms_error}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add {phone} to whitelist: {e}")
+            return False
+    else:
+        logger.info(f"📱 {phone} already in whitelist")
+        return True
 
 def remove_from_whitelist(phone, send_goodbye=False):
-    """Enhanced whitelist removal - updates database"""
+    """Enhanced whitelist removal with optional goodbye message"""
     if not phone:
         return False
         
     phone = normalize_phone_number(phone)
+    wl = load_whitelist()
     
-    # Update database
-    update_user_profile(phone, subscription_status='cancelled')
-    log_whitelist_event(phone, "removed")
-    logger.info(f"📱 Removed {phone} from whitelist")
-    
-    # Also remove from file for backward compatibility
-    try:
-        wl = set()
+    if phone in wl:
         try:
-            with open(WHITELIST_FILE, "r") as f:
-                wl = set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            pass
-        
-        if phone in wl:
             wl.remove(phone)
             with open(WHITELIST_FILE, "w") as f:
                 for num in wl:
                     f.write(num + "\n")
-    except Exception as e:
-        logger.warning(f"Failed to update whitelist file: {e}")
-    
-    if send_goodbye:
-        goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
-        try:
-            send_sms(phone, goodbye_msg, bypass_quota=True)
-            logger.info(f"👋 Goodbye message sent to {phone}")
-        except Exception as sms_error:
-            logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
-    
-    return True
+            
+            log_whitelist_event(phone, "removed")
+            logger.info(f"📱 Removed {phone} from whitelist")
+            
+            if send_goodbye:
+                goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
+                try:
+                    send_sms(phone, goodbye_msg, bypass_quota=True)
+                    logger.info(f"👋 Goodbye message sent to {phone}")
+                except Exception as sms_error:
+                    logger.error(f"Failed to send goodbye SMS to {phone}: {sms_error}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to remove {phone} from whitelist: {e}")
+            return False
+    else:
+        logger.info(f"📱 {phone} not in whitelist")
+        return True
 
 # === SMS Functions ===
 def send_sms(to_number, message, bypass_quota=False):
@@ -788,7 +765,7 @@ class ContentFilter:
         if len(text) > 500:
             return False, "Query too long"
         
-        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks']
+        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks', 'stop', 'start']
         if text.lower() in short_allowed:
             return True, ""
         
@@ -1006,63 +983,6 @@ def extract_phone_from_stripe_metadata(metadata):
     
     return None
 
-def cancel_user_subscription(phone):
-    """Cancel user's Stripe subscription and remove from service"""
-    try:
-        profile = get_user_profile(phone)
-        if not profile:
-            return {"success": False, "message": "No user profile found"}
-        
-        stripe_customer_id = profile.get('stripe_customer_id')
-        subscription_id = profile.get('subscription_id')
-        
-        if not stripe_customer_id:
-            logger.warning(f"No Stripe customer ID found for {phone}")
-            return {"success": False, "message": "No active subscription found"}
-        
-        # Cancel the Stripe subscription
-        try:
-            if subscription_id:
-                # Cancel specific subscription
-                cancelled_subscription = stripe.Subscription.modify(
-                    subscription_id,
-                    cancel_at_period_end=True  # Cancel at end of billing period
-                )
-                logger.info(f"✅ Stripe subscription {subscription_id} set to cancel at period end")
-            else:
-                # Find and cancel active subscriptions for customer
-                subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='active')
-                
-                if subscriptions.data:
-                    for subscription in subscriptions.data:
-                        cancelled_subscription = stripe.Subscription.modify(
-                            subscription.id,
-                            cancel_at_period_end=True
-                        )
-                        logger.info(f"✅ Stripe subscription {subscription.id} set to cancel at period end")
-                else:
-                    logger.warning(f"No active subscriptions found for customer {stripe_customer_id}")
-                    return {"success": False, "message": "No active subscription found"}
-            
-        except stripe.error.StripeError as e:
-            logger.error(f"❌ Stripe cancellation error: {e}")
-            return {"success": False, "message": f"Subscription cancellation failed: {str(e)}"}
-        
-        # Update user profile
-        update_user_profile(phone, subscription_status='cancelled')
-        
-        # Remove from whitelist
-        remove_from_whitelist(phone, send_goodbye=False)  # We'll send custom message
-        
-        # Log the cancellation
-        log_stripe_event('user_requested_cancellation', stripe_customer_id, subscription_id, phone, 'cancelled')
-        
-        return {"success": True, "message": "Subscription cancelled successfully"}
-        
-    except Exception as e:
-        logger.error(f"💥 Error cancelling subscription for {phone}: {e}")
-        return {"success": False, "message": "Cancellation processing failed"}
-
 def handle_subscription_created(subscription):
     """Handle new subscription creation"""
     customer_id = subscription['customer']
@@ -1136,6 +1056,211 @@ def handle_subscription_deleted(subscription):
                         {'error': str(e)})
 
 # === ADMIN ENDPOINTS ===
+@app.route('/admin/remove-user', methods=['POST'])
+def admin_remove_user():
+    """Admin endpoint to completely remove a user and their data"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # Remove from whitelist
+        success = remove_from_whitelist(phone, send_goodbye=True)
+        if success:
+            actions_taken.append("Removed from whitelist")
+        
+        # Remove user profile and related data
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    # Get user info before deletion for logging
+                    c.execute("SELECT first_name, location FROM user_profiles WHERE phone = %s", (phone,))
+                    user_info = c.fetchone()
+                    
+                    # Delete user profile
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    profile_deleted = c.rowcount
+                    
+                    # Delete messages
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    messages_deleted = c.rowcount
+                    
+                    # Delete onboarding log
+                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
+                    onboarding_deleted = c.rowcount
+                    
+                    # Delete usage analytics
+                    c.execute("DELETE FROM usage_analytics WHERE phone = %s", (phone,))
+                    analytics_deleted = c.rowcount
+                    
+                    # Delete SMS delivery log
+                    c.execute("DELETE FROM sms_delivery_log WHERE phone = %s", (phone,))
+                    sms_log_deleted = c.rowcount
+                    
+                    # Delete monthly usage
+                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
+                    usage_deleted = c.rowcount
+                    
+                    # Delete whitelist events
+                    c.execute("DELETE FROM whitelist_events WHERE phone = %s", (phone,))
+                    whitelist_events_deleted = c.rowcount
+                    
+                    # Delete subscription events (keep for audit trail but mark as deleted)
+                    c.execute("""
+                        UPDATE subscription_events 
+                        SET status = 'user_deleted', processed = TRUE
+                        WHERE phone = %s
+                    """, (phone,))
+                    subscription_events_updated = c.rowcount
+                    
+                    conn.commit()
+                    
+                    if profile_deleted > 0:
+                        actions_taken.append(f"Deleted user profile")
+                    if messages_deleted > 0:
+                        actions_taken.append(f"Deleted {messages_deleted} messages")
+                    if onboarding_deleted > 0:
+                        actions_taken.append(f"Deleted {onboarding_deleted} onboarding logs")
+                    if analytics_deleted > 0:
+                        actions_taken.append(f"Deleted {analytics_deleted} analytics records")
+                    if sms_log_deleted > 0:
+                        actions_taken.append(f"Deleted {sms_log_deleted} SMS delivery logs")
+                    if usage_deleted > 0:
+                        actions_taken.append(f"Deleted {usage_deleted} usage records")
+                    if whitelist_events_deleted > 0:
+                        actions_taken.append(f"Deleted {whitelist_events_deleted} whitelist events")
+                    if subscription_events_updated > 0:
+                        actions_taken.append(f"Updated {subscription_events_updated} subscription events")
+                    
+                    # Log the removal
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, -999, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"REMOVED: User and all data deleted by admin"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged user removal")
+                    
+                    user_name = user_info['first_name'] if user_info else "Unknown"
+                    user_location = user_info['location'] if user_info else "Unknown"
+                    
+        except Exception as db_error:
+            logger.error(f"Database error removing user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        logger.info(f"🗑️ Completely removed user: {phone} ({user_name} from {user_location})")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Completely removed user {phone} and all associated data",
+            "actions_taken": actions_taken,
+            "user_info": {
+                "phone": phone,
+                "name": user_name,
+                "location": user_location
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error removing user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/reset-user', methods=['POST'])
+def admin_reset_user():
+    """Admin endpoint to reset user's usage quotas and clear message history"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    # Get user info
+                    c.execute("SELECT first_name, location FROM user_profiles WHERE phone = %s", (phone,))
+                    user_info = c.fetchone()
+                    
+                    if not user_info:
+                        return jsonify({"error": "User not found"}), 404
+                    
+                    # Reset monthly usage
+                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
+                    usage_reset = c.rowcount
+                    
+                    # Clear message history (optional - keep for debugging)
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    messages_cleared = c.rowcount
+                    
+                    # Clear usage analytics (optional)
+                    c.execute("DELETE FROM usage_analytics WHERE phone = %s", (phone,))
+                    analytics_cleared = c.rowcount
+                    
+                    conn.commit()
+                    
+                    if usage_reset > 0:
+                        actions_taken.append(f"Reset monthly usage quota")
+                    if messages_cleared > 0:
+                        actions_taken.append(f"Cleared {messages_cleared} message history")
+                    if analytics_cleared > 0:
+                        actions_taken.append(f"Cleared {analytics_cleared} analytics records")
+                    
+                    # Log the reset
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, 998, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"RESET: Usage quota and history reset by admin"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged user reset")
+                    
+        except Exception as db_error:
+            logger.error(f"Database error resetting user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        # Send reset confirmation
+        reset_msg = f"Hi {user_info['first_name']}! Your Hey Alex account has been reset. Your message quota is refreshed and you're ready to go!"
+        
+        try:
+            result = send_sms(phone, reset_msg, bypass_quota=True)
+            if "error" not in result:
+                actions_taken.append("Sent reset confirmation SMS")
+                save_message(phone, "assistant", reset_msg, "user_reset", 0)
+            else:
+                actions_taken.append(f"Failed to send SMS: {result['error']}")
+        except Exception as sms_error:
+            actions_taken.append(f"SMS error: {str(sms_error)}")
+        
+        logger.info(f"🔄 Reset user: {phone} ({user_info['first_name']})")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Reset user {phone} - quota refreshed and history cleared",
+            "actions_taken": actions_taken,
+            "user_info": {
+                "phone": phone,
+                "name": user_info['first_name'],
+                "location": user_info['location']
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting user: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/restore-user', methods=['POST'])
 def admin_restore_user():
     """Admin endpoint to restore a user's complete profile"""
@@ -1192,7 +1317,7 @@ def admin_restore_user():
             return jsonify({"error": f"Database error: {str(db_error)}"}), 500
         
         # Send confirmation SMS
-        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything! To cancel anytime, text \"END SUBSCRIPTION\""
+        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
         
         try:
             result = send_sms(phone, confirmation_msg, bypass_quota=True)
@@ -1252,65 +1377,13 @@ def stripe_webhook():
             subscription = event['data']['object']
             logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
         
-        elif event['type'] == 'invoice.payment_succeeded':
-            invoice = event['data']['object']
-            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
-            
-            # Handle first payment for new subscriptions
-            if invoice.get('billing_reason') in ['subscription_create', 'subscription_cycle']:
-                customer_id = invoice['customer']
-                subscription_id = invoice.get('subscription')
-                
-                if subscription_id:
-                    logger.info(f"🎉 Processing new subscription via invoice: {subscription_id}")
-                    
-                    try:
-                        customer = stripe.Customer.retrieve(customer_id)
-                        
-                        # Try to get phone from customer object or invoice
-                        phone = None
-                        if customer.get('phone'):
-                            phone = normalize_phone_number(customer['phone'])
-                        elif invoice.get('customer_phone'):
-                            phone = normalize_phone_number(invoice['customer_phone'])
-                        
-                        if phone:
-                            # Check if user already exists (avoid duplicates)
-                            existing_profile = get_user_profile(phone)
-                            
-                            if not existing_profile:
-                                update_user_profile(
-                                    phone,
-                                    stripe_customer_id=customer_id,
-                                    subscription_status='active',
-                                    subscription_id=subscription_id
-                                )
-                                
-                                add_to_whitelist(phone, send_welcome=True, source='stripe_invoice')
-                                log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, phone, 'active')
-                                
-                                logger.info(f"✅ New subscription activated via invoice for {phone}")
-                            else:
-                                logger.info(f"📝 User {phone} already exists, updating subscription info")
-                                update_user_profile(
-                                    phone,
-                                    stripe_customer_id=customer_id,
-                                    subscription_status='active',
-                                    subscription_id=subscription_id
-                                )
-                        else:
-                            logger.warning(f"⚠️ No phone number found for customer {customer_id} in invoice webhook")
-                            log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, None, 'active',
-                                           {'error': 'No phone number found', 'customer_phone': invoice.get('customer_phone')})
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Error handling invoice subscription creation: {e}")
-                        log_stripe_event('subscription_created_via_invoice', customer_id, subscription_id, None, 'error',
-                                        {'error': str(e)})
-        
         elif event['type'] == 'invoice.payment_failed':
             invoice = event['data']['object']
             logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
+        
+        elif event['type'] == 'invoice.payment_succeeded':
+            invoice = event['data']['object']
+            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
         
         else:
             logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
@@ -1359,74 +1432,30 @@ def sms_webhook():
     # Save user message
     save_message(sender, "user", body)
     
-    # Handle special commands - AVOID carrier-reserved keywords (STOP, START, UNSUBSCRIBE)
-    termination_commands = [
-        'end subscription', 'cancel subscription', 'cancel my subscription', 
-        'end my subscription', 'delete subscription', 'remove subscription'
-    ]
-
-    reactivation_commands = [
-        'rejoin alex', 'restart alex', 'reactivate alex', 'resume alex',
-        'activate service', 'resubscribe', 'restart subscription'
-    ]
-
-    user_command = body.lower().strip()
-
-    # Check for termination commands
-    if any(cmd in user_command for cmd in termination_commands):
-        logger.info(f"🛑 Termination command detected from {sender}: {body}")
-        
-        # Get user's name for personalized message
-        profile = get_user_profile(sender)
-        first_name = profile.get('first_name', '') if profile else ''
-        
-        # Cancel Stripe subscription
-        cancellation_result = cancel_user_subscription(sender)
-        
-        if cancellation_result["success"]:
-            response_msg = f"Hi{', ' + first_name if first_name else ''}! ✅ Your Hey Alex subscription has been cancelled and will end at your next billing date. You'll keep access until then. Thanks for using our service! 👋\n\nTo resubscribe later, visit heyalex.co"
-        else:
-            # Handle cases where there's no active subscription
-            if "No active subscription found" in cancellation_result["message"]:
-                response_msg = f"Hi{', ' + first_name if first_name else ''}! No active subscription found to cancel. You may already be cancelled or have a billing issue. Contact support if needed."
-            else:
-                response_msg = f"Hi{', ' + first_name if first_name else ''}! There was an issue cancelling your subscription. Please contact support or try again with \"END SUBSCRIPTION\""
-        
+    # Handle special commands
+    if body.lower() in ['stop', 'quit', 'unsubscribe']:
+        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
         try:
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "subscription_cancelled", 0)
-            logger.info(f"✅ Cancellation processed for {sender}")
-            return jsonify({"message": "Cancellation processed"}), 200
+            return jsonify({"message": "Unsubscribe processed"}), 200
         except Exception as e:
-            logger.error(f"Failed to send cancellation message: {e}")
-            return jsonify({"error": "Failed to process cancellation"}), 500
+            logger.error(f"Failed to send unsubscribe message: {e}")
+            return jsonify({"error": "Failed to process unsubscribe"}), 500
     
-    # Check for reactivation commands  
-    if any(cmd in user_command for cmd in reactivation_commands):
-        logger.info(f"🔄 Reactivation command detected from {sender}: {body}")
-        
-        # Add back to whitelist
-        add_to_whitelist(sender, send_welcome=False, source='reactivation')
-        
-        # Update user profile status
-        update_user_profile(sender, subscription_status='active')
-        
+    if body.lower() in ['start', 'subscribe', 'resume']:
         if is_user_onboarded(sender):
-            profile = get_user_profile(sender)
-            first_name = profile['first_name'] if profile else ""
-            response_msg = f"Welcome back{', ' + first_name if first_name else ''}! Your Hey Alex service has been reactivated. Ask me anything!"
+            response_msg = WELCOME_MSG
         else:
             create_user_profile(sender)
             response_msg = ONBOARDING_NAME_MSG
         
         try:
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "service_reactivated", 0)
-            logger.info(f"✅ Service reactivated for {sender}")
-            return jsonify({"message": "Service reactivated"}), 200
+            save_message(sender, "assistant", response_msg, "start_command", 0)
+            return jsonify({"message": "Start message sent"}), 200
         except Exception as e:
-            logger.error(f"Failed to send reactivation message: {e}")
-            return jsonify({"error": "Failed to process reactivation"}), 500
+            logger.error(f"Failed to send start message: {e}")
+            return jsonify({"error": "Failed to send start message"}), 500
     
     # Check if user needs to complete onboarding
     profile = get_user_profile(sender)
@@ -1543,7 +1572,11 @@ def health_check():
         'database_type': 'PostgreSQL',
         'sms_char_limit': MAX_SMS_LENGTH,
         'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
-        'cancellation_command': 'END SUBSCRIPTION'
+        'admin_endpoints': [
+            '/admin/remove-user',
+            '/admin/reset-user', 
+            '/admin/restore-user'
+        ]
     })
 
 # Initialize database on startup
@@ -1554,5 +1587,5 @@ if __name__ == "__main__":
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
     logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
     logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
-    logger.info(f"🛑 Cancellation command: END SUBSCRIPTION")
+    logger.info(f"🔧 Admin endpoints available: /admin/remove-user, /admin/reset-user, /admin/restore-user")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
