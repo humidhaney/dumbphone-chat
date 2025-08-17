@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 CHANGELOG = {
+    "3.3": "Added 'longer' command: Users can text 'longer' for detailed 3-part responses (480 chars, counts as 3 messages)",
     "3.2": "COST OPTIMIZATION: Reduced to 200 messages/month with 160-char limit for sustainable pricing ($12/month cost vs $20 revenue)",
     "3.1": "Added comprehensive admin endpoints: remove-user, reset-user, and restore-user for complete user management",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
@@ -105,7 +106,8 @@ MONTHLY_LIMIT = 200
 RESET_DAYS = 30
 
 # SMS Response Limits
-MAX_SMS_LENGTH = 160
+MAX_SMS_LENGTH = 160        # Standard response (1 SMS part)
+LONGER_SMS_LENGTH = 480     # "Longer" response (3 SMS parts)
 CLICKSEND_MAX_LENGTH = 1600
 
 # WELCOME MESSAGE
@@ -799,6 +801,12 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
         return IntentResult("weather", {})
     return None
 
+def detect_longer_request(text: str) -> bool:
+    """Check if user is requesting a longer response"""
+    longer_keywords = ['longer', 'more info', 'more details', 'expand', 'tell me more', 'full details']
+    text_lower = text.lower().strip()
+    return any(keyword in text_lower for keyword in longer_keywords)
+
 def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
     return detect_weather_intent(text)
 
@@ -869,13 +877,15 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part)
+- Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part) unless specifically asked for longer
+- If this is a "longer" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
 - Be concise but helpful - provide key information quickly
 - Be friendly and conversational but brief
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Prioritize the most important information first in short responses"""
+- Prioritize the most important information first in short responses
+- End standard responses with "Text 'longer' for more details" when relevant"""
         
         try:
             headers = {
@@ -1570,16 +1580,43 @@ def sms_webhook():
                 logger.error(f"Failed to send onboarding fallback: {fallback_error}")
                 return jsonify({"error": "Onboarding failed"}), 500
     
+    # Check if user is requesting a longer response
+    is_longer_request = detect_longer_request(body)
+    
     # User is fully onboarded - continue to normal processing
     logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
     
     intent = detect_intent(body, sender)
     intent_type = intent.type if intent else "general"
     
+    # Add longer request flag to intent type for logging
+    if is_longer_request:
+        intent_type += "_longer"
+        logger.info(f"🔍 User requested longer response for: {body}")
+    
     user_context = get_user_context_for_queries(sender)
     
     try:
-        if intent and intent.type == "weather":
+        if is_longer_request:
+            # Get the last user query for context
+            last_query = get_conversation_context(sender, "last_query")
+            if last_query:
+                # Re-process the last query with longer response
+                longer_query = f"Provide detailed information about: {last_query}"
+                if user_context['personalized']:
+                    personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + longer_query
+                    response_msg = ask_claude(sender, personalized_msg)
+                else:
+                    response_msg = ask_claude(sender, longer_query)
+                
+                # Use longer length limit
+                response_msg = truncate_response(response_msg, LONGER_SMS_LENGTH)
+                message_parts = 3  # Count as 3 messages
+            else:
+                response_msg = "I'd be happy to provide more details! What would you like to know more about?"
+                message_parts = 1
+        
+        elif intent and intent.type == "weather":
             if user_context['personalized']:
                 city = user_context['location']
                 logger.info(f"🌍 Using user's saved location: {city}")
@@ -1589,6 +1626,11 @@ def sms_webhook():
                 response_msg = f"Hi {first_name}! " + response_msg
             else:
                 response_msg = web_search("weather forecast", search_type="general")
+            
+            response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
+            if not is_longer_request:
+                response_msg += " Text 'longer' for detailed forecast."
+            message_parts = 1
         else:
             if user_context['personalized']:
                 personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
@@ -1601,12 +1643,19 @@ def sms_webhook():
                 if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
                     search_term += f" in {user_context['location']}"
                 response_msg = web_search(search_term, search_type="general")
+            
+            response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
+            if not is_longer_request and len(response_msg) >= MAX_SMS_LENGTH - 50:
+                response_msg = response_msg[:-30] + " Text 'longer' for more."
+            message_parts = 1
         
         original_length = len(response_msg)
-        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
         
         if original_length > len(response_msg):
             logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
+        
+        # Log message parts for cost tracking
+        logger.info(f"📊 Response will use {message_parts} message parts")
         
         response_time = int((time.time() - start_time) * 1000)
         save_message(sender, "assistant", response_msg, intent_type, response_time)
@@ -1614,8 +1663,10 @@ def sms_webhook():
         result = send_sms(sender, response_msg)
         
         if "error" not in result:
+            # Track usage with correct message count
+            # track_monthly_sms_usage(sender, message_count=message_parts, is_outgoing=True)
             log_usage_analytics(sender, intent_type, True, response_time)
-            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars)")
+            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars, {message_parts} parts)")
             return jsonify({"message": "Response sent successfully"}), 200
         else:
             log_usage_analytics(sender, intent_type, False, response_time)
