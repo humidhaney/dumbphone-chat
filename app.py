@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import psycopg
-from psycopg.rows import dict_row
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
@@ -41,17 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.9"
+APP_VERSION = "3.1"
 CHANGELOG = {
-    "3.9": "Updated to single-command closure: 'END SERVICE' → 'CLOSE ACCOUNT' flow with carrier-friendly language throughout",
-    "3.8": "Fixed carrier blocking: Changed cancellation language from 'cancel/subscription' to 'end service' to avoid SMS filtering",
-    "3.7": "Added /admin/test-sms endpoint for debugging SMS delivery issues",
-    "3.6": "Added admin debug endpoints: /admin/users, /admin/subscription-events, /admin/user/<phone>, /admin/link-stripe",
-    "3.5": "Optimized SMS responses: Removed intro phrases and confirmations to maximize valuable content within character limits",
-    "3.4": "Fixed cancellation flow: Use 'Cancel Chat' → 'CONFIRM CANCEL' (avoids ClickSend STOP). Added cancellation instructions to onboarding.",
-    "3.3": "Added STOP → CANCEL flow: Users can now cancel Stripe subscriptions via SMS with STOP then CANCEL commands",
-    "3.2": "Added admin endpoints: /admin/reset-user and /admin/whitelist/remove for user management",
-    "3.1": "Fixed PostgreSQL imports - updated from psycopg2 to psycopg3 for compatibility",
+    "3.1": "Added 'END SUBSCRIPTION' command for proper Stripe subscription cancellation, integrated into onboarding flow",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
     "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
     "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
@@ -115,14 +107,6 @@ RESET_DAYS = 30
 MAX_SMS_LENGTH = 720
 CLICKSEND_MAX_LENGTH = 1600
 
-# WELCOME MESSAGE
-WELCOME_MSG = (
-    "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
-    "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
-    "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
-    "Try asking \"weather today\" to get started."
-)
-
 # ONBOARDING MESSAGES
 ONBOARDING_NAME_MSG = (
     "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant. "
@@ -137,7 +121,15 @@ ONBOARDING_LOCATION_MSG = (
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
     "You get 300 messages per month. Try asking \"weather today\" to start! "
-    "If you ever wish to close your account just write \"END SERVICE\" and I will help you."
+    "\n\n💡 To cancel anytime, just text \"END SUBSCRIPTION\""
+)
+
+# WELCOME MESSAGE (for returning users)
+WELCOME_MSG = (
+    "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
+    "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
+    "✓ Current news & headlines No apps, no browsing - just text me your question and I'll handle the rest! "
+    "Try asking \"weather today\" to get started. To cancel anytime, text \"END SUBSCRIPTION\""
 )
 
 # === Error Handling Decorator ===
@@ -154,10 +146,10 @@ def handle_errors(f):
 # === PostgreSQL Connection Manager ===
 @contextmanager
 def get_db_connection():
-    """Context manager for PostgreSQL connections using psycopg3"""
+    """Context manager for PostgreSQL connections"""
     conn = None
     try:
-        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         yield conn
     except Exception as e:
         if conn:
@@ -359,7 +351,7 @@ def get_user_profile(phone):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT first_name, location, onboarding_step, onboarding_completed, 
-                           stripe_customer_id, subscription_status
+                           stripe_customer_id, subscription_status, subscription_id
                     FROM user_profiles
                     WHERE phone = %s
                 """, (phone,))
@@ -372,7 +364,8 @@ def get_user_profile(phone):
                         'onboarding_step': result['onboarding_step'],
                         'onboarding_completed': bool(result['onboarding_completed']),
                         'stripe_customer_id': result['stripe_customer_id'],
-                        'subscription_status': result['subscription_status']
+                        'subscription_status': result['subscription_status'],
+                        'subscription_id': result['subscription_id']
                     }
                 else:
                     return None
@@ -774,7 +767,7 @@ class ContentFilter:
         if len(text) > 500:
             return False, "Query too long"
         
-        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks', 'stop', 'start']
+        short_allowed = ['hi', 'hey', 'hello', 'help', 'yes', 'no', 'ok', 'thanks']
         if text.lower() in short_allowed:
             return True, ""
         
@@ -877,15 +870,13 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- You can provide responses up to {MAX_SMS_LENGTH} characters
-- BE DIRECT AND CONCISE - Skip intro phrases like "Okay, got it", "Let me help you", "Here's what I found"
-- NO confirmation phrases about names, cities, or search results
-- Start responses immediately with the actual information
-- Be friendly but efficient with every character
+- You can now provide responses up to {MAX_SMS_LENGTH} characters (increased from 500)
+- Give more detailed, thorough answers while staying within the character limit
+- Be friendly and helpful with comprehensive information
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Provide complete, valuable answers within the character limit"""
+- Be conversational and provide valuable, complete answers"""
         
         try:
             headers = {
@@ -969,54 +960,6 @@ IMPORTANT GUIDELINES:
         logger.error(f"💥 Claude integration error for {phone}: {e}")
         return "I'm having trouble processing that question. Let me try to search for that information instead."
 
-def cancel_stripe_subscription(customer_id):
-    """Cancel all active subscriptions for a Stripe customer"""
-    if not STRIPE_SECRET_KEY:
-        logger.error("Stripe not configured for subscription cancellation")
-        return False, "Stripe not configured"
-    
-    try:
-        # Get all subscriptions for the customer
-        subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
-        
-        if not subscriptions.data:
-            logger.warning(f"No active subscriptions found for customer {customer_id}")
-            return False, "No active subscriptions found"
-        
-        cancelled_count = 0
-        errors = []
-        
-        # Cancel all active subscriptions
-        for subscription in subscriptions.data:
-            try:
-                cancelled_sub = stripe.Subscription.cancel(subscription.id)
-                logger.info(f"✅ Cancelled subscription {subscription.id} for customer {customer_id}")
-                cancelled_count += 1
-                
-                # Log the cancellation event
-                log_stripe_event(
-                    'manual_cancellation', 
-                    customer_id, 
-                    subscription.id, 
-                    None, 
-                    'cancelled',
-                    {'cancelled_via': 'sms_command', 'subscription_id': subscription.id}
-                )
-                
-            except Exception as sub_error:
-                error_msg = f"Failed to cancel subscription {subscription.id}: {str(sub_error)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-        
-        if cancelled_count > 0:
-            return True, f"Cancelled {cancelled_count} subscription(s)"
-        else:
-            return False, f"Failed to cancel subscriptions: {'; '.join(errors)}"
-            
-    except Exception as e:
-        logger.error(f"💥 Error cancelling subscriptions for customer {customer_id}: {e}")
-        return False, f"Stripe error: {str(e)}"
-
 # === Stripe Functions ===
 def log_stripe_event(event_type, customer_id, subscription_id, phone, status, additional_data=None):
     """Log Stripe webhook events for debugging"""
@@ -1041,6 +984,63 @@ def extract_phone_from_stripe_metadata(metadata):
             return normalize_phone_number(metadata[field])
     
     return None
+
+def cancel_user_subscription(phone):
+    """Cancel user's Stripe subscription and remove from service"""
+    try:
+        profile = get_user_profile(phone)
+        if not profile:
+            return {"success": False, "message": "No user profile found"}
+        
+        stripe_customer_id = profile.get('stripe_customer_id')
+        subscription_id = profile.get('subscription_id')
+        
+        if not stripe_customer_id:
+            logger.warning(f"No Stripe customer ID found for {phone}")
+            return {"success": False, "message": "No active subscription found"}
+        
+        # Cancel the Stripe subscription
+        try:
+            if subscription_id:
+                # Cancel specific subscription
+                cancelled_subscription = stripe.Subscription.modify(
+                    subscription_id,
+                    cancel_at_period_end=True  # Cancel at end of billing period
+                )
+                logger.info(f"✅ Stripe subscription {subscription_id} set to cancel at period end")
+            else:
+                # Find and cancel active subscriptions for customer
+                subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='active')
+                
+                if subscriptions.data:
+                    for subscription in subscriptions.data:
+                        cancelled_subscription = stripe.Subscription.modify(
+                            subscription.id,
+                            cancel_at_period_end=True
+                        )
+                        logger.info(f"✅ Stripe subscription {subscription.id} set to cancel at period end")
+                else:
+                    logger.warning(f"No active subscriptions found for customer {stripe_customer_id}")
+                    return {"success": False, "message": "No active subscription found"}
+            
+        except stripe.error.StripeError as e:
+            logger.error(f"❌ Stripe cancellation error: {e}")
+            return {"success": False, "message": f"Subscription cancellation failed: {str(e)}"}
+        
+        # Update user profile
+        update_user_profile(phone, subscription_status='cancelled')
+        
+        # Remove from whitelist
+        remove_from_whitelist(phone, send_goodbye=False)  # We'll send custom message
+        
+        # Log the cancellation
+        log_stripe_event('user_requested_cancellation', stripe_customer_id, subscription_id, phone, 'cancelled')
+        
+        return {"success": True, "message": "Subscription cancelled successfully"}
+        
+    except Exception as e:
+        logger.error(f"💥 Error cancelling subscription for {phone}: {e}")
+        return {"success": False, "message": "Cancellation processing failed"}
 
 def handle_subscription_created(subscription):
     """Handle new subscription creation"""
@@ -1115,224 +1115,6 @@ def handle_subscription_deleted(subscription):
                         {'error': str(e)})
 
 # === ADMIN ENDPOINTS ===
-@app.route('/admin/users', methods=['GET'])
-def admin_list_users():
-    """Admin endpoint to list all users and their profiles"""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT phone, first_name, location, onboarding_completed, 
-                           stripe_customer_id, subscription_status, created_date
-                    FROM user_profiles
-                    ORDER BY created_date DESC
-                """)
-                users = c.fetchall()
-                
-                return jsonify({
-                    "total_users": len(users),
-                    "users": [dict(user) for user in users]
-                })
-                
-    except Exception as e:
-        logger.error(f"Error listing users: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/subscription-events', methods=['GET'])
-def admin_subscription_events():
-    """Admin endpoint to view recent Stripe webhook events"""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT event_type, stripe_customer_id, subscription_id, phone, 
-                           status, event_data, timestamp
-                    FROM subscription_events
-                    ORDER BY timestamp DESC
-                    LIMIT 20
-                """)
-                events = c.fetchall()
-                
-                return jsonify({
-                    "total_events": len(events),
-                    "events": [dict(event) for event in events]
-                })
-                
-    except Exception as e:
-        logger.error(f"Error getting subscription events: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/user/<phone>', methods=['GET'])
-def admin_get_user(phone):
-    """Admin endpoint to get specific user details"""
-    try:
-        phone = normalize_phone_number(phone)
-        profile = get_user_profile(phone)
-        
-        if not profile:
-            return jsonify({"error": "User not found"}), 404
-        
-        # Also get recent messages
-        with get_db_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT role, content, intent_type, ts
-                    FROM messages
-                    WHERE phone = %s
-                    ORDER BY id DESC
-                    LIMIT 10
-                """, (phone,))
-                messages = c.fetchall()
-        
-        return jsonify({
-            "profile": profile,
-            "recent_messages": [dict(msg) for msg in messages]
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting user {phone}: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/test-sms', methods=['POST'])
-def admin_test_sms():
-    """Admin endpoint to send test SMS directly"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        message = data.get('message', 'Test message from Hey Alex admin')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Send SMS directly
-        result = send_sms(phone, message, bypass_quota=True)
-        
-        if "error" not in result:
-            return jsonify({
-                "success": True,
-                "message": f"Test SMS sent to {phone}",
-                "clicksend_response": result
-            })
-        else:
-            return jsonify({
-                "success": False,
-                "error": result["error"]
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"Error sending test SMS: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/link-stripe', methods=['POST'])
-def admin_link_stripe():
-    """Admin endpoint to manually link Stripe customer to user profile"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        stripe_customer_id = data.get('stripe_customer_id')
-        subscription_status = data.get('subscription_status', 'active')
-        
-        if not phone or not stripe_customer_id:
-            return jsonify({"error": "phone and stripe_customer_id required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Update the user profile
-        success = update_user_profile(
-            phone,
-            stripe_customer_id=stripe_customer_id,
-            subscription_status=subscription_status
-        )
-        
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Linked {phone} to Stripe customer {stripe_customer_id}",
-                "phone": phone,
-                "stripe_customer_id": stripe_customer_id,
-                "subscription_status": subscription_status
-            })
-        else:
-            return jsonify({"error": "Failed to update profile"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error linking Stripe: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/whitelist/remove', methods=['POST'])
-def admin_remove_from_whitelist():
-    """Admin endpoint to remove users from whitelist"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        send_goodbye = data.get('send_goodbye', False)
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        success = remove_from_whitelist(phone, send_goodbye=send_goodbye)
-        
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Removed {phone} from whitelist",
-                "goodbye_sent": send_goodbye
-            })
-        else:
-            return jsonify({"error": "Failed to remove from whitelist"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error in admin remove from whitelist: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/reset-user', methods=['POST'])
-def admin_reset_user():
-    """Reset a user completely - remove from whitelist and clear database profile"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        actions_taken = []
-        
-        # Remove from whitelist
-        success = remove_from_whitelist(phone, send_goodbye=False)
-        if success:
-            actions_taken.append("Removed from whitelist")
-        
-        # Clear user profile from database
-        try:
-            with get_db_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
-                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
-                    conn.commit()
-                    actions_taken.append("Removed from database")
-        except Exception as db_error:
-            logger.error(f"Database error resetting user: {db_error}")
-            actions_taken.append(f"Database error: {str(db_error)}")
-        
-        logger.info(f"👤 Reset user completely: {phone}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Reset user {phone} completely",
-            "actions_taken": actions_taken
-        })
-        
-    except Exception as e:
-        logger.error(f"Error resetting user: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/admin/restore-user', methods=['POST'])
 def admin_restore_user():
     """Admin endpoint to restore a user's complete profile"""
@@ -1389,7 +1171,7 @@ def admin_restore_user():
             return jsonify({"error": f"Database error: {str(db_error)}"}), 500
         
         # Send confirmation SMS
-        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
+        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything! To cancel anytime, text \"END SUBSCRIPTION\""
         
         try:
             result = send_sms(phone, confirmation_msg, bypass_quota=True)
@@ -1504,130 +1286,74 @@ def sms_webhook():
     # Save user message
     save_message(sender, "user", body)
     
-    # Handle special commands
-    if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
-        try:
-            send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Unsubscribe processed"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send unsubscribe message: {e}")
-            return jsonify({"error": "Failed to process unsubscribe"}), 500
-    
-    if body.upper() == 'END SERVICE':
-        # Handle account closure request with carrier-friendly language
-        try:
-            profile = get_user_profile(sender)
-            if not profile:
-                response_msg = "No account found. If you have questions, contact support."
-                send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No profile found for closure"}), 200
-            
-            stripe_customer_id = profile.get('stripe_customer_id')
-            subscription_status = profile.get('subscription_status')
-            first_name = profile.get('first_name', 'there')
-            
-            if not stripe_customer_id or subscription_status in ['cancelled', 'inactive']:
-                response_msg = f"Hi {first_name}! No active account found to close. If you have questions, contact support."
-                send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No active subscription"}), 200
-            
-            # Send confirmation request with carrier-friendly language
-            response_msg = (
-                f"Hi {first_name}! Are you sure you want to close your Hey Alex account? "
-                "This will stop future payments and remove access. "
-                "Reply \"CLOSE ACCOUNT\" to proceed or anything else to keep your service."
-            )
-            
-            # Mark user as pending cancellation
-            update_user_profile(sender, subscription_status='pending_closure')
-            
-            send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "closure_request", 0)
-            
-            logger.info(f"🤔 Account closure request initiated for {sender} ({first_name})")
-            return jsonify({"message": "Account closure confirmation requested"}), 200
-            
-        except Exception as e:
-            logger.error(f"💥 Error processing account closure request for {sender}: {e}")
-            response_msg = "There was an error processing your request. Please contact support."
-            try:
-                send_sms(sender, response_msg, bypass_quota=True)
-            except:
-                pass
-            return jsonify({"error": "Account closure request failed"}), 500
-    
-    if body.upper() == 'CLOSE ACCOUNT':
-        # Handle final account closure with carrier-friendly language
-        try:
-            profile = get_user_profile(sender)
-            if not profile:
-                response_msg = "No account found. If you have questions, contact support."
-                send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No profile found for closure"}), 200
-            
-            stripe_customer_id = profile.get('stripe_customer_id')
-            subscription_status = profile.get('subscription_status')
-            first_name = profile.get('first_name', 'there')
-            
-            if subscription_status != 'pending_closure':
-                response_msg = f"Hi {first_name}! No pending request found. To close account, first write \"END SERVICE\"."
-                send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No pending closure"}), 200
-            
-            if not stripe_customer_id:
-                response_msg = f"Hi {first_name}! No active account found to close."
-                send_sms(sender, response_msg, bypass_quota=True)
-                return jsonify({"message": "No subscription to close"}), 200
-            
-            # Cancel subscription in Stripe
-            success, message = cancel_stripe_subscription(stripe_customer_id)
-            
-            if success:
-                # Remove from whitelist and update profile
-                remove_from_whitelist(sender, send_goodbye=False)
-                update_user_profile(sender, subscription_status='closed')
-                
-                response_msg = (
-                    f"✅ Your Hey Alex account has been closed, {first_name}. "
-                    "No future payments will occur. Thanks for using Hey Alex! "
-                    "You can restart anytime at heyalex.co"
-                )
-                logger.info(f"🚫 Successfully closed account for {sender} ({first_name})")
+    # Handle special commands - AVOID carrier-reserved keywords (STOP, START, UNSUBSCRIBE)
+    termination_commands = [
+        'end subscription', 'cancel subscription', 'cancel my subscription', 
+        'end my subscription', 'delete subscription', 'remove subscription'
+    ]
+
+    reactivation_commands = [
+        'rejoin alex', 'restart alex', 'reactivate alex', 'resume alex',
+        'activate service', 'resubscribe', 'restart subscription'
+    ]
+
+    user_command = body.lower().strip()
+
+    # Check for termination commands
+    if any(cmd in user_command for cmd in termination_commands):
+        logger.info(f"🛑 Termination command detected from {sender}: {body}")
+        
+        # Get user's name for personalized message
+        profile = get_user_profile(sender)
+        first_name = profile.get('first_name', '') if profile else ''
+        
+        # Cancel Stripe subscription
+        cancellation_result = cancel_user_subscription(sender)
+        
+        if cancellation_result["success"]:
+            response_msg = f"Hi{', ' + first_name if first_name else ''}! ✅ Your Hey Alex subscription has been cancelled and will end at your next billing date. You'll keep access until then. Thanks for using our service! 👋\n\nTo resubscribe later, visit heyalex.co"
+        else:
+            # Handle cases where there's no active subscription
+            if "No active subscription found" in cancellation_result["message"]:
+                response_msg = f"Hi{', ' + first_name if first_name else ''}! No active subscription found to cancel. You may already be cancelled or have a billing issue. Contact support if needed."
             else:
-                response_msg = (
-                    f"❌ There was an issue closing your account, {first_name}. "
-                    "Please contact support for assistance."
-                )
-                logger.error(f"❌ Failed to close account for {sender}: {message}")
-            
+                response_msg = f"Hi{', ' + first_name if first_name else ''}! There was an issue cancelling your subscription. Please contact support or try again with \"END SUBSCRIPTION\""
+        
+        try:
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "account_closed", 0)
-            return jsonify({"message": "Account closure processed", "success": success}), 200
-            
+            save_message(sender, "assistant", response_msg, "subscription_cancelled", 0)
+            logger.info(f"✅ Cancellation processed for {sender}")
+            return jsonify({"message": "Cancellation processed"}), 200
         except Exception as e:
-            logger.error(f"💥 Error processing final closure for {sender}: {e}")
-            response_msg = "There was an error processing your request. Please contact support."
-            try:
-                send_sms(sender, response_msg, bypass_quota=True)
-            except:
-                pass
-            return jsonify({"error": "Account closure failed"}), 500
+            logger.error(f"Failed to send cancellation message: {e}")
+            return jsonify({"error": "Failed to process cancellation"}), 500
     
-    if body.lower() in ['start', 'subscribe', 'resume']:
+    # Check for reactivation commands  
+    if any(cmd in user_command for cmd in reactivation_commands):
+        logger.info(f"🔄 Reactivation command detected from {sender}: {body}")
+        
+        # Add back to whitelist
+        add_to_whitelist(sender, send_welcome=False, source='reactivation')
+        
+        # Update user profile status
+        update_user_profile(sender, subscription_status='active')
+        
         if is_user_onboarded(sender):
-            response_msg = WELCOME_MSG
+            profile = get_user_profile(sender)
+            first_name = profile['first_name'] if profile else ""
+            response_msg = f"Welcome back{', ' + first_name if first_name else ''}! Your Hey Alex service has been reactivated. Ask me anything!"
         else:
             create_user_profile(sender)
             response_msg = ONBOARDING_NAME_MSG
         
         try:
             send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "start_command", 0)
-            return jsonify({"message": "Start message sent"}), 200
+            save_message(sender, "assistant", response_msg, "service_reactivated", 0)
+            logger.info(f"✅ Service reactivated for {sender}")
+            return jsonify({"message": "Service reactivated"}), 200
         except Exception as e:
-            logger.error(f"Failed to send start message: {e}")
-            return jsonify({"error": "Failed to send start message"}), 500
+            logger.error(f"Failed to send reactivation message: {e}")
+            return jsonify({"error": "Failed to process reactivation"}), 500
     
     # Check if user needs to complete onboarding
     profile = get_user_profile(sender)
@@ -1743,7 +1469,8 @@ def health_check():
         'latest_changes': CHANGELOG[APP_VERSION],
         'database_type': 'PostgreSQL',
         'sms_char_limit': MAX_SMS_LENGTH,
-        'clicksend_max_limit': CLICKSEND_MAX_LENGTH
+        'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
+        'cancellation_command': 'END SUBSCRIPTION'
     })
 
 # Initialize database on startup
@@ -1754,4 +1481,5 @@ if __name__ == "__main__":
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
     logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
     logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
+    logger.info(f"🛑 Cancellation command: END SUBSCRIPTION")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
