@@ -879,13 +879,14 @@ def ask_claude(phone, user_msg):
 IMPORTANT GUIDELINES:
 - Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part) unless specifically asked for longer
 - If this is a "longer" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
-- Be concise but helpful - provide key information quickly
-- Be friendly and conversational but brief
+- Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info"
+- Start immediately with the answer/information requested
+- Be friendly but brief - every character counts
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Prioritize the most important information first in short responses
-- End standard responses with "Text 'longer' for more details" when relevant"""
+- End standard responses with "Text 'longer' for more details" when relevant
+- Do NOT use the user's name or location in responses unless specifically relevant"""
         
         try:
             headers = {
@@ -1622,8 +1623,7 @@ def sms_webhook():
                 logger.info(f"🌍 Using user's saved location: {city}")
                 query = f"weather forecast {city}"
                 response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
+                # Remove personalized greeting to save characters
             else:
                 response_msg = web_search("weather forecast", search_type="general")
             
