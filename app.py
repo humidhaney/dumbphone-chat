@@ -16,8 +16,19 @@ import logging
 from functools import wraps
 import time
 import anthropic
-import psycopg
-from urllib.parse import urlparse
+import csv
+import io
+import hmac
+import hashlib
+
+# Try to import stripe, but handle gracefully if not available
+try:
+    import stripe
+    STRIPE_AVAILABLE = True
+except ImportError:
+    STRIPE_AVAILABLE = False
+    stripe = None
+    logging.warning("Stripe module not available - payment features disabled")
 
 # Load env vars
 load_dotenv()
@@ -36,12 +47,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.0"
+APP_VERSION = "2.6"
 CHANGELOG = {
-    "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage across deployments",
-    "2.9": "Improved response quality: removed unnecessary location mentions, increased character limit to 700, refined Claude prompts",
-    "2.8": "Added comprehensive debugging and user profile recovery system to prevent onboarding loops",
-    "2.7": "Enhanced news detection and Google News integration with SerpAPI, improved topic-specific news searches",
     "2.6": "Added automatic welcome message when new users are added to whitelist, enhanced whitelist tracking",
     "2.5": "Added Stripe webhook integration for automatic whitelist management based on subscription status",
     "2.4": "Fixed content filter false positives for philosophical questions, improved spam detection accuracy",
@@ -68,16 +75,22 @@ logger.info(f"  CLICKSEND_API_KEY: {'✅ Set' if CLICKSEND_API_KEY else '❌ Mis
 logger.info(f"  ANTHROPIC_API_KEY: {'✅ Set' if ANTHROPIC_API_KEY else '❌ Missing'}")
 logger.info(f"  SERPAPI_API_KEY: {'✅ Set' if SERPAPI_API_KEY else '❌ Missing'}")
 
-# Stripe Configuration
+# Stripe Configuration - Only if available
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")
 
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-    logger.info("Stripe API initialized successfully")
+if STRIPE_AVAILABLE and STRIPE_SECRET_KEY:
+    try:
+        stripe.api_key = STRIPE_SECRET_KEY
+        logger.info("✅ Stripe API initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Stripe API: {e}")
+        STRIPE_AVAILABLE = False
+elif STRIPE_SECRET_KEY and not STRIPE_AVAILABLE:
+    logger.warning("❌ STRIPE_SECRET_KEY found but Stripe module not available")
 else:
-    logger.warning("STRIPE_SECRET_KEY not found")
+    logger.warning("❌ STRIPE_SECRET_KEY not found - payment features disabled")
 
 # Initialize Anthropic client
 anthropic_client = None
@@ -86,12 +99,12 @@ if ANTHROPIC_API_KEY:
         import anthropic as anthropic_lib
         anthropic_lib.api_key = ANTHROPIC_API_KEY
         anthropic_client = anthropic_lib
-        logger.info("Anthropic client initialized successfully (module-level)")
+        logger.info("✅ Anthropic client initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize Anthropic: {e}")
+        logger.error(f"❌ Failed to initialize Anthropic: {e}")
         anthropic_client = None
 else:
-    logger.warning("ANTHROPIC_API_KEY not found")
+    logger.warning("❌ ANTHROPIC_API_KEY not found")
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
@@ -99,25 +112,7 @@ MONTHLY_USAGE_FILE = "monthly_usage.json"
 USAGE_LIMIT = 200
 MONTHLY_LIMIT = 300
 RESET_DAYS = 30
-
-# Database Configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL:
-    logger.info("🐘 Using PostgreSQL database")
-    # Parse PostgreSQL URL
-    parsed = urlparse(DATABASE_URL)
-    DB_CONFIG = {
-        'host': parsed.hostname,
-        'port': parsed.port,
-        'dbname': parsed.path[1:],  # Remove leading slash
-        'user': parsed.username,
-        'password': parsed.password
-    }
-    USE_POSTGRES = True
-else:
-    logger.info("📁 Using SQLite database")
-    DB_PATH = os.getenv("DB_PATH", "chat.db")
-    USE_POSTGRES = False
+DB_PATH = os.getenv("DB_PATH", "chat.db")
 
 # WELCOME MESSAGE
 WELCOME_MSG = (
@@ -196,652 +191,165 @@ def load_whitelist():
     except FileNotFoundError:
         return set()
 
-# === Database Connection Helper ===
-def get_db_connection():
-    """Get database connection (PostgreSQL or SQLite)"""
-    if USE_POSTGRES:
-        return psycopg.connect(**DB_CONFIG)
-    else:
-        return sqlite3.connect(DB_PATH)
-
-def execute_db_query(query, params=None, fetch=None):
-    """Execute database query with proper connection handling"""
+# === Database Initialization ===
+def init_db():
     try:
-        with get_db_connection() as conn:
-            if USE_POSTGRES:
-                with conn.cursor() as c:
-                    c.execute(query, params or ())
-                    if fetch == 'one':
-                        return c.fetchone()
-                    elif fetch == 'all':
-                        return c.fetchall()
-                    elif fetch == 'lastrowid':
-                        return c.lastrowid if hasattr(c, 'lastrowid') else None
-                    conn.commit()
-                    return c.rowcount
-            else:
-                c = conn.cursor()
-                c.execute(query, params or ())
-                if fetch == 'one':
-                    return c.fetchone()
-                elif fetch == 'all':
-                    return c.fetchall()
-                elif fetch == 'lastrowid':
-                    return c.lastrowid
-                conn.commit()
-                return c.rowcount
+        logger.info(f"🗄️ Initializing database at: {DB_PATH}")
+        
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            
+            # Check if database exists and has data
+            c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            existing_tables = [row[0] for row in c.fetchall()]
+            logger.info(f"📊 Existing tables: {existing_tables}")
+            
+            # Messages table
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                content TEXT NOT NULL,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                intent_type TEXT,
+                response_time_ms INTEGER
+            );
+            """)
+            
+            c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
+            ON messages(phone, ts DESC);
+            """)
+            
+            # User profiles table for onboarding
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                first_name TEXT,
+                location TEXT,
+                onboarding_step INTEGER DEFAULT 0,
+                onboarding_completed BOOLEAN DEFAULT FALSE,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
+            ON user_profiles(phone);
+            """)
+            
+            # Other tables...
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS onboarding_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                response TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('added','removed')),
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source TEXT DEFAULT 'manual'
+            );
+            """)
+            
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS sms_delivery_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                message_content TEXT NOT NULL,
+                clicksend_response TEXT,
+                delivery_status TEXT,
+                message_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_sms_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                message_count INTEGER DEFAULT 1,
+                period_start DATE NOT NULL,
+                period_end DATE NOT NULL,
+                last_message_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                quota_warnings_sent INTEGER DEFAULT 0,
+                quota_exceeded BOOLEAN DEFAULT FALSE,
+                UNIQUE(phone, period_start)
+            );
+            """)
+            
+            conn.commit()
+            
+            # Check for existing data
+            c.execute("SELECT COUNT(*) FROM user_profiles")
+            user_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM messages")  
+            message_count = c.fetchone()[0]
+            
+            logger.info(f"📊 Database initialized successfully")
+            logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
+            
     except Exception as e:
-        logger.error(f"Database query error: {e}")
+        logger.error(f"💥 Database initialization error: {e}")
         raise
-# === Debug Functions ===
-def debug_database_state():
-    """Debug function to check database state"""
-    try:
-        # Check user profiles
-        profile_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
-        profiles = execute_db_query("SELECT phone, first_name, onboarding_completed FROM user_profiles LIMIT 10", fetch='all')
-        
-        # Check messages
-        message_count = execute_db_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
-        
-        # Check whitelist content
-        whitelist = load_whitelist()
-        
-        db_info = f"PostgreSQL ({DB_CONFIG['host']})" if USE_POSTGRES else f"SQLite ({DB_PATH})"
-        
-        logger.info(f"🔍 DATABASE DEBUG:")
-        logger.info(f"  Database: {db_info}")
-        logger.info(f"  User profiles: {profile_count}")
-        logger.info(f"  Messages: {message_count}")
-        logger.info(f"  Whitelist entries: {len(whitelist)}")
-        logger.info(f"  Sample profiles: {profiles}")
-        logger.info(f"  Whitelist content: {list(whitelist)[:5]}")  # First 5 entries
-        
-        return {
-            'database_type': 'PostgreSQL' if USE_POSTGRES else 'SQLite',
-            'database_info': db_info,
-            'profile_count': profile_count,
-            'message_count': message_count,
-            'whitelist_count': len(whitelist),
-            'profiles': profiles,
-            'whitelist': list(whitelist)
-        }
-        
-    except Exception as e:
-        logger.error(f"💥 Database debug error: {e}")
-        return None
 
-def debug_phone_lookup(phone):
-    """Debug function to check phone number lookup"""
-    try:
-        normalized = normalize_phone_number(phone)
-        logger.info(f"🔍 PHONE DEBUG:")
-        logger.info(f"  Original: {phone}")
-        logger.info(f"  Normalized: {normalized}")
-        
-        # Try exact match
-        exact_match = execute_db_query("SELECT phone, first_name FROM user_profiles WHERE phone = %s" if USE_POSTGRES else "SELECT phone, first_name FROM user_profiles WHERE phone = ?", 
-                                     (phone,), fetch='one')
-        
-        # Try normalized match
-        normalized_match = execute_db_query("SELECT phone, first_name FROM user_profiles WHERE phone = %s" if USE_POSTGRES else "SELECT phone, first_name FROM user_profiles WHERE phone = ?", 
-                                          (normalized,), fetch='one')
-        
-        # Get all phone numbers to compare
-        all_phones = execute_db_query("SELECT phone FROM user_profiles", fetch='all')
-        all_phones = [row[0] for row in all_phones] if all_phones else []
-        
-        logger.info(f"  Exact match: {exact_match}")
-        logger.info(f"  Normalized match: {normalized_match}")
-        logger.info(f"  All phones in DB: {all_phones}")
-        
-        return {
-            'original': phone,
-            'normalized': normalized,
-            'exact_match': exact_match,
-            'normalized_match': normalized_match,
-            'all_phones': all_phones
-        }
-        
-    except Exception as e:
-        logger.error(f"💥 Phone debug error: {e}")
-        return None
-
-def check_existing_user_before_onboarding(sender):
-    """Check if user exists before starting onboarding"""
-    # Check whitelist first
-    whitelist = load_whitelist()
-    if sender not in whitelist:
-        logger.info(f"📝 {sender} not in whitelist, this should be a new user")
-        return False
-    
-    # Debug database state
-    debug_state = debug_database_state()
-    if debug_state and debug_state['profile_count'] > 0:
-        logger.info(f"📊 Database has {debug_state['profile_count']} profiles, investigating...")
-        
-        # Check if this specific user exists
-        profile_debug = debug_phone_lookup(sender)
-        if profile_debug:
-            logger.info(f"🔍 Phone lookup results: {profile_debug}")
-    
-    return False
-
-# === Intent Detection ===
-@dataclass
-class IntentResult:
-    type: str
-    entities: Dict[str, Any]
-    confidence: float = 1.0
-
-def detect_news_intent(text: str) -> Optional[IntentResult]:
-    """Enhanced news intent detection with better pattern matching"""
-    news_patterns = [
-        # Direct news requests
-        r'\b(latest|current|recent|new|breaking)\s+(news|headlines)\b',
-        r'\bheadlines?\b',
-        r'\bnews\s+(about|on|regarding)\b',
-        r'\bwhat\'?s\s+(happening|going\s+on|new)\b',
-        r'\btoday\'?s\s+news\b',
-        r'\bbreaking\s+news\b',
-        
-        # Topic-specific news
-        r'\bnews\s+(from|about)\s+(.+)',
-        r'\b(headlines|stories)\s+(from|about|on)\s+(.+)',
-        r'\blatest\s+(.+)\s+news\b',
-        
-        # Source-specific requests
-        r'\b(google|cnn|bbc|reuters|ap|associated\s+press)\s+news\b',
-        r'\bnews\s+from\s+(google|cnn|bbc|reuters|ap)\b',
-        
-        # Current events
-        r'\bwhat\'?s\s+happening\s+(in|with|about)\s+(.+)',
-        r'\bcurrent\s+events\b',
-        r'\btoday\'?s\s+(top\s+)?stories\b'
-    ]
-    
-    text_lower = text.lower().strip()
-    
-    for pattern in news_patterns:
-        match = re.search(pattern, text_lower, re.I)
-        if match:
-            # Extract topic or source if specified
-            topic = None
-            source = None
-            
-            # Look for specific sources
-            source_patterns = {
-                'google': r'\b(google)\s+news\b',
-                'cnn': r'\b(cnn)\b',
-                'bbc': r'\b(bbc)\b', 
-                'reuters': r'\b(reuters)\b',
-                'ap': r'\b(ap|associated\s+press)\b'
-            }
-            
-            for src, src_pattern in source_patterns.items():
-                if re.search(src_pattern, text_lower):
-                    source = src
-                    break
-            
-            # Extract topic from various patterns
-            topic_patterns = [
-                r'news\s+(?:about|on|regarding)\s+(.+?)(?:\s+from|\s+on|\?|$)',
-                r'latest\s+(.+?)\s+news',
-                r'headlines?\s+(?:about|on)\s+(.+?)(?:\?|$)',
-                r'what\'?s\s+happening\s+(?:in|with|about)\s+(.+?)(?:\?|$)'
-            ]
-            
-            for topic_pattern in topic_patterns:
-                topic_match = re.search(topic_pattern, text_lower)
-                if topic_match:
-                    topic = topic_match.group(1).strip()
-                    # Clean up common words
-                    topic = re.sub(r'\b(the|a|an|in|on|at|from)\b', '', topic).strip()
-                    break
-            
-            logger.info(f"📰 News intent detected - Topic: {topic}, Source: {source}")
-            
-            return IntentResult("news", {
-                "topic": topic,
-                "source": source,
-                "original_query": text,
-                "requires_search": True
-            })
-    
-    return None
-
-def detect_weather_intent(text: str) -> Optional[IntentResult]:
-    weather_patterns = [
-        r'\bweather\b',
-        r'\btemperature\b',
-        r'\bforecast\b',
-        r'\brain\b',
-        r'\bsnow\b',
-        r'\bsunny\b'
-    ]
-    
-    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
-        return IntentResult("weather", {})
-    return None
-
-def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
-    """Enhanced intent detection with better news support"""
-    
-    # Check for news intent first since it's a common request
-    news_intent = detect_news_intent(text)
-    if news_intent:
-        return news_intent
-    
-    # Check for weather intent
-    weather_intent = detect_weather_intent(text)
-    if weather_intent:
-        return weather_intent
-    
-    # Add other intent detections here...
-    
-    return None
-
-# === Enhanced News Functions ===
-def get_google_news(query=None, num_results=5):
-    """
-    Fetch news specifically from Google News using SerpAPI
-    """
-    if not SERPAPI_API_KEY:
-        return "News search unavailable - service not configured."
-    
-    # Default to general news if no specific query
-    if not query:
-        query = "latest news headlines"
-    
-    url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google_news",  # Specific Google News engine
-        "q": query,
-        "num": min(num_results, 10),
-        "api_key": SERPAPI_API_KEY,
-        "hl": "en",
-        "gl": "us",
-        "tbm": "nws"  # News tab
-    }
-    
-    try:
-        logger.info(f"📰 Fetching Google News for: {query}")
-        
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code != 200:
-            logger.error(f"❌ Google News API error: {response.status_code}")
-            return f"News service temporarily unavailable (Error: {response.status_code})"
-            
-        data = response.json()
-        
-        # Check for API errors
-        if 'error' in data:
-            logger.error(f"❌ SerpAPI Google News error: {data['error']}")
-            return "News service error. Please try again later."
-        
-        logger.info(f"📊 Google News response keys: {list(data.keys())}")
-        
-        # Process Google News results
-        news_results = data.get("news_results", [])
-        
-        if not news_results:
-            logger.warning(f"⚠️ No news results found for: {query}")
-            return f"No recent news found for '{query}'. Try a different topic."
-        
-        # Format the top news stories
-        formatted_news = []
-        
-        for i, article in enumerate(news_results[:3]):  # Top 3 stories
-            title = article.get('title', '')
-            source = article.get('source', '')
-            date = article.get('date', '')
-            snippet = article.get('snippet', '')
-            
-            # Build news item
-            news_item = f"📰 {title}"
-            
-            if source:
-                news_item += f" — {source}"
-            
-            if date:
-                # Clean up date format if needed
-                clean_date = date.replace(' ago', '').replace('hours', 'hrs').replace('minutes', 'min')
-                news_item += f" ({clean_date})"
-            
-            if snippet and len(news_item) < 400:  # Add snippet if there's room
-                snippet_preview = snippet[:100] + "..." if len(snippet) > 100 else snippet
-                news_item += f"\n{snippet_preview}"
-            
-            formatted_news.append(news_item)
-        
-        # Combine all news items
-        if len(formatted_news) == 1:
-            result = formatted_news[0]
-        else:
-            result = "\n\n".join(formatted_news)
-        
-        # Ensure it fits SMS limits
-        if len(result) > 1500:
-            result = result[:1497] + "..."
-        
-        logger.info(f"✅ Formatted {len(formatted_news)} Google News articles")
-        return result
-        
-    except Exception as e:
-        logger.error(f"💥 Google News fetch error: {e}")
-        return "News service temporarily unavailable. Please try again later."
-
-def get_topic_news(topic, source=None, num_results=3):
-    """
-    Get news about a specific topic, optionally from a specific source
-    """
-    if not SERPAPI_API_KEY:
-        return "News search unavailable - service not configured."
-    
-    # Build search query
-    if source:
-        if source.lower() == 'google':
-            # For Google News, use the dedicated function
-            return get_google_news(topic, num_results)
-        else:
-            query = f"{topic} site:{source}.com"
-    else:
-        query = f"{topic} news"
-    
-    url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google",
-        "q": query,
-        "num": min(num_results, 5),
-        "api_key": SERPAPI_API_KEY,
-        "hl": "en",
-        "gl": "us",
-        "tbm": "nws"  # News search
-    }
-    
-    try:
-        logger.info(f"📰 Searching news for topic: {topic}, source: {source}")
-        
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code != 200:
-            logger.error(f"❌ News search API error: {response.status_code}")
-            return f"News search temporarily unavailable"
-            
-        data = response.json()
-        
-        # Process news results
-        news_results = data.get("news_results", [])
-        
-        if not news_results:
-            # Try regular search if news results are empty
-            organic_results = data.get("organic_results", [])
-            if organic_results:
-                # Filter for news-like results
-                news_results = [
-                    result for result in organic_results 
-                    if any(indicator in result.get('source', '').lower() 
-                          for indicator in ['news', 'cnn', 'bbc', 'reuters', 'ap', 'times'])
-                ]
-        
-        if not news_results:
-            return f"No recent news found about '{topic}'. Try a different topic or check the spelling."
-        
-        # Format the results
-        if len(news_results) == 1:
-            article = news_results[0]
-            title = article.get('title', '')
-            source_name = article.get('source', '')
-            snippet = article.get('snippet', '')
-            
-            result = f"📰 {title}"
-            if source_name:
-                result += f" — {source_name}"
-            if snippet:
-                result += f"\n{snippet}"
-        else:
-            # Multiple articles - create a summary
-            headlines = []
-            for article in news_results[:3]:
-                title = article.get('title', '')
-                source_name = article.get('source', '')
-                if title:
-                    headline = f"• {title}"
-                    if source_name:
-                        headline += f" ({source_name})"
-                    headlines.append(headline)
-            
-            result = f"📰 Latest news about {topic}:\n\n" + "\n\n".join(headlines)
-        
-        # Ensure SMS length limits
-        if len(result) > 1500:
-            result = result[:1497] + "..."
-        
-        logger.info(f"✅ Found news about '{topic}' from {len(news_results)} sources")
-        return result
-        
-    except Exception as e:
-        logger.error(f"💥 Topic news search error: {e}")
-        return f"Unable to fetch news about '{topic}' right now. Please try again later."
-
-def get_breaking_news():
-    """
-    Get breaking/trending news stories
-    """
-    if not SERPAPI_API_KEY:
-        return "Breaking news unavailable - service not configured."
-    
-    # Search for breaking news
-    breaking_queries = [
-        "breaking news today",
-        "trending news headlines", 
-        "top news stories today"
-    ]
-    
-    for query in breaking_queries:
-        try:
-            result = get_google_news(query, num_results=3)
-            if "unavailable" not in result.lower() and "no recent news" not in result.lower():
-                return f"🚨 {result}"
-        except:
-            continue
-    
-    return "Unable to fetch breaking news right now. Please try again later."
-
-# === Enhanced Web Search ===
-def enhanced_web_search(q, num=3, search_type="general"):
-    """Enhanced web search with better news handling"""
-    
-    if not SERPAPI_API_KEY:
-        return "Search unavailable - service not configured."
-    
-    q = q.strip()
-    if len(q) < 2:
-        return "Search query too short."
-    
-    # Handle news searches specifically
-    if search_type == "news":
-        # Check if it's a general news request
-        if any(keyword in q.lower() for keyword in ['latest news', 'headlines', 'breaking news', 'current events']):
-            return get_google_news()
-        else:
-            # Topic-specific news
-            return get_topic_news(q)
-    
-    # For other search types, use the existing logic
-    url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google",
-        "q": q,
-        "num": min(num, 5),
-        "api_key": SERPAPI_API_KEY,
-        "hl": "en",
-        "gl": "us",
-    }
-    
-    if search_type == "local":
-        params["engine"] = "google_maps"
-    elif search_type == "news":
-        params["tbm"] = "nws"
-    
-    try:
-        logger.info(f"🔍 Enhanced search: {q} (type: {search_type})")
-        r = requests.get(url, params=params, timeout=15)
-        
-        if r.status_code != 200:
-            return f"Search error (status {r.status_code})"
-            
-        data = r.json()
-        
-        # Process results based on search type
-        if search_type == "news":
-            news_results = data.get("news_results", [])
-            if news_results:
-                top_article = news_results[0]
-                title = top_article.get('title', '')
-                source = top_article.get('source', '')
-                snippet = top_article.get('snippet', '')
-                
-                result = f"📰 {title}"
-                if source:
-                    result += f" — {source}"
-                if snippet:
-                    result += f"\n{snippet}"
-                return result[:500]
-        
-        # Default processing for other types
-        organic_results = data.get("organic_results", [])
-        if organic_results:
-            top = organic_results[0]
-            title = top.get("title", "")
-            snippet = top.get("snippet", "")
-            
-            result = f"{title}"
-            if snippet:
-                result += f" — {snippet}"
-            return result[:500]
-        
-        return f"No results found for '{q}'."
-        
-    except Exception as e:
-        logger.error(f"Enhanced search error: {e}")
-        return "Search service temporarily unavailable."
-
-# === User Profile & Onboarding System ===
+# === Onboarding System ===
 def get_user_profile(phone):
-    """Enhanced get_user_profile with debugging and phone format flexibility"""
+    """Get user profile and onboarding status"""
     try:
-        # First try the original phone number
-        placeholder = "%s" if USE_POSTGRES else "?"
-        result = execute_db_query(f"""
-            SELECT first_name, location, onboarding_step, onboarding_completed
-            FROM user_profiles
-            WHERE phone = {placeholder}
-        """, (phone,), fetch='one')
-        
-        if result:
-            logger.info(f"✅ Found profile for {phone} (exact match)")
-            return {
-                'first_name': result[0],
-                'location': result[1],
-                'onboarding_step': result[2],
-                'onboarding_completed': bool(result[3])
-            }
-        
-        # If not found, try normalized phone number
-        normalized = normalize_phone_number(phone)
-        if normalized != phone:
-            result = execute_db_query(f"""
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
                 SELECT first_name, location, onboarding_step, onboarding_completed
                 FROM user_profiles
-                WHERE phone = {placeholder}
-            """, (normalized,), fetch='one')
+                WHERE phone = ?
+            """, (phone,))
+            result = c.fetchone()
             
             if result:
-                logger.info(f"✅ Found profile for {phone} (normalized as {normalized})")
                 return {
                     'first_name': result[0],
                     'location': result[1],
                     'onboarding_step': result[2],
                     'onboarding_completed': bool(result[3])
                 }
-        
-        # If still not found, log debug info for whitelisted users
-        whitelist = load_whitelist()
-        if phone in whitelist or normalized in whitelist:
-            logger.warning(f"❌ Whitelisted user {phone} has no profile - may need recovery")
-            debug_phone_lookup(phone)
-        
-        return None
-        
+            else:
+                return None
     except Exception as e:
         logger.error(f"Error getting user profile for {phone}: {e}")
         return None
 
 def create_user_profile(phone):
-    """Create new user profile for onboarding with enhanced debugging"""
+    """Create new user profile for onboarding"""
     try:
-        original_phone = phone
-        phone = normalize_phone_number(phone)
-        
-        logger.info(f"📝 Creating user profile - Original: {original_phone}, Normalized: {phone}")
-        
-        # Check if profile already exists
-        placeholder = "%s" if USE_POSTGRES else "?"
-        existing = execute_db_query(f"SELECT phone, onboarding_completed FROM user_profiles WHERE phone = {placeholder}", 
-                                  (phone,), fetch='one')
-        
-        if existing:
-            logger.info(f"👤 Profile already exists for {phone}: completed={existing[1]}")
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT OR IGNORE INTO user_profiles 
+                (phone, onboarding_step, onboarding_completed)
+                VALUES (?, 1, FALSE)
+            """, (phone,))
+            conn.commit()
+            logger.info(f"📝 Created user profile for {phone}")
             return True
-        
-        # Create new profile
-        if USE_POSTGRES:
-            query = """
-                INSERT INTO user_profiles 
-                (phone, onboarding_step, onboarding_completed, created_date, updated_date)
-                VALUES (%s, 1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                RETURNING id
-            """
-            result = execute_db_query(query, (phone,), fetch='one')
-            profile_id = result[0] if result else None
-        else:
-            query = """
-                INSERT INTO user_profiles 
-                (phone, onboarding_step, onboarding_completed, created_date, updated_date)
-                VALUES (?, 1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """
-            execute_db_query(query, (phone,))
-            profile_id = execute_db_query("SELECT last_insert_rowid()", fetch='one')[0]
-        
-        # Verify creation
-        created = execute_db_query(f"SELECT id, phone FROM user_profiles WHERE phone = {placeholder}", 
-                                 (phone,), fetch='one')
-        
-        logger.info(f"📝 Profile creation result - ID: {profile_id}, Created: {created}")
-        
-        if created:
-            logger.info(f"✅ Successfully created user profile for {phone} (ID: {created[0]})")
-            return True
-        else:
-            logger.error(f"❌ Failed to create profile for {phone} - no record found after insert")
-            return False
-        
     except Exception as e:
-        logger.error(f"💥 Error creating user profile for {phone}: {e}")
-        # Log database state for debugging
-        try:
-            profile_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
-            logger.error(f"📊 Current profile count in database: {profile_count}")
-        except:
-            logger.error("📊 Could not check database state")
+        logger.error(f"Error creating user profile for {phone}: {e}")
         return False
 
 def update_user_profile(phone, first_name=None, location=None, onboarding_step=None, onboarding_completed=None):
     """Update user profile information"""
     try:
-        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             
@@ -885,7 +393,6 @@ def update_user_profile(phone, first_name=None, location=None, onboarding_step=N
 def log_onboarding_step(phone, step, response):
     """Log onboarding step response"""
     try:
-        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -975,7 +482,6 @@ def get_user_context_for_queries(phone):
 def log_whitelist_event(phone, action):
     """Log whitelist addition/removal events"""
     try:
-        phone = normalize_phone_number(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("""
@@ -987,6 +493,7 @@ def log_whitelist_event(phone, action):
     except Exception as e:
         logger.error(f"Error logging whitelist event: {e}")
 
+# === Enhanced Whitelist Management with Auto-Welcome ===
 def add_to_whitelist(phone, send_welcome=True):
     """Enhanced whitelist addition with automatic welcome message and onboarding"""
     if not phone:
@@ -1068,163 +575,12 @@ def remove_from_whitelist(phone, send_goodbye=False):
         logger.info(f"📱 {phone} not in whitelist")
         return True
 
-# === Database Initialization ===
-def init_db():
-    try:
-        db_info = f"PostgreSQL ({DB_CONFIG['host']})" if USE_POSTGRES else f"SQLite ({DB_PATH})"
-        logger.info(f"🗄️ Initializing database: {db_info}")
-        
-        with get_db_connection() as conn:
-            if USE_POSTGRES:
-                c = conn.cursor()
-            else:
-                c = conn.cursor()
-            
-            # Check existing tables
-            if USE_POSTGRES:
-                c.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            else:
-                c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            existing_tables = [row[0] for row in c.fetchall()]
-            logger.info(f"📊 Existing tables: {existing_tables}")
-            
-            # Create tables with appropriate SQL syntax
-            if USE_POSTGRES:
-                # PostgreSQL syntax
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                    content TEXT NOT NULL,
-                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    intent_type TEXT,
-                    response_time_ms INTEGER
-                );
-                """)
-                
-                c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_messages_phone_ts 
-                ON messages(phone, ts DESC);
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT UNIQUE NOT NULL,
-                    first_name TEXT,
-                    location TEXT,
-                    onboarding_step INTEGER DEFAULT 0,
-                    onboarding_completed BOOLEAN DEFAULT FALSE,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_profiles_phone 
-                ON user_profiles(phone);
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS onboarding_log (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    step INTEGER NOT NULL,
-                    response TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS whitelist_events (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('added','removed')),
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    source TEXT DEFAULT 'manual'
-                );
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS sms_delivery_log (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    message_content TEXT NOT NULL,
-                    clicksend_response TEXT,
-                    delivery_status TEXT,
-                    message_id TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS monthly_sms_usage (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    message_count INTEGER DEFAULT 1,
-                    period_start DATE NOT NULL,
-                    period_end DATE NOT NULL,
-                    last_message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    quota_warnings_sent INTEGER DEFAULT 0,
-                    quota_exceeded BOOLEAN DEFAULT FALSE,
-                    UNIQUE(phone, period_start)
-                );
-                """)
-                
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS usage_analytics (
-                    id SERIAL PRIMARY KEY,
-                    phone TEXT NOT NULL,
-                    intent_type TEXT,
-                    success BOOLEAN,
-                    response_time_ms INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                
-            else:
-                # SQLite syntax (existing code)
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-                    content TEXT NOT NULL,
-                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    intent_type TEXT,
-                    response_time_ms INTEGER
-                );
-                """)
-                
-                # ... (rest of SQLite table creation code)
-            
-            conn.commit()
-            
-            # Check for existing data
-            if USE_POSTGRES:
-                c.execute("SELECT COUNT(*) FROM user_profiles")
-                user_count = c.fetchone()[0]
-                c.execute("SELECT COUNT(*) FROM messages")
-                message_count = c.fetchone()[0]
-            else:
-                user_count = execute_db_query("SELECT COUNT(*) FROM user_profiles", fetch='one')[0]
-                message_count = execute_db_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
-            
-            logger.info(f"📊 Database initialized successfully")
-            logger.info(f"📊 Found {user_count} user profiles and {message_count} messages")
-            
-    except Exception as e:
-        logger.error(f"💥 Database initialization error: {e}")
-        raise
-
 # === SMS Functions ===
 def send_sms(to_number, message, bypass_quota=False):
     if not CLICKSEND_USERNAME or not CLICKSEND_API_KEY:
         logger.error("ClickSend credentials not configured")
         return {"error": "SMS service not configured"}
     
-    to_number = normalize_phone_number(to_number)
     url = "https://rest.clicksend.com/v3/sms/send"
     headers = {"Content-Type": "application/json"}
     
@@ -1275,7 +631,6 @@ def send_sms(to_number, message, bypass_quota=False):
         return {"error": f"SMS send failed: {str(e)}"}
 
 def log_sms_delivery(phone, message_content, clicksend_response, delivery_status, message_id):
-    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1285,49 +640,15 @@ def log_sms_delivery(phone, message_content, clicksend_response, delivery_status
         conn.commit()
 
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
-    """Save message with enhanced debugging"""
-    try:
-        original_phone = phone
-        phone = normalize_phone_number(phone)
-        
-        logger.info(f"💬 Saving message - Phone: {original_phone} -> {phone}, Role: {role}, Content: {content[:50]}...")
-        
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
-                VALUES (?, ?, ?, ?, ?)
-            """, (phone, role, content, intent_type, response_time_ms))
-            
-            rows_affected = c.rowcount
-            message_id = c.lastrowid
-            conn.commit()
-            
-            logger.info(f"💬 Message saved - ID: {message_id}, Rows affected: {rows_affected}")
-            
-            # Verify save
-            c.execute("SELECT id FROM messages WHERE phone = ? ORDER BY id DESC LIMIT 1", (phone,))
-            verify = c.fetchone()
-            
-            if verify:
-                logger.info(f"✅ Message verification successful - Latest message ID: {verify[0]}")
-            else:
-                logger.error(f"❌ Message verification failed - no messages found for {phone}")
-                
-    except Exception as e:
-        logger.error(f"💥 Error saving message for {phone}: {e}")
-        # Log database state
-        try:
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                c = conn.cursor()
-                c.execute("SELECT COUNT(*) FROM messages")
-                count = c.fetchone()[0]
-                logger.error(f"📊 Current message count in database: {count}")
-        except:
-            logger.error("📊 Could not check message count")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO messages (phone, role, content, intent_type, response_time_ms) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (phone, role, content, intent_type, response_time_ms))
+        conn.commit()
 
 def load_history(phone, limit=4):
-    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1341,7 +662,6 @@ def load_history(phone, limit=4):
     return [{"role": r, "content": t} for (r, t) in reversed(rows)]
 
 def log_usage_analytics(phone, intent_type, success, response_time_ms):
-    phone = normalize_phone_number(phone)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
@@ -1360,7 +680,6 @@ def track_monthly_sms_usage(phone, is_outgoing=True):
     if not is_outgoing:
         return True, {}, None
     
-    phone = normalize_phone_number(phone)
     period_start, period_end = get_current_period_dates()
     
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -1460,6 +779,84 @@ class ContentFilter:
 
 content_filter = ContentFilter()
 
+# === Intent Detection ===
+@dataclass
+class IntentResult:
+    type: str
+    entities: Dict[str, Any]
+    confidence: float = 1.0
+
+def detect_weather_intent(text: str) -> Optional[IntentResult]:
+    weather_patterns = [
+        r'\bweather\b',
+        r'\btemperature\b',
+        r'\bforecast\b',
+        r'\brain\b',
+        r'\bsnow\b',
+        r'\bsunny\b'
+    ]
+    
+    if any(re.search(pattern, text, re.I) for pattern in weather_patterns):
+        return IntentResult("weather", {})
+    return None
+
+def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
+    return detect_weather_intent(text)
+
+# === Web Search ===
+def web_search(q, num=3, search_type="general"):
+    if not SERPAPI_API_KEY:
+        logger.warning("❌ SERPAPI_API_KEY not configured - search unavailable")
+        return "I'd love to search for that information, but my search service isn't configured right now. Please contact support."
+    
+    q = q.strip()
+    if len(q) < 2:
+        return "Search query too short."
+    
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google",
+        "q": q,
+        "num": min(num, 5),
+        "api_key": SERPAPI_API_KEY,
+        "hl": "en",
+        "gl": "us",
+    }
+    
+    try:
+        logger.info(f"🔍 Searching: {q}")
+        r = requests.get(url, params=params, timeout=15)
+        
+        if r.status_code != 200:
+            logger.error(f"❌ Search API error: {r.status_code}")
+            return f"Search temporarily unavailable. Try again later."
+            
+        data = r.json()
+        logger.info(f"✅ Search response received")
+        
+        # Check for API errors in response
+        if 'error' in data:
+            logger.error(f"❌ SerpAPI error: {data['error']}")
+            return "Search service error. Please try again later."
+        
+    except Exception as e:
+        logger.error(f"💥 Search exception: {e}")
+        return "Search service temporarily unavailable. Try again later."
+
+    # Process results
+    org = data.get("organic_results", [])
+    if org:
+        top = org[0]
+        title = top.get("title", "")
+        snippet = top.get("snippet", "")
+        
+        result = f"{title}"
+        if snippet:
+            result += f" — {snippet}"
+        return result[:500]
+    
+    return f"No results found for '{q}'."
+
 # === Claude Integration ===
 def ask_claude(phone, user_msg):
     start_time = time.time()
@@ -1474,14 +871,12 @@ def ask_claude(phone, user_msg):
         system_context = """You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- Keep responses under 700 characters when possible for SMS
-- Be friendly and helpful  
+- Keep responses under 500 characters when possible for SMS
+- Be friendly and helpful
 - You DO have access to web search capabilities
-- For specific information requests, provide direct answers when you have knowledge, or respond with "Let me search for [specific topic]" if you need current information
-- Never make up detailed information - always offer to search for accurate, current details when uncertain
-- Be conversational and helpful
-- Don't mention searching unless you actually need to search
-- Don't add location context unless the query specifically relates to location"""
+- For specific information requests, respond with "Let me search for [specific topic]" 
+- Never make up detailed information - always offer to search for accurate, current details
+- Be conversational and helpful"""
         
         try:
             headers = {
@@ -1548,11 +943,11 @@ IMPORTANT GUIDELINES:
             if match:
                 search_term = match.group(1).strip()
                 logger.info(f"🔍 Claude suggested search for: {search_term}")
-                search_result = enhanced_web_search(search_term, search_type="general")
+                search_result = web_search(search_term, search_type="general")
                 return search_result
         
-        if len(reply) > 700:
-            reply = reply[:697] + "..."
+        if len(reply) > 500:
+            reply = reply[:497] + "..."
             
         response_time = int((time.time() - start_time) * 1000)
         log_usage_analytics(phone, "claude_chat", True, response_time)
@@ -1581,6 +976,81 @@ def save_usage(data):
     except Exception as e:
         logger.error(f"Failed to save usage data: {e}")
 
+# === Stripe Webhook (only if Stripe is available) ===
+if STRIPE_AVAILABLE:
+    @app.route('/webhook/stripe', methods=['POST'])
+    def stripe_webhook():
+        """Handle Stripe webhook events for subscription management"""
+        payload = request.get_data(as_text=True)
+        sig_header = request.headers.get('Stripe-Signature')
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError as e:
+            logger.error(f"Invalid payload in Stripe webhook: {e}")
+            return jsonify({"error": "Invalid payload"}), 400
+        except stripe.SignatureVerificationError as e:
+            logger.error(f"Invalid signature in Stripe webhook: {e}")
+            return jsonify({"error": "Invalid signature"}), 400
+
+        logger.info(f"🔔 Received Stripe webhook: {event['type']}")
+        
+        # Handle the event
+        if event['type'] == 'customer.subscription.created':
+            subscription = event['data']['object']
+            customer_id = subscription['customer']
+            
+            try:
+                customer = stripe.Customer.retrieve(customer_id)
+                phone = customer.metadata.get('phone')
+                
+                if phone:
+                    phone = normalize_phone_number(phone)
+                    add_to_whitelist(phone, send_welcome=True)
+                    logger.info(f"✅ Added {phone} to whitelist via Stripe subscription created")
+                else:
+                    logger.warning(f"⚠️ No phone in customer metadata for subscription created: {customer_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing subscription created: {e}")
+        
+        elif event['type'] == 'customer.subscription.deleted':
+            subscription = event['data']['object']
+            customer_id = subscription['customer']
+            
+            try:
+                customer = stripe.Customer.retrieve(customer_id)
+                phone = customer.metadata.get('phone')
+                
+                if phone:
+                    phone = normalize_phone_number(phone)
+                    remove_from_whitelist(phone, send_goodbye=True)
+                    logger.info(f"❌ Removed {phone} from whitelist via Stripe subscription deleted")
+                else:
+                    logger.warning(f"⚠️ No phone in customer metadata for subscription deleted: {customer_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing subscription deleted: {e}")
+        
+        elif event['type'] == 'invoice.payment_failed':
+            invoice = event['data']['object']
+            customer_id = invoice['customer']
+            
+            try:
+                customer = stripe.Customer.retrieve(customer_id)
+                phone = customer.metadata.get('phone')
+                
+                if phone:
+                    logger.warning(f"💳 Payment failed for {phone}")
+                    # Optionally send a warning SMS
+                    
+            except Exception as e:
+                logger.error(f"Error processing payment failed: {e}")
+        
+        return jsonify({"status": "success"}), 200
+
 # === Main SMS Webhook ===
 @app.route("/sms", methods=["POST"])
 @handle_errors  
@@ -1597,9 +1067,6 @@ def sms_webhook():
     
     if not body:
         return jsonify({"message": "Empty message received"}), 200
-    
-    # Normalize sender phone number
-    sender = normalize_phone_number(sender)
     
     # Check whitelist
     whitelist = load_whitelist()
@@ -1643,80 +1110,19 @@ def sms_webhook():
             logger.error(f"Failed to send start message: {e}")
             return jsonify({"error": "Failed to send start message"}), 500
     
-    # Enhanced user profile checking with debugging
+    # Check if user needs to complete onboarding
     profile = get_user_profile(sender)
     logger.info(f"👤 User profile for {sender}: {profile}")
     
-    # Special case: If user is in whitelist but has no profile, it might be a recovery case
     if not profile:
-        logger.warning(f"🔍 User {sender} in whitelist but no profile found - investigating...")
-        
-        # Enhanced debugging for this specific case
-        debug_state = debug_database_state()
-        debug_phone_lookup(sender)
-        
-        # Check database permissions and connectivity
-        try:
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                c = conn.cursor()
-                c.execute("SELECT 1")
-                logger.info(f"✅ Database connection test successful")
-                
-                # Check if we can write to the database (using valid role)
-                c.execute("INSERT INTO messages (phone, role, content) VALUES (?, 'user', 'connection_test')", (sender,))
-                test_id = c.lastrowid
-                c.execute("DELETE FROM messages WHERE id = ?", (test_id,))
-                conn.commit()
-                logger.info(f"✅ Database write test successful")
-                
-        except Exception as db_error:
-            logger.error(f"💥 Database connectivity issue: {db_error}")
-            
-            # Send error message and return
-            error_msg = "Sorry, I'm having database issues. Please contact support."
-            try:
-                send_sms(sender, error_msg, bypass_quota=True)
-                return jsonify({"message": "Database error sent"}), 500
-            except Exception as sms_error:
-                logger.error(f"Failed to send database error message: {sms_error}")
-                return jsonify({"error": "Database connectivity failed"}), 500
-        
-        # If we have other users in the database, this might be a lookup issue
-        if debug_state and debug_state['profile_count'] > 0:
-            logger.warning(f"📊 Database has {debug_state['profile_count']} profiles, but lookup failed for {sender}")
-        
-        # Try to create new profile with enhanced logging
-        logger.info(f"📝 Attempting to create new profile for {sender}")
-        creation_success = create_user_profile(sender)
-        
-        if not creation_success:
-            logger.error(f"💥 Failed to create profile for {sender}")
-            error_msg = "Sorry, I'm having trouble setting up your account. Please contact support."
-            try:
-                send_sms(sender, error_msg, bypass_quota=True)
-                return jsonify({"message": "Profile creation failed"}), 500
-            except Exception as sms_error:
-                logger.error(f"Failed to send profile creation error: {sms_error}")
-                return jsonify({"error": "Profile creation failed"}), 500
-        
-        # Try to get the profile again
-        profile = get_user_profile(sender)
-        if not profile:
-            logger.error(f"💥 Profile creation appeared successful but still can't retrieve for {sender}")
-            error_msg = "Sorry, I'm having trouble with your account setup. Please contact support."
-            try:
-                send_sms(sender, error_msg, bypass_quota=True)
-                return jsonify({"message": "Profile retrieval failed"}), 500
-            except Exception as sms_error:
-                logger.error(f"Failed to send profile retrieval error: {sms_error}")
-                return jsonify({"error": "Profile retrieval failed"}), 500
-        
-        logger.info(f"✅ Successfully created and retrieved profile for {sender}")
+        # No profile exists - create one and start onboarding
+        logger.info(f"📝 No profile found for {sender}, creating new profile")
+        create_user_profile(sender)
         
         try:
             send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
             save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"message": "Onboarding started"}), 200
+            return jsonify({"message": "Onboarding started for new user"}), 200
         except Exception as e:
             logger.error(f"Failed to send onboarding start message: {e}")
             return jsonify({"error": "Failed to start onboarding"}), 500
@@ -1751,7 +1157,7 @@ def sms_webhook():
     # User is fully onboarded - continue to normal processing
     logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
     
-    # User is onboarded, process normal queries with enhanced news support
+    # User is onboarded, process normal queries
     intent = detect_intent(body, sender)
     intent_type = intent.type if intent else "general"
     
@@ -1759,60 +1165,22 @@ def sms_webhook():
     user_context = get_user_context_for_queries(sender)
     
     try:
-        # Enhanced processing based on intent
-        if intent and intent.type == "news":
-            # Handle news requests
-            entities = intent.entities
-            topic = entities.get("topic")
-            source = entities.get("source")
-            
-            logger.info(f"📰 Processing news request - Topic: {topic}, Source: {source}")
-            
-            if source == "google" or "google news" in body.lower():
-                # Specific Google News request
-                if topic:
-                    response_msg = get_google_news(topic)
-                else:
-                    response_msg = get_google_news()
-            elif topic and source:
-                # Topic + specific source
-                response_msg = get_topic_news(topic, source)
-            elif topic:
-                # Just topic, any source
-                response_msg = get_topic_news(topic)
-            elif "breaking" in body.lower():
-                # Breaking news request
-                response_msg = get_breaking_news()
-            else:
-                # General news request
-                response_msg = get_google_news()
-            
-            # Personalize if user is onboarded
-            if user_context['personalized']:
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-        
-        elif intent and intent.type == "weather":
+        # Process based on intent
+        if intent and intent.type == "weather":
             # Use user's location if no city specified and user is onboarded
             if user_context['personalized']:
                 city = user_context['location']
                 logger.info(f"🌍 Using user's saved location: {city}")
                 query = f"weather forecast {city}"
-                response_msg = enhanced_web_search(query, search_type="general")
+                response_msg = web_search(query, search_type="general")
                 first_name = user_context['first_name']
                 response_msg = f"Hi {first_name}! " + response_msg
             else:
-                response_msg = enhanced_web_search("weather forecast", search_type="general")
-        
+                response_msg = web_search("weather forecast", search_type="general")
         else:
             # Use Claude for general queries with user context
             if user_context['personalized']:
-                # Only add location context for location-specific queries
-                location_keywords = ['near', 'in', 'around', 'restaurant', 'weather', 'business', 'store']
-                if any(keyword in body.lower() for keyword in location_keywords):
-                    personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                else:
-                    personalized_msg = f"User's name is {user_context['first_name']}. " + body
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
                 response_msg = ask_claude(sender, personalized_msg)
             else:
                 response_msg = ask_claude(sender, body)
@@ -1820,26 +1188,10 @@ def sms_webhook():
             # If Claude suggests a search, perform it
             if "Let me search for" in response_msg:
                 search_term = body
-                
-                # Check if it's a news-related search
-                if any(keyword in body.lower() for keyword in ['news', 'headlines', 'breaking', 'current events']):
-                    # Detect if it's news and route accordingly
-                    news_intent_check = detect_news_intent(body)
-                    if news_intent_check:
-                        if news_intent_check.entities.get("topic"):
-                            response_msg = get_topic_news(news_intent_check.entities["topic"])
-                        else:
-                            response_msg = get_google_news()
-                    else:
-                        response_msg = enhanced_web_search(search_term, search_type="news")
-                else:
-                    # Only add location context for location-relevant searches
-                    location_keywords = ['near', 'in', 'around', 'restaurant', 'weather', 'business', 'store']
-                    if (user_context['personalized'] and 
-                        any(keyword in body.lower() for keyword in location_keywords) and 
-                        not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at '])):
-                        search_term += f" in {user_context['location']}"
-                    response_msg = enhanced_web_search(search_term, search_type="general")
+                # Add location context to search if available
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
         
         # Ensure response is not too long for SMS
         if len(response_msg) > 1600:
@@ -1875,79 +1227,7 @@ def sms_webhook():
             logger.error(f"Failed to send fallback message: {fallback_error}")
             return jsonify({"error": "Processing failed"}), 500
 
-# === Debug and Admin Endpoints ===
-@app.route('/debug/user/<phone>', methods=['GET'])
-def debug_user(phone):
-    """Debug endpoint to check a specific user"""
-    try:
-        phone = normalize_phone_number(phone)
-        
-        # Get debug info
-        db_state = debug_database_state()
-        phone_debug = debug_phone_lookup(phone)
-        profile = get_user_profile(phone)
-        
-        return jsonify({
-            'phone': phone,
-            'database_state': db_state,
-            'phone_debug': phone_debug,
-            'profile': profile,
-            'in_whitelist': phone in load_whitelist()
-        })
-        
-    except Exception as e:
-                return jsonify({'error': str(e)}), 500
-
-@app.route('/debug/database', methods=['GET'])
-def debug_database():
-    """Debug endpoint to check database state"""
-    try:
-        debug_state = debug_database_state()
-        return jsonify(debug_state)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/admin/recover-user', methods=['POST'])
-def recover_user():
-    """Recover a user who lost their profile"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        first_name = data.get('first_name', 'User')
-        location = data.get('location', 'Unknown')
-        
-        if not phone:
-            return jsonify({'error': 'Phone required'}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        # Add to whitelist if not already there
-        add_to_whitelist(phone, send_welcome=False)
-        
-        # Create or update profile as completed
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR REPLACE INTO user_profiles 
-                (phone, first_name, location, onboarding_step, onboarding_completed, created_date, updated_date)
-                VALUES (?, ?, ?, 3, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """, (phone, first_name, location))
-            conn.commit()
-        
-        logger.info(f"🔧 Recovered user {phone}: {first_name} in {location}")
-        
-        return jsonify({
-            'success': True,
-            'message': f'Recovered user {phone}',
-            'phone': phone,
-            'first_name': first_name,
-            'location': location
-        })
-        
-    except Exception as e:
-        logger.error(f"Error recovering user: {e}")
-        return jsonify({'error': str(e)}), 500
-
+# === Admin Endpoints ===
 @app.route('/admin/whitelist/add', methods=['POST'])
 def admin_add_to_whitelist():
     """Admin endpoint to manually add users to whitelist"""
@@ -2014,114 +1294,19 @@ def get_all_users():
         logger.error(f"Error getting all users: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Test Endpoints ===
-@app.route('/test/news', methods=['GET'])
-def test_news():
-    """Test endpoint to verify news functionality"""
-    try:
-        query = request.args.get('q', 'latest news')
-        search_type = request.args.get('type', 'google')
-        
-        logger.info(f"🧪 Testing news with query: {query}, type: {search_type}")
-        
-        if search_type == 'google':
-            result = get_google_news(query)
-        elif search_type == 'topic':
-            result = get_topic_news(query)
-        elif search_type == 'breaking':
-            result = get_breaking_news()
-        else:
-            result = enhanced_web_search(query, search_type="news")
-        
-        return jsonify({
-            "query": query,
-            "type": search_type,
-            "result": result,
-            "length": len(result)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in news test: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/test/intent', methods=['POST'])
-def test_intent():
-    """Test endpoint to verify intent detection"""
-    try:
-        data = request.get_json()
-        text = data.get('text', '')
-        
-        if not text:
-            return jsonify({"error": "Text required"}), 400
-        
-        intent = detect_intent(text)
-        
-        return jsonify({
-            "text": text,
-            "intent": {
-                "type": intent.type if intent else None,
-                "entities": intent.entities if intent else {},
-                "confidence": intent.confidence if intent else 0
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in intent test: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/debug/database-test/<phone>', methods=['POST'])
-def test_database_operations(phone):
-    """Test database operations for a specific phone number"""
-    try:
-        phone = normalize_phone_number(phone)
-        results = {}
-        
-        # Test 1: Basic database connection
-        try:
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                c = conn.cursor()
-                c.execute("SELECT 1")
-                results['connection'] = "✅ Success"
-        except Exception as e:
-            results['connection'] = f"❌ Failed: {e}"
-            return jsonify(results)
-        
-        # Test 2: Create user profile
-        try:
-            success = create_user_profile(phone)
-            results['create_profile'] = "✅ Success" if success else "❌ Failed"
-        except Exception as e:
-            results['create_profile'] = f"❌ Exception: {e}"
-        
-        # Test 3: Retrieve user profile
-        try:
-            profile = get_user_profile(phone)
-            results['get_profile'] = f"✅ Found: {profile}" if profile else "❌ Not found"
-        except Exception as e:
-            results['get_profile'] = f"❌ Exception: {e}"
-        
-        # Test 4: Save message
-        try:
-            save_message(phone, "user", "test message")
-            results['save_message'] = "✅ Success"
-        except Exception as e:
-            results['save_message'] = f"❌ Exception: {e}"
-        
-        # Test 5: Load history
-        try:
-            history = load_history(phone, 1)
-            results['load_history'] = f"✅ Found {len(history)} messages"
-        except Exception as e:
-            results['load_history'] = f"❌ Exception: {e}"
-        
-        return jsonify({
-            'phone': phone,
-            'tests': results,
-            'database_path': DB_PATH
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "version": APP_VERSION,
+        "services": {
+            "anthropic": "✅" if anthropic_client else "❌",
+            "serpapi": "✅" if SERPAPI_API_KEY else "❌", 
+            "clicksend": "✅" if CLICKSEND_USERNAME and CLICKSEND_API_KEY else "❌",
+            "stripe": "✅" if STRIPE_AVAILABLE else "❌"
+        }
+    })
 
 # Initialize database on startup
 init_db()
@@ -2129,22 +1314,4 @@ init_db()
 if __name__ == "__main__":
     logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
-    
-    # Test news functionality on startup if SERPAPI_API_KEY is available
-    if SERPAPI_API_KEY:
-        try:
-            test_result = get_google_news("tech news", 1)
-            if "unavailable" not in test_result.lower():
-                logger.info("✅ News functionality test passed")
-            else:
-                logger.warning("⚠️ News functionality test returned unavailable")
-        except Exception as e:
-            logger.error(f"❌ News functionality test failed: {e}")
-    else:
-        logger.warning("⚠️ SERPAPI_API_KEY not set - news functionality will be limited")
-    
-    # Debug startup state
-    logger.info("🔍 Startup Debug Information:")
-    debug_database_state()
-    
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
