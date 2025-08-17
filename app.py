@@ -879,14 +879,14 @@ def ask_claude(phone, user_msg):
 IMPORTANT GUIDELINES:
 - Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part) unless specifically asked for longer
 - If this is a "longer" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
-- Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info"
+- Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info", "Sure", or user names
 - Start immediately with the answer/information requested
-- Be friendly but brief - every character counts
+- Be factual and helpful but brief - every character counts
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- End standard responses with "Text 'longer' for more details" when relevant
-- Do NOT use the user's name or location in responses unless specifically relevant"""
+- End standard responses with "Text 'longer' for more." when relevant
+- NEVER include user names, greetings, or conversational fluff"""
         
         try:
             headers = {
@@ -908,7 +908,7 @@ IMPORTANT GUIDELINES:
             
             data = {
                 "model": "claude-3-haiku-20240307",
-                "max_tokens": 250,
+                "max_tokens": 300 if "longer" in user_msg.lower() else 150,
                 "temperature": 0.3,
                 "system": system_context,
                 "messages": messages
@@ -1601,20 +1601,27 @@ def sms_webhook():
         if is_longer_request:
             # Get the last user query for context
             last_query = get_last_user_query(sender)
-            if last_query and last_query.lower() != "longer":
+            logger.info(f"🔍 Last query found: {last_query}")
+            
+            if last_query and last_query.lower() not in ['longer', 'more info', 'more details']:
                 # Re-process the last query with longer response
-                longer_query = f"Provide detailed information about: {last_query}"
+                logger.info(f"🔍 Processing longer response for: {last_query}")
+                
+                # Use the original query for search or Claude
                 if user_context['personalized']:
-                    personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + longer_query
-                    response_msg = ask_claude(sender, personalized_msg)
+                    search_term = last_query
+                    if not any(keyword in last_query.lower() for keyword in ['in ', 'near ', 'at ']):
+                        search_term += f" in {user_context['location']}"
+                    response_msg = web_search(search_term, search_type="general")
                 else:
-                    response_msg = ask_claude(sender, longer_query)
+                    response_msg = web_search(last_query, search_type="general")
                 
                 # Use longer length limit
                 response_msg = truncate_response(response_msg, LONGER_SMS_LENGTH)
                 message_parts = 3  # Count as 3 messages
+                logger.info(f"📊 Generated longer response: {len(response_msg)} chars")
             else:
-                response_msg = "I'd be happy to provide more details! What would you like to know more about?"
+                response_msg = "Ask me a question first, then text 'longer' for more details!"
                 message_parts = 1
         
         elif intent and intent.type == "weather":
