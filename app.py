@@ -1056,6 +1056,78 @@ def handle_subscription_deleted(subscription):
                         {'error': str(e)})
 
 # === ADMIN ENDPOINTS ===
+@app.route('/admin/whitelist/remove', methods=['POST'])
+def admin_remove_from_whitelist():
+    """Admin endpoint to remove users from whitelist"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        send_goodbye = data.get('send_goodbye', False)
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        success = remove_from_whitelist(phone, send_goodbye=send_goodbye)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Removed {phone} from whitelist",
+                "goodbye_sent": send_goodbye
+            })
+        else:
+            return jsonify({"error": "Failed to remove from whitelist"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error in admin remove from whitelist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/reset-user', methods=['POST'])
+def admin_reset_user():
+    """Reset a user completely - remove from whitelist and clear database profile"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # Remove from whitelist
+        success = remove_from_whitelist(phone, send_goodbye=False)
+        if success:
+            actions_taken.append("Removed from whitelist")
+        
+        # Clear user profile from database
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    conn.commit()
+                    actions_taken.append("Removed from database")
+        except Exception as db_error:
+            logger.error(f"Database error resetting user: {db_error}")
+            actions_taken.append(f"Database error: {str(db_error)}")
+        
+        logger.info(f"👤 Reset user completely: {phone}")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Reset user {phone} completely",
+            "actions_taken": actions_taken
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting user: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/admin/restore-user', methods=['POST'])
 def admin_restore_user():
     """Admin endpoint to restore a user's complete profile"""
