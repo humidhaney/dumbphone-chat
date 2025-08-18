@@ -689,6 +689,28 @@ def log_sms_delivery(phone, message_content, clicksend_response, delivery_status
     except Exception as e:
         logger.error(f"Error logging SMS delivery: {e}")
 
+def get_last_user_query(phone):
+    """Get the last user query for context in longer responses"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT content FROM messages
+                    WHERE phone = %s AND role = 'user'
+                    ORDER BY id DESC
+                    LIMIT 2
+                """, (phone,))
+                results = c.fetchall()
+                # Get the second-to-last query (current is "more info")
+                if len(results) >= 2:
+                    return results[1]['content']
+                elif len(results) == 1:
+                    return results[0]['content']
+                return None
+    except Exception as e:
+        logger.error(f"Error getting last user query: {e}")
+        return None
+
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
     try:
         with get_db_connection() as conn:
@@ -1607,7 +1629,7 @@ def sms_webhook():
             last_query = get_last_user_query(sender)
             logger.info(f"🔍 Last query found: {last_query}")
             
-            if last_query and last_query.lower() not in ['longer', 'more info', 'more details']:
+            if last_query and last_query.lower() not in ['longer', 'more info', 'more details', 'more', 'details']:
                 # Re-process the last query with longer response
                 logger.info(f"🔍 Processing longer response for: {last_query}")
                 
