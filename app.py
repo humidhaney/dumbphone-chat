@@ -826,12 +826,41 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
 def detect_longer_request(text: str) -> bool:
     """Check if user is requesting a longer response"""
     longer_keywords = [
+        # Direct requests
         'longer', 'more info', 'more details', 'expand', 'tell me more', 'full details',
         'more', 'continue', 'go on', 'elaborate', 'explain more', 'details',
-        'full story', 'complete info', 'everything', 'all of it'
+        'full story', 'complete info', 'everything', 'all of it',
+        
+        # Question-based
+        'what else', 'anything else', 'what more', 'tell me everything', 
+        'full info', 'complete details',
+        
+        # Continuation
+        'keep going', 'more please', 'continue that', 'finish that',
+        
+        # Depth requests  
+        'deeper', 'in depth', 'comprehensive', 'thorough', 'breakdown', 'analysis',
+        
+        # Specific follow-ups
+        'schedule', 'forecast', 'menu', 'hours', 'ratings'
     ]
+    
     text_lower = text.lower().strip()
-    return any(keyword in text_lower for keyword in longer_keywords)
+    
+    # Check exact matches
+    if any(keyword in text_lower for keyword in longer_keywords):
+        return True
+    
+    # Check short casual responses (be careful with context)
+    short_triggers = ['??', 'and?', 'yep', 'yes']
+    if text_lower in short_triggers:
+        return True
+    
+    # Pattern matching for "what about..."
+    if text_lower.startswith('what about'):
+        return True
+        
+    return False
 
 def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
     return detect_weather_intent(text)
@@ -904,7 +933,8 @@ def ask_claude(phone, user_msg):
 
 IMPORTANT GUIDELINES:
 - Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part) unless specifically asked for longer
-- If this is a "longer" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
+- If this is a "longer" or "detailed" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
+- For detailed requests, include statistics, schedules, analysis, and comprehensive information
 - Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info", "Sure", or user names
 - Start immediately with the answer/information requested
 - Be factual and helpful but brief - every character counts
@@ -912,7 +942,8 @@ IMPORTANT GUIDELINES:
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
 - DO NOT end messages with prompts like "Text 'longer' for more" - let users naturally ask for more if needed
-- NEVER include user names, greetings, or conversational fluff"""
+- NEVER include user names, greetings, or conversational fluff
+- For sports queries, include scores, records, standings, recent games, and upcoming schedule when detailed info is requested"""
         
         try:
             headers = {
@@ -1629,25 +1660,31 @@ def sms_webhook():
             last_query = get_last_user_query(sender)
             logger.info(f"🔍 Last query found: {last_query}")
             
-            if last_query and last_query.lower() not in ['longer', 'more info', 'more details', 'more', 'details']:
-                # Re-process the last query with longer response
+            if last_query and last_query.lower() not in ['longer', 'more info', 'more details', 'more', 'details', 'everything', 'tell me more']:
+                # Re-process the last query with longer response using Claude for detailed analysis
                 logger.info(f"🔍 Processing longer response for: {last_query}")
                 
-                # Use the original query for search or Claude
+                # Use Claude to provide detailed information
                 if user_context['personalized']:
-                    search_term = last_query
-                    if not any(keyword in last_query.lower() for keyword in ['in ', 'near ', 'at ']):
-                        search_term += f" in {user_context['location']}"
-                    response_msg = web_search(search_term, search_type="general")
+                    detailed_query = f"Provide comprehensive detailed information about: {last_query}. User lives in {user_context['location']}. Include all relevant details, statistics, schedules, and context."
+                    response_msg = ask_claude(sender, detailed_query)
                 else:
-                    response_msg = web_search(last_query, search_type="general")
+                    detailed_query = f"Provide comprehensive detailed information about: {last_query}. Include all relevant details, statistics, schedules, and context."
+                    response_msg = ask_claude(sender, detailed_query)
+                
+                # If Claude suggests search, do a more detailed search
+                if "Let me search for" in response_msg:
+                    search_term = f"{last_query} detailed stats schedule analysis"
+                    if user_context['personalized']:
+                        search_term += f" {user_context['location']}"
+                    response_msg = web_search(search_term, search_type="general")
                 
                 # Use longer length limit
                 response_msg = truncate_response(response_msg, LONGER_SMS_LENGTH)
                 message_parts = 3  # Count as 3 messages
                 logger.info(f"📊 Generated longer response: {len(response_msg)} chars")
             else:
-                response_msg = "Ask me a question first, then text 'longer' for more details!"
+                response_msg = "Ask me a question first, then text 'details' for more comprehensive info!"
                 message_parts = 1
         
         elif intent and intent.type == "weather":
