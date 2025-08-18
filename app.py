@@ -803,7 +803,11 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
 
 def detect_longer_request(text: str) -> bool:
     """Check if user is requesting a longer response"""
-    longer_keywords = ['longer', 'more info', 'more details', 'expand', 'tell me more', 'full details']
+    longer_keywords = [
+        'longer', 'more info', 'more details', 'expand', 'tell me more', 'full details',
+        'more', 'continue', 'go on', 'elaborate', 'explain more', 'details',
+        'full story', 'complete info', 'everything', 'all of it'
+    ]
     text_lower = text.lower().strip()
     return any(keyword in text_lower for keyword in longer_keywords)
 
@@ -885,7 +889,7 @@ IMPORTANT GUIDELINES:
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- End standard responses with "Text 'longer' for more." when relevant
+- DO NOT end messages with prompts like "Text 'longer' for more" - let users naturally ask for more if needed
 - NEVER include user names, greetings, or conversational fluff"""
         
         try:
@@ -1635,8 +1639,6 @@ def sms_webhook():
                 response_msg = web_search("weather forecast", search_type="general")
             
             response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-            if not is_longer_request:
-                response_msg += " Text 'longer' for detailed forecast."
             message_parts = 1
         else:
             if user_context['personalized']:
@@ -1652,8 +1654,6 @@ def sms_webhook():
                 response_msg = web_search(search_term, search_type="general")
             
             response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-            if not is_longer_request and len(response_msg) >= MAX_SMS_LENGTH - 50:
-                response_msg = response_msg[:-30] + " Text 'longer' for more."
             message_parts = 1
         
         original_length = len(response_msg)
