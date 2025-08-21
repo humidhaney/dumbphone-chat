@@ -1725,7 +1725,7 @@ def health_check():
         'database_type': 'PostgreSQL',
         'sms_char_limit': MAX_SMS_LENGTH,
         'monthly_message_limit': MONTHLY_LIMIT,
-        'message_parts_per_response': 2
+        'message_parts_per_response': 2,
         'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
         'admin_endpoints': [
             '/admin/remove-user',
