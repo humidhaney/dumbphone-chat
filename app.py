@@ -41,8 +41,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.3"
+APP_VERSION = "4.2"
 CHANGELOG = {
+    "4.2": "PERFECT BALANCE: 200 messages/month at 320 characters each (2 SMS parts) - great value with 76% profit margin",
+    "4.1": "OPTIMIZED: Changed to 320-char messages (2 SMS parts) for optimal cost efficiency at $0.08 per message",
+    "4.0": "MAJOR: Changed to 480-char detailed messages (3 SMS parts) with 100 messages/month for comprehensive responses",
     "3.3": "Added 'longer' command: Users can text 'longer' for detailed 3-part responses (480 chars, counts as 3 messages)",
     "3.2": "COST OPTIMIZATION: Reduced to 200 messages/month with 160-char limit for sustainable pricing ($12/month cost vs $20 revenue)",
     "3.1": "Added comprehensive admin endpoints: remove-user, reset-user, and restore-user for complete user management",
@@ -106,8 +109,8 @@ MONTHLY_LIMIT = 200
 RESET_DAYS = 30
 
 # SMS Response Limits
-MAX_SMS_LENGTH = 160        # Standard response (1 SMS part)
-LONGER_SMS_LENGTH = 480     # "Longer" response (3 SMS parts)
+MAX_SMS_LENGTH = 480        # Standard response (3 SMS parts)
+LONGER_SMS_LENGTH = 480     # "Longer" response (same as standard now)
 CLICKSEND_MAX_LENGTH = 1600
 
 # WELCOME MESSAGE
@@ -131,7 +134,7 @@ ONBOARDING_LOCATION_MSG = (
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 200 messages per month. Try asking \"weather today\" to start!"
+    "You get 200 detailed messages per month. Try asking \"weather today\" to start!"
 )
 
 # === Error Handling Decorator ===
@@ -932,18 +935,20 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- Keep responses under {MAX_SMS_LENGTH} characters (160 chars = 1 SMS part) unless specifically asked for longer
-- If this is a "longer" or "detailed" request, provide a comprehensive response up to {LONGER_SMS_LENGTH} characters (3 SMS parts)
-- For detailed requests, include statistics, schedules, analysis, and comprehensive information
+- Provide comprehensive responses up to {MAX_SMS_LENGTH} characters (320 chars = 2 SMS parts)
+- Give detailed, helpful answers with key information
+- Users get 200 messages per month, so make each response valuable and informative
 - Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info", "Sure", or user names
 - Start immediately with the answer/information requested
-- Be factual and helpful but brief - every character counts
+- Be factual and helpful with important details - prioritize the most useful information
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- DO NOT end messages with prompts like "Text 'longer' for more" - let users naturally ask for more if needed
+- DO NOT end messages with prompts like "Text 'longer' for more" - each response should be complete
 - NEVER include user names, greetings, or conversational fluff
-- For sports queries, include scores, records, standings, recent games, and upcoming schedule when detailed info is requested"""
+- For sports queries, include scores, records, recent games, and key details
+- For weather, include current conditions and forecast highlights
+- For restaurants/businesses, include hours, contact info, and key details"""
         
         try:
             headers = {
@@ -1655,67 +1660,25 @@ def sms_webhook():
     user_context = get_user_context_for_queries(sender)
     
     try:
-        if is_longer_request:
-            # Get the last user query for context
-            last_query = get_last_user_query(sender)
-            logger.info(f"🔍 Last query found: {last_query}")
-            
-            if last_query and last_query.lower() not in ['longer', 'more info', 'more details', 'more', 'details', 'everything', 'tell me more']:
-                # Re-process the last query with longer response using Claude for detailed analysis
-                logger.info(f"🔍 Processing longer response for: {last_query}")
-                
-                # Use Claude to provide detailed information
-                if user_context['personalized']:
-                    detailed_query = f"Provide comprehensive detailed information about: {last_query}. User lives in {user_context['location']}. Include all relevant details, statistics, schedules, and context."
-                    response_msg = ask_claude(sender, detailed_query)
-                else:
-                    detailed_query = f"Provide comprehensive detailed information about: {last_query}. Include all relevant details, statistics, schedules, and context."
-                    response_msg = ask_claude(sender, detailed_query)
-                
-                # If Claude suggests search, do a more detailed search
-                if "Let me search for" in response_msg:
-                    search_term = f"{last_query} detailed stats schedule analysis"
-                    if user_context['personalized']:
-                        search_term += f" {user_context['location']}"
-                    response_msg = web_search(search_term, search_type="general")
-                
-                # Use longer length limit
-                response_msg = truncate_response(response_msg, LONGER_SMS_LENGTH)
-                message_parts = 3  # Count as 3 messages
-                logger.info(f"📊 Generated longer response: {len(response_msg)} chars")
-            else:
-                response_msg = "Ask me a question first, then text 'details' for more comprehensive info!"
-                message_parts = 1
-        
-        elif intent and intent.type == "weather":
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                # Remove personalized greeting to save characters
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-            
-            response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-            message_parts = 1
+        # Since all messages are now detailed (480 chars), simplify the logic
+        if user_context['personalized']:
+            personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+            response_msg = ask_claude(sender, personalized_msg)
         else:
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            if "Let me search for" in response_msg:
-                search_term = body
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
-            
-            response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-            message_parts = 1
+            response_msg = ask_claude(sender, body)
+        
+        if "Let me search for" in response_msg:
+            search_term = body
+            if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                search_term += f" in {user_context['location']}"
+            response_msg = web_search(search_term, search_type="general")
         
         original_length = len(response_msg)
+        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
+        message_parts = 2  # All messages are now 2 SMS parts
+        
+        if original_length > len(response_msg):
+            logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
         
         if original_length > len(response_msg):
             logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
@@ -1762,6 +1725,7 @@ def health_check():
         'database_type': 'PostgreSQL',
         'sms_char_limit': MAX_SMS_LENGTH,
         'monthly_message_limit': MONTHLY_LIMIT,
+        'message_parts_per_response': 2
         'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
         'admin_endpoints': [
             '/admin/remove-user',
@@ -1777,7 +1741,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
     logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
     logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
-    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters (1 SMS part)")
-    logger.info(f"📊 Monthly message limit: {MONTHLY_LIMIT} messages")
+    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters (2 SMS parts)")
+    logger.info(f"📊 Monthly message limit: {MONTHLY_LIMIT} detailed messages")
     logger.info(f"🔧 Admin endpoints available: /admin/remove-user, /admin/reset-user, /admin/restore-user")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
