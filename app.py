@@ -1102,7 +1102,7 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                     if competitor['team']['id'] != str(team_id):
                         opponent = competitor['team']['displayName']
                 
-                game_datetime = datetime.strpython(next_game['date'], '%Y-%m-%dT%H:%M:%SZ')
+                game_datetime = datetime.strptime(next_game['date'], '%Y-%m-%dT%H:%M:%SZ')
                 game_date = game_datetime.strftime('%A, %B %d')
                 game_time = game_datetime.strftime('%I:%M%p ET')
             
@@ -2056,30 +2056,32 @@ def sms_webhook():
     try:
         # Handle sports queries with ESPN API
         if intent and intent.type.startswith("sports"):
+            sport_type = intent.entities.get("sport", "nfl")  # Default to NFL
+            
             if intent.type == "sports_schedule":
                 team_name = intent.entities.get("team")
                 if team_name:
-                    team_data = get_nfl_team_data(team_name)
+                    team_data = get_team_data(team_name, sport_type)
                     if team_data:
-                        response_msg = get_nfl_schedule(team_data['id'], team_data['name'])
+                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
                     else:
                         response_msg = f"Team '{team_name}' not found. Try: Saints, Patriots, Cowboys, etc."
                 else:
-                    response_msg = "Which NFL team are you asking about?"
+                    response_msg = f"Which {sport_type.upper()} team are you asking about?"
             
             elif intent.type == "sports_scores":
-                response_msg = get_nfl_scores()
+                response_msg = get_sport_scores(sport_type)
             
             elif intent.type == "sports_team_score" or intent.type == "sports_team_info":
                 team_name = intent.entities.get("team")
                 if team_name:
-                    team_data = get_nfl_team_data(team_name)
+                    team_data = get_team_data(team_name, sport_type)
                     if team_data:
-                        response_msg = get_nfl_schedule(team_data['id'], team_data['name'])
+                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
                     else:
                         response_msg = f"Team '{team_name}' not found."
                 else:
-                    response_msg = get_nfl_scores()
+                    response_msg = get_sport_scores(sport_type)
         
         # Handle other queries
         else:
