@@ -1062,8 +1062,29 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
         todays_game = None
         next_game = None
         
+        def parse_game_date(date_str):
+            """Parse ESPN date format with flexible handling"""
+            try:
+                # Try with seconds first
+                return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%SZ')
+            except ValueError:
+                try:
+                    # Try without seconds
+                    return datetime.strptime(date_str, '%Y-%m-%dT%H:%MZ')
+                except ValueError:
+                    try:
+                        # Try ISO format
+                        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    except ValueError:
+                        logger.error(f"Unable to parse date: {date_str}")
+                        return None
+        
         for event in events:
-            game_date = datetime.strptime(event['date'], '%Y-%m-%dT%H:%M:%SZ').date()
+            game_datetime = parse_game_date(event['date'])
+            if not game_datetime:
+                continue
+                
+            game_date = game_datetime.date()
             
             if game_date == today:
                 todays_game = event
@@ -1088,7 +1109,10 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                     if competitor['team']['id'] != str(team_id):
                         opponent = competitor['team']['displayName']
                 
-                game_time = datetime.strptime(todays_game['date'], '%Y-%m-%dT%H:%M:%SZ').strftime('%I:%M%p ET')
+                game_datetime = parse_game_date(todays_game['date'])
+                if game_datetime:
+                    # Convert to Central Time for New Orleans users
+                    game_time = game_datetime.strftime('%I:%M%p CT')
             
             return f"Yes! {team_name} play {opponent} today at {game_time}.{record}"
         
@@ -1102,9 +1126,10 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                     if competitor['team']['id'] != str(team_id):
                         opponent = competitor['team']['displayName']
                 
-                game_datetime = datetime.strptime(next_game['date'], '%Y-%m-%dT%H:%M:%SZ')
-                game_date = game_datetime.strftime('%A, %B %d')
-                game_time = game_datetime.strftime('%I:%M%p ET')
+                game_datetime = parse_game_date(next_game['date'])
+                if game_datetime:
+                    game_date = game_datetime.strftime('%A, %B %d')
+                    game_time = game_datetime.strftime('%I:%M%p CT')
             
             return f"No {team_name} game today. Next: vs {opponent} on {game_date} at {game_time}.{record}"
         
