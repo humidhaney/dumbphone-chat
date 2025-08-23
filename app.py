@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import re
@@ -41,13 +41,17 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "3.1"
+APP_VERSION = "5.1"
 CHANGELOG = {
-    "3.1": "Added comprehensive ESPN API sports integration for NFL, MLB, NHL, and College Football - real-time scores, schedules, and team data",
+    "5.1": "ENHANCED: Added comprehensive ESPN Sports API integration for NFL, MLB, NHL, and College Football with real-time data",
+    "5.0": "MAJOR: Added ESPN Sports API integration for accurate NFL team schedules, scores, and game information",
+    "4.2": "PERFECT BALANCE: 200 messages/month at 320 characters each (2 SMS parts) - great value with 76% profit margin",
+    "4.1": "OPTIMIZED: Changed to 320-char messages (2 SMS parts) for optimal cost efficiency at $0.08 per message",
+    "4.0": "MAJOR: Changed to 480-char detailed messages (3 SMS parts) with 100 messages/month for comprehensive responses",
+    "3.3": "Added 'longer' command: Users can text 'longer' for detailed 3-part responses (480 chars, counts as 3 messages)",
+    "3.2": "COST OPTIMIZATION: Reduced to 200 messages/month with 160-char limit for sustainable pricing ($12/month cost vs $20 revenue)",
+    "3.1": "Added comprehensive admin endpoints: remove-user, reset-user, and restore-user for complete user management",
     "3.0": "MAJOR: Migrated from SQLite to PostgreSQL for persistent data storage - no more data loss on redeploys!",
-    "2.9": "Increased SMS response limit to 720 characters for longer, more detailed answers",
-    "2.8": "Added comprehensive admin debug endpoints for SMS testing and troubleshooting",
-    "2.7": "Added complete Stripe webhook integration for automatic subscription management and user lifecycle",
 }
 
 # === Config & API Keys ===
@@ -100,11 +104,12 @@ if ANTHROPIC_API_KEY:
 
 WHITELIST_FILE = "whitelist.txt"
 USAGE_FILE = "usage.json"
-MONTHLY_LIMIT = 300
+MONTHLY_LIMIT = 200
 RESET_DAYS = 30
 
 # SMS Response Limits
-MAX_SMS_LENGTH = 720
+MAX_SMS_LENGTH = 480        # Standard response (3 SMS parts)
+LONGER_SMS_LENGTH = 480     # "Longer" response (same as standard now)
 CLICKSEND_MAX_LENGTH = 1600
 
 # WELCOME MESSAGE
@@ -128,265 +133,357 @@ ONBOARDING_LOCATION_MSG = (
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 300 messages per month. Try asking \"weather today\" or \"Saints game today\" to start!"
+    "You get 200 detailed messages per month. Try asking \"weather today\" or \"Saints game today\" to start!"
 )
 
-# === ESPN API Sports Integration ===
-ESPN_BASE_URL = "https://site.api.espn.com/apis/site/v2/sports"
+# === ESPN Sports API Integration ===
+ESPN_BASE_URL = "https://site.web.api.espn.com/apis/site/v2/sports"
 
-# Team name mappings for ESPN API
-ESPN_TEAM_MAPPINGS = {
-    # NFL Teams
-    'nfl': {
-        'saints': {'name': 'New Orleans Saints', 'id': '18'},
-        'patriots': {'name': 'New England Patriots', 'id': '17'},
-        'cowboys': {'name': 'Dallas Cowboys', 'id': '6'},
-        'packers': {'name': 'Green Bay Packers', 'id': '9'},
-        'chiefs': {'name': 'Kansas City Chiefs', 'id': '12'},
-        'bills': {'name': 'Buffalo Bills', 'id': '2'},
-        'bengals': {'name': 'Cincinnati Bengals', 'id': '4'},
-        'ravens': {'name': 'Baltimore Ravens', 'id': '33'},
-        'steelers': {'name': 'Pittsburgh Steelers', 'id': '23'},
-        'browns': {'name': 'Cleveland Browns', 'id': '5'},
-        'titans': {'name': 'Tennessee Titans', 'id': '10'},
-        'colts': {'name': 'Indianapolis Colts', 'id': '11'},
-        'jaguars': {'name': 'Jacksonville Jaguars', 'id': '30'},
-        'texans': {'name': 'Houston Texans', 'id': '34'},
-        'broncos': {'name': 'Denver Broncos', 'id': '7'},
-        'chargers': {'name': 'Los Angeles Chargers', 'id': '24'},
-        'raiders': {'name': 'Las Vegas Raiders', 'id': '13'},
-        'dolphins': {'name': 'Miami Dolphins', 'id': '15'},
-        'jets': {'name': 'New York Jets', 'id': '20'},
-        'eagles': {'name': 'Philadelphia Eagles', 'id': '21'},
-        'commanders': {'name': 'Washington Commanders', 'id': '28'},
-        'giants': {'name': 'New York Giants', 'id': '19'},
-        'rams': {'name': 'Los Angeles Rams', 'id': '14'},
-        'seahawks': {'name': 'Seattle Seahawks', 'id': '26'},
-        '49ers': {'name': 'San Francisco 49ers', 'id': '25'},
-        'cardinals': {'name': 'Arizona Cardinals', 'id': '22'},
-        'vikings': {'name': 'Minnesota Vikings', 'id': '16'},
-        'lions': {'name': 'Detroit Lions', 'id': '8'},
-        'bears': {'name': 'Chicago Bears', 'id': '3'},
-        'buccaneers': {'name': 'Tampa Bay Buccaneers', 'id': '27'},
-        'falcons': {'name': 'Atlanta Falcons', 'id': '1'},
-        'panthers': {'name': 'Carolina Panthers', 'id': '29'},
-    },
-    # MLB Teams
-    'mlb': {
-        'yankees': {'name': 'New York Yankees', 'id': '10'},
-        'red sox': {'name': 'Boston Red Sox', 'id': '2'},
-        'blue jays': {'name': 'Toronto Blue Jays', 'id': '14'},
-        'orioles': {'name': 'Baltimore Orioles', 'id': '1'},
-        'rays': {'name': 'Tampa Bay Rays', 'id': '30'},
-        'white sox': {'name': 'Chicago White Sox', 'id': '4'},
-        'guardians': {'name': 'Cleveland Guardians', 'id': '5'},
-        'tigers': {'name': 'Detroit Tigers', 'id': '6'},
-        'royals': {'name': 'Kansas City Royals', 'id': '7'},
-        'twins': {'name': 'Minnesota Twins', 'id': '9'},
-        'astros': {'name': 'Houston Astros', 'id': '18'},
-        'angels': {'name': 'Los Angeles Angels', 'id': '3'},
-        'athletics': {'name': 'Oakland Athletics', 'id': '11'},
-        'mariners': {'name': 'Seattle Mariners', 'id': '12'},
-        'rangers': {'name': 'Texas Rangers', 'id': '13'},
-        'braves': {'name': 'Atlanta Braves', 'id': '15'},
-        'marlins': {'name': 'Miami Marlins', 'id': '28'},
-        'mets': {'name': 'New York Mets', 'id': '21'},
-        'phillies': {'name': 'Philadelphia Phillies', 'id': '22'},
-        'nationals': {'name': 'Washington Nationals', 'id': '20'},
-        'cubs': {'name': 'Chicago Cubs', 'id': '16'},
-        'reds': {'name': 'Cincinnati Reds', 'id': '17'},
-        'brewers': {'name': 'Milwaukee Brewers', 'id': '8'},
-        'pirates': {'name': 'Pittsburgh Pirates', 'id': '23'},
-        'cardinals': {'name': 'St. Louis Cardinals', 'id': '24'},
-        'diamondbacks': {'name': 'Arizona Diamondbacks', 'id': '29'},
-        'rockies': {'name': 'Colorado Rockies', 'id': '27'},
-        'dodgers': {'name': 'Los Angeles Dodgers', 'id': '19'},
-        'padres': {'name': 'San Diego Padres', 'id': '25'},
-        'giants': {'name': 'San Francisco Giants', 'id': '26'},
-    },
-    # NHL Teams
-    'nhl': {
-        'bruins': {'name': 'Boston Bruins', 'id': '6'},
-        'sabres': {'name': 'Buffalo Sabres', 'id': '7'},
-        'red wings': {'name': 'Detroit Red Wings', 'id': '17'},
-        'panthers': {'name': 'Florida Panthers', 'id': '13'},
-        'canadiens': {'name': 'Montreal Canadiens', 'id': '8'},
-        'senators': {'name': 'Ottawa Senators', 'id': '9'},
-        'lightning': {'name': 'Tampa Bay Lightning', 'id': '14'},
-        'maple leafs': {'name': 'Toronto Maple Leafs', 'id': '10'},
-        'hurricanes': {'name': 'Carolina Hurricanes', 'id': '12'},
-        'blue jackets': {'name': 'Columbus Blue Jackets', 'id': '29'},
-        'devils': {'name': 'New Jersey Devils', 'id': '18'},
-        'islanders': {'name': 'New York Islanders', 'id': '2'},
-        'rangers': {'name': 'New York Rangers', 'id': '3'},
-        'flyers': {'name': 'Philadelphia Flyers', 'id': '4'},
-        'penguins': {'name': 'Pittsburgh Penguins', 'id': '5'},
-        'capitals': {'name': 'Washington Capitals', 'id': '15'},
-        'blackhawks': {'name': 'Chicago Blackhawks', 'id': '16'},
-        'avalanche': {'name': 'Colorado Avalanche', 'id': '21'},
-        'stars': {'name': 'Dallas Stars', 'id': '25'},
-        'wild': {'name': 'Minnesota Wild', 'id': '30'},
-        'predators': {'name': 'Nashville Predators', 'id': '18'},
-        'blues': {'name': 'St. Louis Blues', 'id': '19'},
-        'flames': {'name': 'Calgary Flames', 'id': '20'},
-        'oilers': {'name': 'Edmonton Oilers', 'id': '22'},
-        'kraken': {'name': 'Seattle Kraken', 'id': '55'},
-        'canucks': {'name': 'Vancouver Canucks', 'id': '23'},
-        'ducks': {'name': 'Anaheim Ducks', 'id': '24'},
-        'kings': {'name': 'Los Angeles Kings', 'id': '26'},
-        'sharks': {'name': 'San Jose Sharks', 'id': '28'},
-        'golden knights': {'name': 'Vegas Golden Knights', 'id': '54'},
-        'coyotes': {'name': 'Arizona Coyotes', 'id': '53'},
-    },
-    # College Football Teams
-    'college': {
-        'alabama': {'name': 'Alabama Crimson Tide', 'id': '333'},
-        'georgia': {'name': 'Georgia Bulldogs', 'id': '61'},
-        'ohio state': {'name': 'Ohio State Buckeyes', 'id': '194'},
-        'michigan': {'name': 'Michigan Wolverines', 'id': '130'},
-        'clemson': {'name': 'Clemson Tigers', 'id': '228'},
-        'notre dame': {'name': 'Notre Dame Fighting Irish', 'id': '87'},
-        'texas': {'name': 'Texas Longhorns', 'id': '251'},
-        'oklahoma': {'name': 'Oklahoma Sooners', 'id': '201'},
-        'lsu': {'name': 'LSU Tigers', 'id': '99'},
-        'florida': {'name': 'Florida Gators', 'id': '57'},
-        'penn state': {'name': 'Penn State Nittany Lions', 'id': '213'},
-        'wisconsin': {'name': 'Wisconsin Badgers', 'id': '275'},
-        'oregon': {'name': 'Oregon Ducks', 'id': '2483'},
-        'usc': {'name': 'USC Trojans', 'id': '30'},
-        'ucla': {'name': 'UCLA Bruins', 'id': '26'},
-        'stanford': {'name': 'Stanford Cardinal', 'id': '24'},
-        'miami': {'name': 'Miami Hurricanes', 'id': '2390'},
-        'florida state': {'name': 'Florida State Seminoles', 'id': '52'},
-        'tulane': {'name': 'Tulane Green Wave', 'id': '2655'},
+def get_team_data(team_name, sport_type):
+    """Get team data for different sports from ESPN API"""
+    
+    # NFL teams
+    nfl_teams = {
+        'saints': {'id': '18', 'name': 'New Orleans Saints'},
+        'patriots': {'id': '17', 'name': 'New England Patriots'},
+        'cowboys': {'id': '6', 'name': 'Dallas Cowboys'},
+        'packers': {'id': '9', 'name': 'Green Bay Packers'},
+        'chiefs': {'id': '12', 'name': 'Kansas City Chiefs'},
+        'bills': {'id': '2', 'name': 'Buffalo Bills'},
+        'bengals': {'id': '4', 'name': 'Cincinnati Bengals'},
+        'ravens': {'id': '33', 'name': 'Baltimore Ravens'},
+        'steelers': {'id': '23', 'name': 'Pittsburgh Steelers'},
+        'browns': {'id': '5', 'name': 'Cleveland Browns'},
+        'titans': {'id': '10', 'name': 'Tennessee Titans'},
+        'colts': {'id': '11', 'name': 'Indianapolis Colts'},
+        'jaguars': {'id': '30', 'name': 'Jacksonville Jaguars'},
+        'texans': {'id': '34', 'name': 'Houston Texans'},
+        'broncos': {'id': '7', 'name': 'Denver Broncos',},
+        'chargers': {'id': '24', 'name': 'Los Angeles Chargers'},
+        'raiders': {'id': '13', 'name': 'Las Vegas Raiders'},
+        'dolphins': {'id': '15', 'name': 'Miami Dolphins'},
+        'jets': {'id': '20', 'name': 'New York Jets'},
+        'eagles': {'id': '21', 'name': 'Philadelphia Eagles'},
+        'commanders': {'id': '28', 'name': 'Washington Commanders'},
+        'giants': {'id': '19', 'name': 'New York Giants'},
+        'rams': {'id': '14', 'name': 'Los Angeles Rams'},
+        'seahawks': {'id': '26', 'name': 'Seattle Seahawks'},
+        '49ers': {'id': '25', 'name': 'San Francisco 49ers'},
+        'cardinals': {'id': '22', 'name': 'Arizona Cardinals'},
+        'vikings': {'id': '16', 'name': 'Minnesota Vikings'},
+        'lions': {'id': '8', 'name': 'Detroit Lions'},
+        'bears': {'id': '3', 'name': 'Chicago Bears'},
+        'buccaneers': {'id': '27', 'name': 'Tampa Bay Buccaneers'},
+        'falcons': {'id': '1', 'name': 'Atlanta Falcons'},
+        'panthers': {'id': '29', 'name': 'Carolina Panthers'}
     }
-}
+    
+    # MLB teams
+    mlb_teams = {
+        'yankees': {'id': '10', 'name': 'New York Yankees'},
+        'red sox': {'id': '2', 'name': 'Boston Red Sox'},
+        'blue jays': {'id': '14', 'name': 'Toronto Blue Jays'},
+        'orioles': {'id': '1', 'name': 'Baltimore Orioles'},
+        'rays': {'id': '30', 'name': 'Tampa Bay Rays'},
+        'white sox': {'id': '4', 'name': 'Chicago White Sox'},
+        'guardians': {'id': '5', 'name': 'Cleveland Guardians'},
+        'tigers': {'id': '6', 'name': 'Detroit Tigers'},
+        'royals': {'id': '7', 'name': 'Kansas City Royals'},
+        'twins': {'id': '9', 'name': 'Minnesota Twins'},
+        'astros': {'id': '18', 'name': 'Houston Astros'},
+        'angels': {'id': '3', 'name': 'Los Angeles Angels'},
+        'athletics': {'id': '11', 'name': 'Oakland Athletics'},
+        'mariners': {'id': '12', 'name': 'Seattle Mariners'},
+        'rangers': {'id': '13', 'name': 'Texas Rangers'},
+        'braves': {'id': '15', 'name': 'Atlanta Braves'},
+        'marlins': {'id': '28', 'name': 'Miami Marlins'},
+        'mets': {'id': '21', 'name': 'New York Mets'},
+        'phillies': {'id': '22', 'name': 'Philadelphia Phillies'},
+        'nationals': {'id': '20', 'name': 'Washington Nationals'},
+        'cubs': {'id': '16', 'name': 'Chicago Cubs'},
+        'reds': {'id': '17', 'name': 'Cincinnati Reds'},
+        'brewers': {'id': '8', 'name': 'Milwaukee Brewers'},
+        'pirates': {'id': '23', 'name': 'Pittsburgh Pirates'},
+        'cardinals': {'id': '24', 'name': 'St. Louis Cardinals'},
+        'diamondbacks': {'id': '29', 'name': 'Arizona Diamondbacks'},
+        'rockies': {'id': '27', 'name': 'Colorado Rockies'},
+        'dodgers': {'id': '19', 'name': 'Los Angeles Dodgers'},
+        'padres': {'id': '25', 'name': 'San Diego Padres'},
+        'giants': {'id': '26', 'name': 'San Francisco Giants'}
+    }
+    
+    # NHL teams
+    nhl_teams = {
+        'bruins': {'id': '6', 'name': 'Boston Bruins'},
+        'sabres': {'id': '7', 'name': 'Buffalo Sabres'},
+        'red wings': {'id': '17', 'name': 'Detroit Red Wings'},
+        'panthers': {'id': '13', 'name': 'Florida Panthers'},
+        'canadiens': {'id': '8', 'name': 'Montreal Canadiens'},
+        'senators': {'id': '9', 'name': 'Ottawa Senators'},
+        'lightning': {'id': '14', 'name': 'Tampa Bay Lightning'},
+        'maple leafs': {'id': '10', 'name': 'Toronto Maple Leafs'},
+        'hurricanes': {'id': '12', 'name': 'Carolina Hurricanes'},
+        'blue jackets': {'id': '29', 'name': 'Columbus Blue Jackets'},
+        'devils': {'id': '18', 'name': 'New Jersey Devils'},
+        'islanders': {'id': '19', 'name': 'New York Islanders'},
+        'rangers': {'id': '20', 'name': 'New York Rangers'},
+        'flyers': {'id': '4', 'name': 'Philadelphia Flyers'},
+        'penguins': {'id': '5', 'name': 'Pittsburgh Penguins'},
+        'capitals': {'id': '15', 'name': 'Washington Capitals'},
+        'blackhawks': {'id': '16', 'name': 'Chicago Blackhawks'},
+        'avalanche': {'id': '21', 'name': 'Colorado Avalanche'},
+        'stars': {'id': '25', 'name': 'Dallas Stars'},
+        'wild': {'id': '30', 'name': 'Minnesota Wild'},
+        'predators': {'id': '18', 'name': 'Nashville Predators'},
+        'blues': {'id': '19', 'name': 'St. Louis Blues'},
+        'flames': {'id': '20', 'name': 'Calgary Flames'},
+        'oilers': {'id': '22', 'name': 'Edmonton Oilers'},
+        'kraken': {'id': '26', 'name': 'Seattle Kraken'},
+        'canucks': {'id': '23', 'name': 'Vancouver Canucks'},
+        'ducks': {'id': '24', 'name': 'Anaheim Ducks'},
+        'kings': {'id': '26', 'name': 'Los Angeles Kings'},
+        'sharks': {'id': '28', 'name': 'San Jose Sharks'},
+        'golden knights': {'id': '37', 'name': 'Vegas Golden Knights'},
+        'coyotes': {'id': '53', 'name': 'Arizona Coyotes'}
+    }
+    
+    # College teams (major ones)
+    college_teams = {
+        'alabama': {'id': '333', 'name': 'Alabama Crimson Tide'},
+        'georgia': {'id': '61', 'name': 'Georgia Bulldogs'},
+        'ohio state': {'id': '194', 'name': 'Ohio State Buckeyes'},
+        'michigan': {'id': '130', 'name': 'Michigan Wolverines'},
+        'clemson': {'id': '228', 'name': 'Clemson Tigers'},
+        'notre dame': {'id': '87', 'name': 'Notre Dame Fighting Irish'},
+        'texas': {'id': '251', 'name': 'Texas Longhorns'},
+        'oklahoma': {'id': '201', 'name': 'Oklahoma Sooners'},
+        'lsu': {'id': '99', 'name': 'LSU Tigers'},
+        'florida': {'id': '57', 'name': 'Florida Gators'},
+        'penn state': {'id': '213', 'name': 'Penn State Nittany Lions'},
+        'wisconsin': {'id': '275', 'name': 'Wisconsin Badgers'},
+        'oregon': {'id': '2483', 'name': 'Oregon Ducks'},
+        'usc': {'id': '30', 'name': 'USC Trojans'},
+        'ucla': {'id': '26', 'name': 'UCLA Bruins'},
+        'stanford': {'id': '24', 'name': 'Stanford Cardinal'},
+        'miami': {'id': '2390', 'name': 'Miami Hurricanes'},
+        'florida state': {'id': '52', 'name': 'Florida State Seminoles'},
+        'virginia tech': {'id': '259', 'name': 'Virginia Tech Hokies'},
+        'north carolina': {'id': '153', 'name': 'North Carolina Tar Heels'},
+        'duke': {'id': '150', 'name': 'Duke Blue Devils'},
+        'kentucky': {'id': '96', 'name': 'Kentucky Wildcats'},
+        'tennessee': {'id': '2633', 'name': 'Tennessee Volunteers'},
+        'auburn': {'id': '2', 'name': 'Auburn Tigers'},
+        'mississippi': {'id': '145', 'name': 'Ole Miss Rebels'},
+        'mississippi state': {'id': '344', 'name': 'Mississippi State Bulldogs'},
+        'arkansas': {'id': '8', 'name': 'Arkansas Razorbacks'},
+        'missouri': {'id': '142', 'name': 'Missouri Tigers'},
+        'south carolina': {'id': '2579', 'name': 'South Carolina Gamecocks'},
+        'vanderbilt': {'id': '238', 'name': 'Vanderbilt Commodores'},
+        'texas a&m': {'id': '245', 'name': 'Texas A&M Aggies'},
+        'tulane': {'id': '2655', 'name': 'Tulane Green Wave'}
+    }
+    
+    teams = {
+        'nfl': nfl_teams,
+        'mlb': mlb_teams, 
+        'nhl': nhl_teams,
+        'college': college_teams
+    }
+    
+    if sport_type not in teams:
+        return None
+        
+    team_key = team_name.lower().replace(' ', '').replace('new orleans', 'saints').replace('neworleans', 'saints')
+    
+    # Find team by partial match
+    for key, team_info in teams[sport_type].items():
+        if key.replace(' ', '') in team_key or team_key in key.replace(' ', ''):
+            return team_info
+    
+    return None
 
-def get_team_data(team_name, sport='nfl'):
-    """Get ESPN team data for a given team name and sport"""
-    sport_teams = ESPN_TEAM_MAPPINGS.get(sport.lower(), {})
-    team_key = team_name.lower().strip()
-    return sport_teams.get(team_key)
-
-def get_sports_schedule(sport, team_id, team_name):
-    """Get team schedule from ESPN API"""
+def get_sports_schedule(sport, team_id=None, team_name=""):
+    """Get sports schedule from ESPN API"""
     try:
-        if sport == 'college':
-            url = f"{ESPN_BASE_URL}/football/college-football/teams/{team_id}/schedule"
-        else:
-            url = f"{ESPN_BASE_URL}/{sport}/nfl/teams/{team_id}/schedule" if sport == 'nfl' else f"{ESPN_BASE_URL}/{sport}/teams/{team_id}/schedule"
+        # ESPN API URLs for different sports
+        sport_urls = {
+            'nfl': f"{ESPN_BASE_URL}/football/nfl/teams/{team_id}/schedule",
+            'mlb': f"{ESPN_BASE_URL}/baseball/mlb/teams/{team_id}/schedule",
+            'nhl': f"{ESPN_BASE_URL}/hockey/nhl/teams/{team_id}/schedule",
+            'college': f"{ESPN_BASE_URL}/football/college-football/teams/{team_id}/schedule"
+        }
         
-        logger.info(f"📅 Fetching schedule for {team_name} from {url}")
+        if sport not in sport_urls:
+            return f"Sport '{sport}' not supported yet."
         
+        url = sport_urls[sport]
         response = requests.get(url, timeout=10)
         
         if response.status_code != 200:
-            logger.error(f"ESPN API error: {response.status_code}")
-            return f"Unable to get {team_name} schedule. Please try again."
-            
+            return f"Unable to get {team_name} schedule right now."
+        
         data = response.json()
         
-        if 'events' not in data or not data['events']:
-            return f"No scheduled games found for {team_name}."
+        if 'events' not in data:
+            return f"No {team_name} games found."
         
-        today = datetime.now().strftime('%Y-%m-%d')
-        upcoming_games = []
-        today_game = None
+        events = data['events']
+        today = datetime.now().date()
         
-        for event in data['events']:
-            game_date = event['date'][:10]  # Extract date part
-            game_datetime = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
+        # Look for today's game
+        todays_game = None
+        next_game = None
+        
+        def parse_game_date(date_str):
+            """Parse ESPN date format with flexible handling"""
+            try:
+                # Try with seconds first
+                dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%SZ')
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                try:
+                    # Try without seconds
+                    dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%MZ')
+                    return dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    try:
+                        # Try ISO format
+                        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    except ValueError:
+                        logger.error(f"Unable to parse date: {date_str}")
+                        return None
+        
+        def convert_to_central(utc_dt):
+            """Convert UTC datetime to Central Time"""
+            if not utc_dt:
+                return None
+            # Central Time is UTC-6 (CST) or UTC-5 (CDT)
+            # Since it's August, we're in CDT (UTC-5)
+            central_offset = timedelta(hours=-5)  # CDT offset
+            return utc_dt + central_offset
+        
+        for event in events:
+            game_datetime_utc = parse_game_date(event['date'])
+            if not game_datetime_utc:
+                continue
+                
+            # Convert to Central Time for date comparison
+            game_datetime_central = convert_to_central(game_datetime_utc)
+            if not game_datetime_central:
+                continue
+                
+            game_date = game_datetime_central.date()
             
             if game_date == today:
-                # Game today
-                competitor = None
-                home_away = "vs"
-                
-                for competition in event.get('competitions', []):
-                    for competitor_data in competition.get('competitors', []):
-                        if competitor_data['team']['id'] != team_id:
-                            competitor = competitor_data['team']['displayName']
-                            if not competitor_data.get('homeAway') == 'home':
-                                home_away = "@"
-                
-                game_time = game_datetime.strftime('%I:%M%p ET').lstrip('0')
-                today_game = f"Yes! {team_name} play {home_away} {competitor} today at {game_time}."
+                todays_game = event
                 break
-            elif game_date > today:
-                # Future game
-                competitor = None
-                home_away = "vs"
-                
-                for competition in event.get('competitions', []):
-                    for competitor_data in competition.get('competitors', []):
-                        if competitor_data['team']['id'] != team_id:
-                            competitor = competitor_data['team']['displayName']
-                            if not competitor_data.get('homeAway') == 'home':
-                                home_away = "@"
-                
-                game_time = game_datetime.strftime('%A, %B %d at %I:%M%p ET').lstrip('0')
-                upcoming_games.append(f"{home_away} {competitor} on {game_time}")
-                
-                if len(upcoming_games) >= 2:  # Limit to next 2 games
-                    break
+            elif game_date > today and not next_game:
+                next_game = event
         
-        if today_game:
-            return today_game
-        elif upcoming_games:
-            return f"No {team_name} game today. Next: {upcoming_games[0]}."
+        # Get team record if available
+        record = ""
+        if 'team' in data and 'record' in data['team']:
+            wins = data['team']['record'].get('wins', 0)
+            losses = data['team']['record'].get('losses', 0)
+            record = f" Record: {wins}-{losses}."
+        
+        # Format response
+        if todays_game:
+            opponent = ""
+            game_time = ""
+            
+            for competition in todays_game.get('competitions', []):
+                for competitor in competition.get('competitors', []):
+                    if competitor['team']['id'] != str(team_id):
+                        opponent = competitor['team']['displayName']
+                
+                game_datetime_utc = parse_game_date(todays_game['date'])
+                if game_datetime_utc:
+                    # Convert to Central Time and format
+                    game_datetime_central = convert_to_central(game_datetime_utc)
+                    if game_datetime_central:
+                        game_time = game_datetime_central.strftime('%I:%M%p CT').replace(' CT', 'PM CT' if game_datetime_central.hour >= 12 else 'AM CT')
+                        # Clean up the format
+                        game_time = game_datetime_central.strftime('%I:%M%p CT')
+            
+            # Add preseason context if it's preseason
+            season_type = ""
+            if todays_game.get('season', {}).get('type') == 1:  # Preseason
+                season_type = " (Preseason)"
+            
+            return f"Yes! {team_name} play {opponent} today at {game_time}.{season_type}{record}"
+        
+        elif next_game:
+            opponent = ""
+            game_date = ""
+            game_time = ""
+            
+            for competition in next_game.get('competitions', []):
+                for competitor in competition.get('competitors', []):
+                    if competitor['team']['id'] != str(team_id):
+                        opponent = competitor['team']['displayName']
+                
+                game_datetime_utc = parse_game_date(next_game['date'])
+                if game_datetime_utc:
+                    game_datetime_central = convert_to_central(game_datetime_utc)
+                    if game_datetime_central:
+                        game_date = game_datetime_central.strftime('%A, %B %d')
+                        game_time = game_datetime_central.strftime('%I:%M%p CT')
+            
+            return f"No {team_name} game today. Next: vs {opponent} on {game_date} at {game_time}.{record}"
+        
         else:
-            return f"No upcoming games found for {team_name}."
+            return f"No upcoming {team_name} games found.{record}"
             
     except Exception as e:
-        logger.error(f"Error getting {team_name} schedule: {e}")
+        logger.error(f"ESPN API error: {e}")
         return f"Unable to get {team_name} schedule. Please try again."
 
-def get_sports_scores(sport='nfl'):
-    """Get current scores from ESPN API"""
+def get_sports_scores(sport):
+    """Get current scores for different sports from ESPN API"""
     try:
-        if sport == 'college':
-            url = f"{ESPN_BASE_URL}/football/college-football/scoreboard"
-        else:
-            url = f"{ESPN_BASE_URL}/{sport}/scoreboard"
+        # ESPN API URLs for scoreboards
+        scoreboard_urls = {
+            'nfl': f"{ESPN_BASE_URL}/football/nfl/scoreboard",
+            'mlb': f"{ESPN_BASE_URL}/baseball/mlb/scoreboard", 
+            'nhl': f"{ESPN_BASE_URL}/hockey/nhl/scoreboard",
+            'college': f"{ESPN_BASE_URL}/football/college-football/scoreboard"
+        }
         
-        logger.info(f"📊 Fetching {sport.upper()} scores from ESPN")
+        if sport not in scoreboard_urls:
+            return f"{sport.upper()} scores not available."
         
+        url = scoreboard_urls[sport]
         response = requests.get(url, timeout=10)
         
         if response.status_code != 200:
-            logger.error(f"ESPN API error: {response.status_code}")
-            return f"Unable to get {sport.upper()} scores. Please try again."
-            
+            return f"Unable to get {sport.upper()} scores right now."
+        
         data = response.json()
         
-        if 'events' not in data or not data['events']:
+        if not data.get('events'):
             return f"No {sport.upper()} games today."
         
-        scores = []
-        for event in data['events']:
-            for competition in event.get('competitions', []):
-                competitors = competition.get('competitors', [])
-                if len(competitors) == 2:
-                    team1 = competitors[0]['team']['abbreviation']
-                    score1 = competitors[0].get('score', '0')
-                    team2 = competitors[1]['team']['abbreviation']
-                    score2 = competitors[1].get('score', '0')
-                    
-                    status = competition.get('status', {}).get('type', {}).get('description', 'Unknown')
-                    
-                    if status == 'Final':
-                        scores.append(f"{team1} {score1}, {team2} {score2} (Final)")
-                    else:
-                        scores.append(f"{team1} {score1}, {team2} {score2} ({status})")
-                
-                if len(scores) >= 5:  # Limit to 5 games for SMS
-                    break
+        games = []
+        sport_name = sport.upper()
         
-        if scores:
-            return f"{sport.upper()} Scores: " + " | ".join(scores)
-        else:
-            return f"No {sport.upper()} scores available."
+        for event in data['events'][:3]:  # Limit to 3 games for SMS
+            competition = event['competitions'][0]
             
+            team1 = competition['competitors'][0]['team']['abbreviation']
+            team2 = competition['competitors'][1]['team']['abbreviation'] 
+            score1 = competition['competitors'][0].get('score', '0')
+            score2 = competition['competitors'][1].get('score', '0')
+            
+            status = competition['status']['type']['description']
+            
+            if status == 'Final':
+                games.append(f"{team1} {score1}, {team2} {score2} (Final)")
+            else:
+                games.append(f"{team1} {score1}, {team2} {score2} ({status})")
+        
+        return f"{sport_name} Scores: " + " | ".join(games) if games else f"No {sport_name} games today."
+        
     except Exception as e:
         logger.error(f"ESPN {sport} scores error: {e}")
         return f"Unable to get {sport.upper()} scores. Please try again."
@@ -493,7 +590,7 @@ def get_db_connection():
     """Context manager for PostgreSQL connections"""
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
         yield conn
     except Exception as e:
         if conn:
@@ -693,399 +790,6 @@ def get_user_profile(phone):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as c:
-                c.execute("""
-                    SELECT phone FROM user_profiles 
-                    WHERE stripe_customer_id = %s
-                """, (customer_id,))
-                result = c.fetchone()
-                
-                if result:
-                    phone = result['phone']
-                    
-                    update_user_profile(phone, subscription_status='cancelled')
-                    remove_from_whitelist(phone, send_goodbye=True)
-                    log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
-                    
-                    logger.info(f"✅ Subscription cancelled for {phone}")
-                else:
-                    logger.warning(f"⚠️ No user found for customer {customer_id}")
-                    log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'cancelled',
-                                   {'error': 'No user found'})
-        
-    except Exception as e:
-        logger.error(f"❌ Error handling subscription deletion: {e}")
-        log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'error',
-                        {'error': str(e)})
-
-# === ADMIN ENDPOINTS ===
-@app.route('/admin/restore-user', methods=['POST'])
-def admin_restore_user():
-    """Admin endpoint to restore a user's complete profile"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        first_name = data.get('first_name')
-        location = data.get('location')
-        stripe_customer_id = data.get('stripe_customer_id')
-        subscription_status = data.get('subscription_status', 'active')
-        
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
-        
-        if not first_name or not location:
-            return jsonify({"error": "first_name and location are required"}), 400
-        
-        phone = normalize_phone_number(phone)
-        
-        actions_taken = []
-        
-        # Add to whitelist
-        success = add_to_whitelist(phone, send_welcome=False, source='admin_restore')
-        if success:
-            actions_taken.append("Added to whitelist")
-        
-        # Create/update user profile
-        try:
-            with get_db_connection() as conn:
-                with conn.cursor() as c:
-                    
-                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
-                    
-                    c.execute("""
-                        INSERT INTO user_profiles 
-                        (phone, first_name, location, onboarding_step, onboarding_completed, 
-                         stripe_customer_id, subscription_status, created_date, updated_date)
-                        VALUES (%s, %s, %s, 3, TRUE, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (phone, first_name, location, stripe_customer_id, subscription_status))
-                    
-                    conn.commit()
-                    actions_taken.append("Created complete user profile")
-                    
-                    c.execute("""
-                        INSERT INTO onboarding_log (phone, step, response, timestamp)
-                        VALUES (%s, 999, %s, CURRENT_TIMESTAMP)
-                    """, (phone, f"RESTORED: {first_name} in {location}"))
-                    
-                    conn.commit()
-                    actions_taken.append("Logged profile restoration")
-                    
-        except Exception as db_error:
-            logger.error(f"Database error restoring user: {db_error}")
-            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
-        
-        # Send confirmation SMS
-        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
-        
-        try:
-            result = send_sms(phone, confirmation_msg, bypass_quota=True)
-            if "error" not in result:
-                actions_taken.append("Sent confirmation SMS")
-                save_message(phone, "assistant", confirmation_msg, "profile_restored", 0)
-            else:
-                actions_taken.append(f"Failed to send SMS: {result['error']}")
-        except Exception as sms_error:
-            actions_taken.append(f"SMS error: {str(sms_error)}")
-        
-        logger.info(f"👤 Restored user profile: {first_name} ({phone}) in {location}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Restored user profile for {first_name} ({phone})",
-            "actions_taken": actions_taken,
-            "profile": {
-                "phone": phone,
-                "first_name": first_name,
-                "location": location,
-                "onboarding_completed": True,
-                "stripe_customer_id": stripe_customer_id,
-                "subscription_status": subscription_status
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error restoring user: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# === STRIPE WEBHOOK ===
-@app.route('/webhook/stripe', methods=['POST'])
-def stripe_webhook():
-    """Handle Stripe webhook events"""
-    payload = request.data
-    sig_header = request.headers.get('Stripe-Signature')
-    
-    if not sig_header:
-        logger.error("Missing Stripe signature header")
-        return jsonify({'error': 'Missing signature header'}), 400
-    
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-        
-        logger.info(f"📨 Received Stripe webhook: {event['type']}")
-        
-        if event['type'] == 'customer.subscription.created':
-            handle_subscription_created(event['data']['object'])
-        
-        elif event['type'] == 'customer.subscription.deleted':
-            handle_subscription_deleted(event['data']['object'])
-        
-        elif event['type'] == 'customer.subscription.updated':
-            subscription = event['data']['object']
-            logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
-        
-        elif event['type'] == 'invoice.payment_failed':
-            invoice = event['data']['object']
-            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
-        
-        elif event['type'] == 'invoice.payment_succeeded':
-            invoice = event['data']['object']
-            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
-        
-        else:
-            logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
-        
-        return jsonify({'status': 'success'}), 200
-        
-    except ValueError as e:
-        logger.error(f"❌ Invalid payload: {e}")
-        return jsonify({'error': 'Invalid payload'}), 400
-    except stripe.error.SignatureVerificationError as e:
-        logger.error(f"❌ Invalid signature: {e}")
-        return jsonify({'error': 'Invalid signature'}), 400
-    except Exception as e:
-        logger.error(f"💥 Error processing Stripe webhook: {e}")
-        return jsonify({'error': 'Webhook processing failed'}), 500
-
-# === MAIN SMS WEBHOOK ===
-@app.route("/sms", methods=["POST"])
-@handle_errors  
-def sms_webhook():
-    start_time = time.time()
-    
-    sender = request.form.get("from")
-    body = (request.form.get("body") or "").strip()
-    
-    logger.info(f"📱 SMS received from {sender}: {repr(body)}")
-    
-    if not sender:
-        return jsonify({"error": "Missing 'from' field"}), 400
-    
-    if not body:
-        return jsonify({"message": "Empty message received"}), 200
-    
-    # Check whitelist
-    whitelist = load_whitelist()
-    if sender not in whitelist:
-        logger.warning(f"🚫 Unauthorized sender: {sender}")
-        return jsonify({"message": "Unauthorized sender"}), 403
-    
-    # Content filtering
-    is_valid, filter_reason = content_filter.is_valid_query(body)
-    if not is_valid:
-        logger.warning(f"🚫 Content filtered for {sender}: {filter_reason}")
-        return jsonify({"message": "Content filtered"}), 400
-    
-    # Save user message
-    save_message(sender, "user", body)
-    
-    # Handle special commands
-    if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
-        try:
-            send_sms(sender, response_msg, bypass_quota=True)
-            return jsonify({"message": "Unsubscribe processed"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send unsubscribe message: {e}")
-            return jsonify({"error": "Failed to process unsubscribe"}), 500
-    
-    if body.lower() in ['start', 'subscribe', 'resume']:
-        if is_user_onboarded(sender):
-            response_msg = WELCOME_MSG
-        else:
-            create_user_profile(sender)
-            response_msg = ONBOARDING_NAME_MSG
-        
-        try:
-            send_sms(sender, response_msg, bypass_quota=True)
-            save_message(sender, "assistant", response_msg, "start_command", 0)
-            return jsonify({"message": "Start message sent"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send start message: {e}")
-            return jsonify({"error": "Failed to send start message"}), 500
-    
-    # Check if user needs to complete onboarding
-    profile = get_user_profile(sender)
-    logger.info(f"👤 User profile for {sender}: {profile}")
-    
-    if not profile:
-        logger.info(f"📝 No profile found for {sender}, creating new profile")
-        create_user_profile(sender)
-        
-        try:
-            send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
-            save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
-            return jsonify({"message": "Onboarding started for new user"}), 200
-        except Exception as e:
-            logger.error(f"Failed to send onboarding start message: {e}")
-            return jsonify({"error": "Failed to start onboarding"}), 500
-    
-    elif not profile['onboarding_completed']:
-        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
-        
-        try:
-            response_msg = handle_onboarding_response(sender, body)
-            result = send_sms(sender, response_msg)
-            
-            if "error" not in result:
-                logger.info(f"✅ Onboarding response sent to {sender}")
-                return jsonify({"message": "Onboarding response sent"}), 200
-            else:
-                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
-                return jsonify({"error": "Failed to send onboarding response"}), 500
-                
-        except Exception as e:
-            logger.error(f"💥 Onboarding error for {sender}: {e}")
-            fallback_msg = "Sorry, there was an error during setup. Please try again."
-            try:
-                send_sms(sender, fallback_msg, bypass_quota=True)
-                return jsonify({"message": "Onboarding fallback sent"}), 200
-            except Exception as fallback_error:
-                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
-                return jsonify({"error": "Onboarding failed"}), 500
-    
-    # User is fully onboarded - continue to normal processing
-    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
-    
-    intent = detect_intent(body, sender)
-    intent_type = intent.type if intent else "general"
-    
-    user_context = get_user_context_for_queries(sender)
-    
-    try:
-        # Handle sports queries with ESPN API
-        if intent and intent.type.startswith("sports"):
-            sport_type = intent.entities.get("sport", "nfl")  # Default to NFL
-            
-            if intent.type == "sports_schedule":
-                team_name = intent.entities.get("team")
-                if team_name:
-                    team_data = get_team_data(team_name, sport_type)
-                    if team_data:
-                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
-                    else:
-                        response_msg = f"Team '{team_name}' not found in {sport_type.upper()}."
-                else:
-                    # General sports schedule query
-                    response_msg = f"Which {sport_type.upper()} team would you like schedule info for?"
-                    
-            elif intent.type == "sports_scores":
-                response_msg = get_sports_scores(sport_type)
-                
-            elif intent.type == "sports_team_score":
-                team_name = intent.entities.get("team")
-                if team_name:
-                    team_data = get_team_data(team_name, sport_type)
-                    if team_data:
-                        response_msg = get_sports_scores(sport_type)  # Get general scores for now
-                    else:
-                        response_msg = f"Team '{team_name}' not found in {sport_type.upper()}."
-                else:
-                    response_msg = get_sports_scores(sport_type)
-                    
-            elif intent.type == "sports_team_info":
-                team_name = intent.entities.get("team")
-                if team_name:
-                    team_data = get_team_data(team_name, sport_type)
-                    if team_data:
-                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
-                    else:
-                        response_msg = f"Team '{team_name}' not found in {sport_type.upper()}."
-                else:
-                    response_msg = f"Which {sport_type.upper()} team would you like info about?"
-            else:
-                response_msg = get_sports_scores(sport_type)
-                
-        elif intent and intent.type == "weather":
-            if user_context['personalized']:
-                city = user_context['location']
-                logger.info(f"🌍 Using user's saved location: {city}")
-                query = f"weather forecast {city}"
-                response_msg = web_search(query, search_type="general")
-                first_name = user_context['first_name']
-                response_msg = f"Hi {first_name}! " + response_msg
-            else:
-                response_msg = web_search("weather forecast", search_type="general")
-        else:
-            if user_context['personalized']:
-                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-                response_msg = ask_claude(sender, personalized_msg)
-            else:
-                response_msg = ask_claude(sender, body)
-            
-            if "Let me search for" in response_msg:
-                search_term = body
-                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                    search_term += f" in {user_context['location']}"
-                response_msg = web_search(search_term, search_type="general")
-        
-        original_length = len(response_msg)
-        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
-        
-        if original_length > len(response_msg):
-            logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
-        
-        response_time = int((time.time() - start_time) * 1000)
-        save_message(sender, "assistant", response_msg, intent_type, response_time)
-        
-        result = send_sms(sender, response_msg)
-        
-        if "error" not in result:
-            log_usage_analytics(sender, intent_type, True, response_time)
-            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars)")
-            return jsonify({"message": "Response sent successfully"}), 200
-        else:
-            log_usage_analytics(sender, intent_type, False, response_time)
-            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
-            return jsonify({"error": "Failed to send response"}), 500
-            
-    except Exception as e:
-        response_time = int((time.time() - start_time) * 1000)
-        log_usage_analytics(sender, intent_type, False, response_time)
-        logger.error(f"💥 Processing error for {sender}: {e}")
-        
-        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
-        try:
-            send_sms(sender, fallback_msg, bypass_quota=True)
-            return jsonify({"message": "Fallback response sent"}), 200
-        except Exception as fallback_error:
-            logger.error(f"Failed to send fallback message: {fallback_error}")
-            return jsonify({"error": "Processing failed"}), 500
-
-# === HEALTH CHECK ===
-@app.route('/')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'version': APP_VERSION,
-        'latest_changes': CHANGELOG[APP_VERSION],
-        'database_type': 'PostgreSQL',
-        'sms_char_limit': MAX_SMS_LENGTH,
-        'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
-        'sports_supported': ['NFL', 'MLB', 'NHL', 'College Football'],
-        'espn_api_enabled': True
-    })
-
-# Initialize database on startup
-init_db()
-
-if __name__ == "__main__":
-    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
-    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
-    logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
-    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters")
-    logger.info(f"🏈 Sports API: ESPN integration enabled")
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000))):
                 c.execute("""
                     SELECT first_name, location, onboarding_step, onboarding_completed, 
                            stripe_customer_id, subscription_status
@@ -1424,6 +1128,28 @@ def log_sms_delivery(phone, message_content, clicksend_response, delivery_status
     except Exception as e:
         logger.error(f"Error logging SMS delivery: {e}")
 
+def get_last_user_query(phone):
+    """Get the last user query for context in longer responses"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT content FROM messages
+                    WHERE phone = %s AND role = 'user'
+                    ORDER BY id DESC
+                    LIMIT 2
+                """, (phone,))
+                results = c.fetchall()
+                # Get the second-to-last query (current is "more info")
+                if len(results) >= 2:
+                    return results[1]['content']
+                elif len(results) == 1:
+                    return results[0]['content']
+                return None
+    except Exception as e:
+        logger.error(f"Error getting last user query: {e}")
+        return None
+
 def save_message(phone, role, content, intent_type=None, response_time_ms=None):
     try:
         with get_db_connection() as conn:
@@ -1536,13 +1262,52 @@ def detect_weather_intent(text: str) -> Optional[IntentResult]:
         return IntentResult("weather", {})
     return None
 
+def detect_longer_request(text: str) -> bool:
+    """Check if user is requesting a longer response"""
+    longer_keywords = [
+        # Direct requests
+        'longer', 'more info', 'more details', 'expand', 'tell me more', 'full details',
+        'more', 'continue', 'go on', 'elaborate', 'explain more', 'details',
+        'full story', 'complete info', 'everything', 'all of it',
+        
+        # Question-based
+        'what else', 'anything else', 'what more', 'tell me everything', 
+        'full info', 'complete details',
+        
+        # Continuation
+        'keep going', 'more please', 'continue that', 'finish that',
+        
+        # Depth requests  
+        'deeper', 'in depth', 'comprehensive', 'thorough', 'breakdown', 'analysis',
+        
+        # Specific follow-ups
+        'schedule', 'forecast', 'menu', 'hours', 'ratings'
+    ]
+    
+    text_lower = text.lower().strip()
+    
+    # Check exact matches
+    if any(keyword in text_lower for keyword in longer_keywords):
+        return True
+    
+    # Check short casual responses (be careful with context)
+    short_triggers = ['??', 'and?', 'yep', 'yes']
+    if text_lower in short_triggers:
+        return True
+    
+    # Pattern matching for "what about..."
+    if text_lower.startswith('what about'):
+        return True
+        
+    return False
+
 def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
-    # Try sports intent first
+    # Check sports first
     sports_intent = detect_sports_intent(text)
     if sports_intent:
         return sports_intent
     
-    # Then try weather intent
+    # Check weather
     weather_intent = detect_weather_intent(text)
     if weather_intent:
         return weather_intent
@@ -1616,13 +1381,20 @@ def ask_claude(phone, user_msg):
         system_context = f"""You are Alex, a helpful SMS assistant that helps people stay connected to information without spending time online. 
 
 IMPORTANT GUIDELINES:
-- You can now provide responses up to {MAX_SMS_LENGTH} characters (increased from 500)
-- Give more detailed, thorough answers while staying within the character limit
-- Be friendly and helpful with comprehensive information
+- Provide comprehensive responses up to {MAX_SMS_LENGTH} characters (480 chars = 3 SMS parts)
+- Give detailed, helpful answers with key information
+- Users get 200 messages per month, so make each response valuable and informative
+- Be concise and direct - NO introductory phrases like "Got it", "Let me provide", "Here's the info", "Sure", or user names
+- Start immediately with the answer/information requested
+- Be factual and helpful with important details - prioritize the most useful information
 - You DO have access to web search capabilities
 - For specific information requests, respond with "Let me search for [specific topic]" 
 - Never make up detailed information - always offer to search for accurate, current details
-- Be conversational and provide valuable, complete answers"""
+- DO NOT end messages with prompts like "Text 'longer' for more" - each response should be complete
+- NEVER include user names, greetings, or conversational fluff
+- For sports queries, include scores, records, recent games, and key details
+- For weather, include current conditions and forecast highlights
+- For restaurants/businesses, include hours, contact info, and key details"""
         
         try:
             headers = {
@@ -1644,7 +1416,7 @@ IMPORTANT GUIDELINES:
             
             data = {
                 "model": "claude-3-haiku-20240307",
-                "max_tokens": 250,
+                "max_tokens": 300 if "longer" in user_msg.lower() else 150,
                 "temperature": 0.3,
                 "system": system_context,
                 "messages": messages
@@ -1778,4 +1550,673 @@ def handle_subscription_deleted(subscription):
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as c
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT phone FROM user_profiles 
+                    WHERE stripe_customer_id = %s
+                """, (customer_id,))
+                result = c.fetchone()
+                
+                if result:
+                    phone = result['phone']
+                    
+                    update_user_profile(phone, subscription_status='cancelled')
+                    remove_from_whitelist(phone, send_goodbye=True)
+                    log_stripe_event('subscription_deleted', customer_id, subscription_id, phone, 'cancelled')
+                    
+                    logger.info(f"✅ Subscription cancelled for {phone}")
+                else:
+                    logger.warning(f"⚠️ No user found for customer {customer_id}")
+                    log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'cancelled',
+                                   {'error': 'No user found'})
+        
+    except Exception as e:
+        logger.error(f"❌ Error handling subscription deletion: {e}")
+        log_stripe_event('subscription_deleted', customer_id, subscription_id, None, 'error',
+                        {'error': str(e)})
+
+# === ADMIN ENDPOINTS ===
+@app.route('/admin/remove-user', methods=['POST'])
+def admin_remove_user():
+    """Admin endpoint to completely remove a user and their data"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # Remove from whitelist
+        success = remove_from_whitelist(phone, send_goodbye=True)
+        if success:
+            actions_taken.append("Removed from whitelist")
+        
+        # Remove user profile and related data
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    # Get user info before deletion for logging
+                    c.execute("SELECT first_name, location FROM user_profiles WHERE phone = %s", (phone,))
+                    user_info = c.fetchone()
+                    
+                    # Delete user profile
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    profile_deleted = c.rowcount
+                    
+                    # Delete messages
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    messages_deleted = c.rowcount
+                    
+                    # Delete onboarding log
+                    c.execute("DELETE FROM onboarding_log WHERE phone = %s", (phone,))
+                    onboarding_deleted = c.rowcount
+                    
+                    # Delete usage analytics
+                    c.execute("DELETE FROM usage_analytics WHERE phone = %s", (phone,))
+                    analytics_deleted = c.rowcount
+                    
+                    # Delete SMS delivery log
+                    c.execute("DELETE FROM sms_delivery_log WHERE phone = %s", (phone,))
+                    sms_log_deleted = c.rowcount
+                    
+                    # Delete monthly usage
+                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
+                    usage_deleted = c.rowcount
+                    
+                    # Delete whitelist events
+                    c.execute("DELETE FROM whitelist_events WHERE phone = %s", (phone,))
+                    whitelist_events_deleted = c.rowcount
+                    
+                    # Delete subscription events (keep for audit trail but mark as deleted)
+                    c.execute("""
+                        UPDATE subscription_events 
+                        SET status = 'user_deleted', processed = TRUE
+                        WHERE phone = %s
+                    """, (phone,))
+                    subscription_events_updated = c.rowcount
+                    
+                    conn.commit()
+                    
+                    if profile_deleted > 0:
+                        actions_taken.append(f"Deleted user profile")
+                    if messages_deleted > 0:
+                        actions_taken.append(f"Deleted {messages_deleted} messages")
+                    if onboarding_deleted > 0:
+                        actions_taken.append(f"Deleted {onboarding_deleted} onboarding logs")
+                    if analytics_deleted > 0:
+                        actions_taken.append(f"Deleted {analytics_deleted} analytics records")
+                    if sms_log_deleted > 0:
+                        actions_taken.append(f"Deleted {sms_log_deleted} SMS delivery logs")
+                    if usage_deleted > 0:
+                        actions_taken.append(f"Deleted {usage_deleted} usage records")
+                    if whitelist_events_deleted > 0:
+                        actions_taken.append(f"Deleted {whitelist_events_deleted} whitelist events")
+                    if subscription_events_updated > 0:
+                        actions_taken.append(f"Updated {subscription_events_updated} subscription events")
+                    
+                    # Log the removal
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, -999, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"REMOVED: User and all data deleted by admin"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged user removal")
+                    
+                    user_name = user_info['first_name'] if user_info else "Unknown"
+                    user_location = user_info['location'] if user_info else "Unknown"
+                    
+        except Exception as db_error:
+            logger.error(f"Database error removing user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        logger.info(f"🗑️ Completely removed user: {phone} ({user_name} from {user_location})")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Completely removed user {phone} and all associated data",
+            "actions_taken": actions_taken,
+            "user_info": {
+                "phone": phone,
+                "name": user_name,
+                "location": user_location
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error removing user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/reset-user', methods=['POST'])
+def admin_reset_user():
+    """Admin endpoint to reset user's usage quotas and clear message history"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    # Get user info
+                    c.execute("SELECT first_name, location FROM user_profiles WHERE phone = %s", (phone,))
+                    user_info = c.fetchone()
+                    
+                    if not user_info:
+                        return jsonify({"error": "User not found"}), 404
+                    
+                    # Reset monthly usage
+                    c.execute("DELETE FROM monthly_sms_usage WHERE phone = %s", (phone,))
+                    usage_reset = c.rowcount
+                    
+                    # Clear message history (optional - keep for debugging)
+                    c.execute("DELETE FROM messages WHERE phone = %s", (phone,))
+                    messages_cleared = c.rowcount
+                    
+                    # Clear usage analytics (optional)
+                    c.execute("DELETE FROM usage_analytics WHERE phone = %s", (phone,))
+                    analytics_cleared = c.rowcount
+                    
+                    conn.commit()
+                    
+                    if usage_reset > 0:
+                        actions_taken.append(f"Reset monthly usage quota")
+                    if messages_cleared > 0:
+                        actions_taken.append(f"Cleared {messages_cleared} message history")
+                    if analytics_cleared > 0:
+                        actions_taken.append(f"Cleared {analytics_cleared} analytics records")
+                    
+                    # Log the reset
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, 998, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"RESET: Usage quota and history reset by admin"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged user reset")
+                    
+        except Exception as db_error:
+            logger.error(f"Database error resetting user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        # Send reset confirmation
+        reset_msg = f"Hi {user_info['first_name']}! Your Hey Alex account has been reset. Your message quota is refreshed and you're ready to go!"
+        
+        try:
+            result = send_sms(phone, reset_msg, bypass_quota=True)
+            if "error" not in result:
+                actions_taken.append("Sent reset confirmation SMS")
+                save_message(phone, "assistant", reset_msg, "user_reset", 0)
+            else:
+                actions_taken.append(f"Failed to send SMS: {result['error']}")
+        except Exception as sms_error:
+            actions_taken.append(f"SMS error: {str(sms_error)}")
+        
+        logger.info(f"🔄 Reset user: {phone} ({user_info['first_name']})")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Reset user {phone} - quota refreshed and history cleared",
+            "actions_taken": actions_taken,
+            "user_info": {
+                "phone": phone,
+                "name": user_info['first_name'],
+                "location": user_info['location']
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/check-user', methods=['POST'])
+def admin_check_user():
+    """Admin endpoint to check user status and recent activity"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        user_info = {}
+        
+        # Check if in whitelist
+        whitelist = load_whitelist()
+        user_info['in_whitelist'] = phone in whitelist
+        
+        # Get user profile
+        profile = get_user_profile(phone)
+        user_info['profile'] = profile
+        
+        # Get recent messages
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("""
+                        SELECT role, content, intent_type, ts
+                        FROM messages
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 5
+                    """, (phone,))
+                    messages = c.fetchall()
+                    user_info['recent_messages'] = [dict(msg) for msg in messages]
+                    
+                    # Get recent SMS delivery logs
+                    c.execute("""
+                        SELECT message_content, delivery_status, message_id, timestamp
+                        FROM sms_delivery_log
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 3
+                    """, (phone,))
+                    sms_logs = c.fetchall()
+                    user_info['recent_sms_delivery'] = [dict(log) for log in sms_logs]
+                    
+                    # Get subscription events
+                    c.execute("""
+                        SELECT event_type, status, timestamp
+                        FROM subscription_events
+                        WHERE phone = %s
+                        ORDER BY id DESC
+                        LIMIT 3
+                    """, (phone,))
+                    events = c.fetchall()
+                    user_info['subscription_events'] = [dict(event) for event in events]
+                    
+        except Exception as db_error:
+            logger.error(f"Database error checking user: {db_error}")
+            user_info['db_error'] = str(db_error)
+        
+        return jsonify({
+            "success": True,
+            "phone": phone,
+            "user_info": user_info
+        })
+        
+    except Exception as e:
+        logger.error(f"Error checking user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/restore-user', methods=['POST'])
+def admin_restore_user():
+    """Admin endpoint to restore a user's complete profile"""
+    try:
+        data = request.get_json()
+        phone = data.get('phone')
+        first_name = data.get('first_name')
+        location = data.get('location')
+        stripe_customer_id = data.get('stripe_customer_id')
+        subscription_status = data.get('subscription_status', 'active')
+        
+        if not phone:
+            return jsonify({"error": "Phone number required"}), 400
+        
+        if not first_name or not location:
+            return jsonify({"error": "first_name and location are required"}), 400
+        
+        phone = normalize_phone_number(phone)
+        
+        actions_taken = []
+        
+        # Add to whitelist
+        success = add_to_whitelist(phone, send_welcome=False, source='admin_restore')
+        if success:
+            actions_taken.append("Added to whitelist")
+        
+        # Create/update user profile
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as c:
+                    
+                    c.execute("DELETE FROM user_profiles WHERE phone = %s", (phone,))
+                    
+                    c.execute("""
+                        INSERT INTO user_profiles 
+                        (phone, first_name, location, onboarding_step, onboarding_completed, 
+                         stripe_customer_id, subscription_status, created_date, updated_date)
+                        VALUES (%s, %s, %s, 3, TRUE, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (phone, first_name, location, stripe_customer_id, subscription_status))
+                    
+                    conn.commit()
+                    actions_taken.append("Created complete user profile")
+                    
+                    c.execute("""
+                        INSERT INTO onboarding_log (phone, step, response, timestamp)
+                        VALUES (%s, 999, %s, CURRENT_TIMESTAMP)
+                    """, (phone, f"RESTORED: {first_name} in {location}"))
+                    
+                    conn.commit()
+                    actions_taken.append("Logged profile restoration")
+                    
+        except Exception as db_error:
+            logger.error(f"Database error restoring user: {db_error}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        # Send confirmation SMS
+        confirmation_msg = f"Hi {first_name}! Your Hey Alex account has been restored. You're all set up in {location}. Ask me anything!"
+        
+        try:
+            result = send_sms(phone, confirmation_msg, bypass_quota=True)
+            if "error" not in result:
+                actions_taken.append("Sent confirmation SMS")
+                save_message(phone, "assistant", confirmation_msg, "profile_restored", 0)
+            else:
+                actions_taken.append(f"Failed to send SMS: {result['error']}")
+        except Exception as sms_error:
+            actions_taken.append(f"SMS error: {str(sms_error)}")
+        
+        logger.info(f"👤 Restored user profile: {first_name} ({phone}) in {location}")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Restored user profile for {first_name} ({phone})",
+            "actions_taken": actions_taken,
+            "profile": {
+                "phone": phone,
+                "first_name": first_name,
+                "location": location,
+                "onboarding_completed": True,
+                "stripe_customer_id": stripe_customer_id,
+                "subscription_status": subscription_status
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error restoring user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# === STRIPE WEBHOOK ===
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events"""
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    if not sig_header:
+        logger.error("Missing Stripe signature header")
+        return jsonify({'error': 'Missing signature header'}), 400
+    
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+        
+        logger.info(f"📨 Received Stripe webhook: {event['type']}")
+        
+        if event['type'] == 'customer.subscription.created':
+            handle_subscription_created(event['data']['object'])
+        
+        elif event['type'] == 'customer.subscription.deleted':
+            handle_subscription_deleted(event['data']['object'])
+        
+        elif event['type'] == 'customer.subscription.updated':
+            subscription = event['data']['object']
+            logger.info(f"📝 Subscription updated: {subscription['id']} - Status: {subscription['status']}")
+        
+        elif event['type'] == 'invoice.payment_failed':
+            invoice = event['data']['object']
+            logger.warning(f"💳 Payment failed for customer: {invoice['customer']}")
+        
+        elif event['type'] == 'invoice.payment_succeeded':
+            invoice = event['data']['object']
+            logger.info(f"✅ Payment succeeded for customer: {invoice['customer']}")
+        
+        else:
+            logger.info(f"ℹ️ Unhandled Stripe event type: {event['type']}")
+        
+        return jsonify({'status': 'success'}), 200
+        
+    except ValueError as e:
+        logger.error(f"❌ Invalid payload: {e}")
+        return jsonify({'error': 'Invalid payload'}), 400
+    except stripe.error.SignatureVerificationError as e:
+        logger.error(f"❌ Invalid signature: {e}")
+        return jsonify({'error': 'Invalid signature'}), 400
+    except Exception as e:
+        logger.error(f"💥 Error processing Stripe webhook: {e}")
+        return jsonify({'error': 'Webhook processing failed'}), 500
+
+# === MAIN SMS WEBHOOK ===
+@app.route("/sms", methods=["POST"])
+@handle_errors  
+def sms_webhook():
+    start_time = time.time()
+    
+    sender = request.form.get("from")
+    body = (request.form.get("body") or "").strip()
+    
+    logger.info(f"📱 SMS received from {sender}: {repr(body)}")
+    
+    if not sender:
+        return jsonify({"error": "Missing 'from' field"}), 400
+    
+    if not body:
+        return jsonify({"message": "Empty message received"}), 200
+    
+    # Check whitelist
+    whitelist = load_whitelist()
+    if sender not in whitelist:
+        logger.warning(f"🚫 Unauthorized sender: {sender}")
+        return jsonify({"message": "Unauthorized sender"}), 403
+    
+    # Content filtering
+    is_valid, filter_reason = content_filter.is_valid_query(body)
+    if not is_valid:
+        logger.warning(f"🚫 Content filtered for {sender}: {filter_reason}")
+        return jsonify({"message": "Content filtered"}), 400
+    
+    # Save user message
+    save_message(sender, "user", body)
+    
+    # Handle special commands
+    if body.lower() in ['stop', 'quit', 'unsubscribe']:
+        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
+        try:
+            send_sms(sender, response_msg, bypass_quota=True)
+            return jsonify({"message": "Unsubscribe processed"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send unsubscribe message: {e}")
+            return jsonify({"error": "Failed to process unsubscribe"}), 500
+    
+    if body.lower() in ['start', 'subscribe', 'resume']:
+        if is_user_onboarded(sender):
+            response_msg = WELCOME_MSG
+        else:
+            create_user_profile(sender)
+            response_msg = ONBOARDING_NAME_MSG
+        
+        try:
+            send_sms(sender, response_msg, bypass_quota=True)
+            save_message(sender, "assistant", response_msg, "start_command", 0)
+            return jsonify({"message": "Start message sent"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send start message: {e}")
+            return jsonify({"error": "Failed to send start message"}), 500
+    
+    # Check if user needs to complete onboarding
+    profile = get_user_profile(sender)
+    logger.info(f"👤 User profile for {sender}: {profile}")
+    
+    if not profile:
+        logger.info(f"📝 No profile found for {sender}, creating new profile")
+        create_user_profile(sender)
+        
+        try:
+            send_sms(sender, ONBOARDING_NAME_MSG, bypass_quota=True)
+            save_message(sender, "assistant", ONBOARDING_NAME_MSG, "onboarding_start", 0)
+            return jsonify({"message": "Onboarding started for new user"}), 200
+        except Exception as e:
+            logger.error(f"Failed to send onboarding start message: {e}")
+            return jsonify({"error": "Failed to start onboarding"}), 500
+    
+    elif not profile['onboarding_completed']:
+        logger.info(f"🚀 User {sender} is in onboarding process (step {profile['onboarding_step']})")
+        
+        try:
+            response_msg = handle_onboarding_response(sender, body)
+            result = send_sms(sender, response_msg)
+            
+            if "error" not in result:
+                logger.info(f"✅ Onboarding response sent to {sender}")
+                return jsonify({"message": "Onboarding response sent"}), 200
+            else:
+                logger.error(f"❌ Failed to send onboarding response to {sender}: {result['error']}")
+                return jsonify({"error": "Failed to send onboarding response"}), 500
+                
+        except Exception as e:
+            logger.error(f"💥 Onboarding error for {sender}: {e}")
+            fallback_msg = "Sorry, there was an error during setup. Please try again."
+            try:
+                send_sms(sender, fallback_msg, bypass_quota=True)
+                return jsonify({"message": "Onboarding fallback sent"}), 200
+            except Exception as fallback_error:
+                logger.error(f"Failed to send onboarding fallback: {fallback_error}")
+                return jsonify({"error": "Onboarding failed"}), 500
+    
+    # Check if user is requesting a longer response
+    is_longer_request = detect_longer_request(body)
+    
+    # User is fully onboarded - continue to normal processing
+    logger.info(f"✅ User {sender} is fully onboarded: {profile['first_name']} in {profile['location']}")
+    
+    intent = detect_intent(body, sender)
+    intent_type = intent.type if intent else "general"
+    
+    # Add longer request flag to intent type for logging
+    if is_longer_request:
+        intent_type += "_longer"
+        logger.info(f"🔍 User requested longer response for: {body}")
+    
+    user_context = get_user_context_for_queries(sender)
+    
+    try:
+        # Handle sports queries with ESPN API
+        if intent and intent.type.startswith("sports"):
+            sport_type = intent.entities.get("sport", "nfl")  # Default to NFL
+            
+            if intent.type == "sports_schedule":
+                team_name = intent.entities.get("team")
+                if team_name:
+                    team_data = get_team_data(team_name, sport_type)
+                    if team_data:
+                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
+                    else:
+                        response_msg = f"Team '{team_name}' not found. Try: Saints, Patriots, Cowboys, etc."
+                else:
+                    response_msg = f"Which {sport_type.upper()} team are you asking about?"
+            
+            elif intent.type == "sports_scores":
+                response_msg = get_sports_scores(sport_type)
+            
+            elif intent.type == "sports_team_score" or intent.type == "sports_team_info":
+                team_name = intent.entities.get("team")
+                if team_name:
+                    team_data = get_team_data(team_name, sport_type)
+                    if team_data:
+                        response_msg = get_sports_schedule(sport_type, team_data['id'], team_data['name'])
+                    else:
+                        response_msg = f"Team '{team_name}' not found."
+                else:
+                    response_msg = get_sports_scores(sport_type)
+        
+        # Handle other queries
+        else:
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            if "Let me search for" in response_msg:
+                search_term = body
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
+        
+        original_length = len(response_msg)
+        response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
+        message_parts = 3  # All messages are now 3 SMS parts (480 chars)
+        
+        if original_length > len(response_msg):
+            logger.info(f"📏 Response truncated from {original_length} to {len(response_msg)} chars")
+        
+        # Log message parts for cost tracking
+        logger.info(f"📊 Response will use {message_parts} message parts")
+        
+        response_time = int((time.time() - start_time) * 1000)
+        save_message(sender, "assistant", response_msg, intent_type, response_time)
+        
+        result = send_sms(sender, response_msg)
+        
+        if "error" not in result:
+            log_usage_analytics(sender, intent_type, True, response_time)
+            logger.info(f"✅ Response sent to {sender} in {response_time}ms (length: {len(response_msg)} chars, {message_parts} parts)")
+            return jsonify({"message": "Response sent successfully"}), 200
+        else:
+            log_usage_analytics(sender, intent_type, False, response_time)
+            logger.error(f"❌ Failed to send response to {sender}: {result['error']}")
+            return jsonify({"error": "Failed to send response"}), 500
+            
+    except Exception as e:
+        response_time = int((time.time() - start_time) * 1000)
+        log_usage_analytics(sender, intent_type, False, response_time)
+        logger.error(f"💥 Processing error for {sender}: {e}")
+        
+        fallback_msg = "Sorry, I'm having trouble processing your request. Please try again in a moment."
+        try:
+            send_sms(sender, fallback_msg, bypass_quota=True)
+            return jsonify({"message": "Fallback response sent"}), 200
+        except Exception as fallback_error:
+            logger.error(f"Failed to send fallback message: {fallback_error}")
+            return jsonify({"error": "Processing failed"}), 500
+
+# === HEALTH CHECK ===
+@app.route('/')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'version': APP_VERSION,
+        'latest_changes': CHANGELOG[APP_VERSION],
+        'database_type': 'PostgreSQL',
+        'sms_char_limit': MAX_SMS_LENGTH,
+        'monthly_message_limit': MONTHLY_LIMIT,
+        'message_parts_per_response': 3,
+        'clicksend_max_limit': CLICKSEND_MAX_LENGTH,
+        'sports_supported': ['NFL', 'MLB', 'NHL', 'College Football'],
+        'espn_api_enabled': True,
+        'admin_endpoints': [
+            '/admin/remove-user',
+            '/admin/reset-user', 
+            '/admin/restore-user',
+            '/admin/check-user'
+        ]
+    })
+
+# Initialize database on startup
+init_db()
+
+if __name__ == "__main__":
+    logger.info(f"🚀 Starting Hey Alex SMS Assistant v{APP_VERSION}")
+    logger.info(f"📋 Latest changes: {CHANGELOG[APP_VERSION]}")
+    logger.info(f"🗄️ Database: PostgreSQL (persistent storage)")
+    logger.info(f"📏 SMS response limit: {MAX_SMS_LENGTH} characters (3 SMS parts)")
+    logger.info(f"📊 Monthly message limit: {MONTHLY_LIMIT} detailed messages")
+    logger.info(f"🏈 Sports API: ESPN integration enabled (NFL, MLB, NHL, College)")
+    logger.info(f"🔧 Admin endpoints available: /admin/remove-user, /admin/reset-user, /admin/restore-user, /admin/check-user")
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
