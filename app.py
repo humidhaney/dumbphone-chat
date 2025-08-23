@@ -136,6 +136,13 @@ ONBOARDING_COMPLETE_MSG = (
     "You get 200 detailed messages per month. Try asking \"weather today\" or \"Saints game today\" to start!"
 )
 
+# === Intent Detection Classes ===
+@dataclass
+class IntentResult:
+    type: str
+    entities: Dict[str, Any]
+    confidence: float = 1.0
+
 # === ESPN Sports API Integration ===
 ESPN_BASE_URL = "https://site.web.api.espn.com/apis/site/v2/sports"
 
@@ -1242,12 +1249,6 @@ class ContentFilter:
 content_filter = ContentFilter()
 
 # === Intent Detection ===
-@dataclass
-class IntentResult:
-    type: str
-    entities: Dict[str, Any]
-    confidence: float = 1.0
-
 def detect_weather_intent(text: str) -> Optional[IntentResult]:
     weather_patterns = [
         r'\bweather\b',
