@@ -1066,11 +1066,13 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
             """Parse ESPN date format with flexible handling"""
             try:
                 # Try with seconds first
-                return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%SZ')
+                dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%SZ')
+                return dt.replace(tzinfo=timezone.utc)
             except ValueError:
                 try:
                     # Try without seconds
-                    return datetime.strptime(date_str, '%Y-%m-%dT%H:%MZ')
+                    dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%MZ')
+                    return dt.replace(tzinfo=timezone.utc)
                 except ValueError:
                     try:
                         # Try ISO format
@@ -1079,12 +1081,26 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                         logger.error(f"Unable to parse date: {date_str}")
                         return None
         
+        def convert_to_central(utc_dt):
+            """Convert UTC datetime to Central Time"""
+            if not utc_dt:
+                return None
+            # Central Time is UTC-6 (CST) or UTC-5 (CDT)
+            # Since it's August, we're in CDT (UTC-5)
+            central_offset = timedelta(hours=-5)  # CDT offset
+            return utc_dt + central_offset
+        
         for event in events:
-            game_datetime = parse_game_date(event['date'])
-            if not game_datetime:
+            game_datetime_utc = parse_game_date(event['date'])
+            if not game_datetime_utc:
                 continue
                 
-            game_date = game_datetime.date()
+            # Convert to Central Time for date comparison
+            game_datetime_central = convert_to_central(game_datetime_utc)
+            if not game_datetime_central:
+                continue
+                
+            game_date = game_datetime_central.date()
             
             if game_date == today:
                 todays_game = event
@@ -1109,12 +1125,21 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                     if competitor['team']['id'] != str(team_id):
                         opponent = competitor['team']['displayName']
                 
-                game_datetime = parse_game_date(todays_game['date'])
-                if game_datetime:
-                    # Convert to Central Time for New Orleans users
-                    game_time = game_datetime.strftime('%I:%M%p CT')
+                game_datetime_utc = parse_game_date(todays_game['date'])
+                if game_datetime_utc:
+                    # Convert to Central Time and format
+                    game_datetime_central = convert_to_central(game_datetime_utc)
+                    if game_datetime_central:
+                        game_time = game_datetime_central.strftime('%I:%M%p CT').replace(' CT', 'PM CT' if game_datetime_central.hour >= 12 else 'AM CT')
+                        # Clean up the format
+                        game_time = game_datetime_central.strftime('%I:%M%p CT')
             
-            return f"Yes! {team_name} play {opponent} today at {game_time}.{record}"
+            # Add preseason context if it's preseason
+            season_type = ""
+            if todays_game.get('season', {}).get('type') == 1:  # Preseason
+                season_type = " (Preseason)"
+            
+            return f"Yes! {team_name} play {opponent} today at {game_time}.{season_type}{record}"
         
         elif next_game:
             opponent = ""
@@ -1126,10 +1151,12 @@ def get_sports_schedule(sport, team_id=None, team_name=""):
                     if competitor['team']['id'] != str(team_id):
                         opponent = competitor['team']['displayName']
                 
-                game_datetime = parse_game_date(next_game['date'])
-                if game_datetime:
-                    game_date = game_datetime.strftime('%A, %B %d')
-                    game_time = game_datetime.strftime('%I:%M%p CT')
+                game_datetime_utc = parse_game_date(next_game['date'])
+                if game_datetime_utc:
+                    game_datetime_central = convert_to_central(game_datetime_utc)
+                    if game_datetime_central:
+                        game_date = game_datetime_central.strftime('%A, %B %d')
+                        game_time = game_datetime_central.strftime('%I:%M%p CT')
             
             return f"No {team_name} game today. Next: vs {opponent} on {game_date} at {game_time}.{record}"
         
