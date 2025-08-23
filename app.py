@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "4.2"
+APP_VERSION = "5.0"
 CHANGELOG = {
+    "5.0": "MAJOR: Added ESPN Sports API integration for accurate NFL team schedules, scores, and game information",
     "4.2": "PERFECT BALANCE: 200 messages/month at 320 characters each (2 SMS parts) - great value with 76% profit margin",
     "4.1": "OPTIMIZED: Changed to 320-char messages (2 SMS parts) for optimal cost efficiency at $0.08 per message",
     "4.0": "MAJOR: Changed to 480-char detailed messages (3 SMS parts) with 100 messages/month for comprehensive responses",
@@ -865,8 +866,401 @@ def detect_longer_request(text: str) -> bool:
         
     return False
 
+# === ESPN Sports API Integration ===
+def get_team_data(team_name, sport_type):
+    """Get team data for different sports from ESPN API"""
+    
+    # NFL teams
+    nfl_teams = {
+        'saints': {'id': '18', 'name': 'New Orleans Saints'},
+        'patriots': {'id': '17', 'name': 'New England Patriots'},
+        'cowboys': {'id': '6', 'name': 'Dallas Cowboys'},
+        'packers': {'id': '9', 'name': 'Green Bay Packers'},
+        'chiefs': {'id': '12', 'name': 'Kansas City Chiefs'},
+        'bills': {'id': '2', 'name': 'Buffalo Bills'},
+        'bengals': {'id': '4', 'name': 'Cincinnati Bengals'},
+        'ravens': {'id': '33', 'name': 'Baltimore Ravens'},
+        'steelers': {'id': '23', 'name': 'Pittsburgh Steelers'},
+        'browns': {'id': '5', 'name': 'Cleveland Browns'},
+        'titans': {'id': '10', 'name': 'Tennessee Titans'},
+        'colts': {'id': '11', 'name': 'Indianapolis Colts'},
+        'jaguars': {'id': '30', 'name': 'Jacksonville Jaguars'},
+        'texans': {'id': '34', 'name': 'Houston Texans'},
+        'broncos': {'id': '7', 'name': 'Denver Broncos',},
+        'chargers': {'id': '24', 'name': 'Los Angeles Chargers'},
+        'raiders': {'id': '13', 'name': 'Las Vegas Raiders'},
+        'dolphins': {'id': '15', 'name': 'Miami Dolphins'},
+        'jets': {'id': '20', 'name': 'New York Jets'},
+        'eagles': {'id': '21', 'name': 'Philadelphia Eagles'},
+        'commanders': {'id': '28', 'name': 'Washington Commanders'},
+        'giants': {'id': '19', 'name': 'New York Giants'},
+        'rams': {'id': '14', 'name': 'Los Angeles Rams'},
+        'seahawks': {'id': '26', 'name': 'Seattle Seahawks'},
+        '49ers': {'id': '25', 'name': 'San Francisco 49ers'},
+        'cardinals': {'id': '22', 'name': 'Arizona Cardinals'},
+        'vikings': {'id': '16', 'name': 'Minnesota Vikings'},
+        'lions': {'id': '8', 'name': 'Detroit Lions'},
+        'bears': {'id': '3', 'name': 'Chicago Bears'},
+        'buccaneers': {'id': '27', 'name': 'Tampa Bay Buccaneers'},
+        'falcons': {'id': '1', 'name': 'Atlanta Falcons'},
+        'panthers': {'id': '29', 'name': 'Carolina Panthers'}
+    }
+    
+    # MLB teams
+    mlb_teams = {
+        'yankees': {'id': '10', 'name': 'New York Yankees'},
+        'red sox': {'id': '2', 'name': 'Boston Red Sox'},
+        'blue jays': {'id': '14', 'name': 'Toronto Blue Jays'},
+        'orioles': {'id': '1', 'name': 'Baltimore Orioles'},
+        'rays': {'id': '30', 'name': 'Tampa Bay Rays'},
+        'white sox': {'id': '4', 'name': 'Chicago White Sox'},
+        'guardians': {'id': '5', 'name': 'Cleveland Guardians'},
+        'tigers': {'id': '6', 'name': 'Detroit Tigers'},
+        'royals': {'id': '7', 'name': 'Kansas City Royals'},
+        'twins': {'id': '9', 'name': 'Minnesota Twins'},
+        'astros': {'id': '18', 'name': 'Houston Astros'},
+        'angels': {'id': '3', 'name': 'Los Angeles Angels'},
+        'athletics': {'id': '11', 'name': 'Oakland Athletics'},
+        'mariners': {'id': '12', 'name': 'Seattle Mariners'},
+        'rangers': {'id': '13', 'name': 'Texas Rangers'},
+        'braves': {'id': '15', 'name': 'Atlanta Braves'},
+        'marlins': {'id': '28', 'name': 'Miami Marlins'},
+        'mets': {'id': '21', 'name': 'New York Mets'},
+        'phillies': {'id': '22', 'name': 'Philadelphia Phillies'},
+        'nationals': {'id': '20', 'name': 'Washington Nationals'},
+        'cubs': {'id': '16', 'name': 'Chicago Cubs'},
+        'reds': {'id': '17', 'name': 'Cincinnati Reds'},
+        'brewers': {'id': '8', 'name': 'Milwaukee Brewers'},
+        'pirates': {'id': '23', 'name': 'Pittsburgh Pirates'},
+        'cardinals': {'id': '24', 'name': 'St. Louis Cardinals'},
+        'diamondbacks': {'id': '29', 'name': 'Arizona Diamondbacks'},
+        'rockies': {'id': '27', 'name': 'Colorado Rockies'},
+        'dodgers': {'id': '19', 'name': 'Los Angeles Dodgers'},
+        'padres': {'id': '25', 'name': 'San Diego Padres'},
+        'giants': {'id': '26', 'name': 'San Francisco Giants'}
+    }
+    
+    # NHL teams
+    nhl_teams = {
+        'bruins': {'id': '6', 'name': 'Boston Bruins'},
+        'sabres': {'id': '7', 'name': 'Buffalo Sabres'},
+        'red wings': {'id': '17', 'name': 'Detroit Red Wings'},
+        'panthers': {'id': '13', 'name': 'Florida Panthers'},
+        'canadiens': {'id': '8', 'name': 'Montreal Canadiens'},
+        'senators': {'id': '9', 'name': 'Ottawa Senators'},
+        'lightning': {'id': '14', 'name': 'Tampa Bay Lightning'},
+        'maple leafs': {'id': '10', 'name': 'Toronto Maple Leafs'},
+        'hurricanes': {'id': '12', 'name': 'Carolina Hurricanes'},
+        'blue jackets': {'id': '29', 'name': 'Columbus Blue Jackets'},
+        'devils': {'id': '18', 'name': 'New Jersey Devils'},
+        'islanders': {'id': '19', 'name': 'New York Islanders'},
+        'rangers': {'id': '20', 'name': 'New York Rangers'},
+        'flyers': {'id': '4', 'name': 'Philadelphia Flyers'},
+        'penguins': {'id': '5', 'name': 'Pittsburgh Penguins'},
+        'capitals': {'id': '15', 'name': 'Washington Capitals'},
+        'blackhawks': {'id': '16', 'name': 'Chicago Blackhawks'},
+        'avalanche': {'id': '21', 'name': 'Colorado Avalanche'},
+        'stars': {'id': '25', 'name': 'Dallas Stars'},
+        'wild': {'id': '30', 'name': 'Minnesota Wild'},
+        'predators': {'id': '18', 'name': 'Nashville Predators'},
+        'blues': {'id': '19', 'name': 'St. Louis Blues'},
+        'flames': {'id': '20', 'name': 'Calgary Flames'},
+        'oilers': {'id': '22', 'name': 'Edmonton Oilers'},
+        'kraken': {'id': '26', 'name': 'Seattle Kraken'},
+        'canucks': {'id': '23', 'name': 'Vancouver Canucks'},
+        'ducks': {'id': '24', 'name': 'Anaheim Ducks'},
+        'kings': {'id': '26', 'name': 'Los Angeles Kings'},
+        'sharks': {'id': '28', 'name': 'San Jose Sharks'},
+        'golden knights': {'id': '37', 'name': 'Vegas Golden Knights'},
+        'coyotes': {'id': '53', 'name': 'Arizona Coyotes'}
+    }
+    
+    # College teams (major ones)
+    college_teams = {
+        'alabama': {'id': '333', 'name': 'Alabama Crimson Tide'},
+        'georgia': {'id': '61', 'name': 'Georgia Bulldogs'},
+        'ohio state': {'id': '194', 'name': 'Ohio State Buckeyes'},
+        'michigan': {'id': '130', 'name': 'Michigan Wolverines'},
+        'clemson': {'id': '228', 'name': 'Clemson Tigers'},
+        'notre dame': {'id': '87', 'name': 'Notre Dame Fighting Irish'},
+        'texas': {'id': '251', 'name': 'Texas Longhorns'},
+        'oklahoma': {'id': '201', 'name': 'Oklahoma Sooners'},
+        'lsu': {'id': '99', 'name': 'LSU Tigers'},
+        'florida': {'id': '57', 'name': 'Florida Gators'},
+        'penn state': {'id': '213', 'name': 'Penn State Nittany Lions'},
+        'wisconsin': {'id': '275', 'name': 'Wisconsin Badgers'},
+        'oregon': {'id': '2483', 'name': 'Oregon Ducks'},
+        'usc': {'id': '30', 'name': 'USC Trojans'},
+        'ucla': {'id': '26', 'name': 'UCLA Bruins'},
+        'stanford': {'id': '24', 'name': 'Stanford Cardinal'},
+        'miami': {'id': '2390', 'name': 'Miami Hurricanes'},
+        'florida state': {'id': '52', 'name': 'Florida State Seminoles'},
+        'virginia tech': {'id': '259', 'name': 'Virginia Tech Hokies'},
+        'north carolina': {'id': '153', 'name': 'North Carolina Tar Heels'},
+        'duke': {'id': '150', 'name': 'Duke Blue Devils'},
+        'kentucky': {'id': '96', 'name': 'Kentucky Wildcats'},
+        'tennessee': {'id': '2633', 'name': 'Tennessee Volunteers'},
+        'auburn': {'id': '2', 'name': 'Auburn Tigers'},
+        'mississippi': {'id': '145', 'name': 'Ole Miss Rebels'},
+        'mississippi state': {'id': '344', 'name': 'Mississippi State Bulldogs'},
+        'arkansas': {'id': '8', 'name': 'Arkansas Razorbacks'},
+        'missouri': {'id': '142', 'name': 'Missouri Tigers'},
+        'south carolina': {'id': '2579', 'name': 'South Carolina Gamecocks'},
+        'vanderbilt': {'id': '238', 'name': 'Vanderbilt Commodores'},
+        'texas a&m': {'id': '245', 'name': 'Texas A&M Aggies'},
+        'tulane': {'id': '2655', 'name': 'Tulane Green Wave'}
+    }
+    
+    teams = {
+        'nfl': nfl_teams,
+        'mlb': mlb_teams, 
+        'nhl': nhl_teams,
+        'college': college_teams
+    }
+    
+    if sport_type not in teams:
+        return None
+        
+    team_key = team_name.lower().replace(' ', '').replace('new orleans', 'saints').replace('neworleans', 'saints')
+    
+    # Find team by partial match
+    for key, team_info in teams[sport_type].items():
+        if key.replace(' ', '') in team_key or team_key in key.replace(' ', ''):
+            return team_info
+    
+    return None
+
+def get_sports_schedule(sport, team_id=None, team_name=""):
+    """Get sports schedule from ESPN API"""
+    try:
+        # ESPN API URLs for different sports
+        sport_urls = {
+            'nfl': f"https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/schedule",
+            'mlb': f"https://site.web.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/{team_id}/schedule",
+            'nhl': f"https://site.web.api.espn.com/apis/site/v2/sports/hockey/nhl/teams/{team_id}/schedule",
+            'college': f"https://site.web.api.espn.com/apis/site/v2/sports/football/college-football/teams/{team_id}/schedule"
+        }
+        
+        if sport not in sport_urls:
+            return f"Sport '{sport}' not supported yet."
+        
+        url = sport_urls[sport]
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            return f"Unable to get {team_name} schedule right now."
+        
+        data = response.json()
+        
+        if 'events' not in data:
+            return f"No {team_name} games found."
+        
+        events = data['events']
+        today = datetime.now().date()
+        
+        # Look for today's game
+        todays_game = None
+        next_game = None
+        
+        for event in events:
+            game_date = datetime.strptime(event['date'], '%Y-%m-%dT%H:%M:%SZ').date()
+            
+            if game_date == today:
+                todays_game = event
+                break
+            elif game_date > today and not next_game:
+                next_game = event
+        
+        # Get team record if available
+        record = ""
+        if 'team' in data and 'record' in data['team']:
+            wins = data['team']['record'].get('wins', 0)
+            losses = data['team']['record'].get('losses', 0)
+            record = f" Record: {wins}-{losses}."
+        
+        # Format response
+        if todays_game:
+            opponent = ""
+            game_time = ""
+            
+            for competition in todays_game.get('competitions', []):
+                for competitor in competition.get('competitors', []):
+                    if competitor['team']['id'] != str(team_id):
+                        opponent = competitor['team']['displayName']
+                
+                game_time = datetime.strptime(todays_game['date'], '%Y-%m-%dT%H:%M:%SZ').strftime('%I:%M%p ET')
+            
+            return f"Yes! {team_name} play {opponent} today at {game_time}.{record}"
+        
+        elif next_game:
+            opponent = ""
+            game_date = ""
+            game_time = ""
+            
+            for competition in next_game.get('competitions', []):
+                for competitor in competition.get('competitors', []):
+                    if competitor['team']['id'] != str(team_id):
+                        opponent = competitor['team']['displayName']
+                
+                game_datetime = datetime.strpython(next_game['date'], '%Y-%m-%dT%H:%M:%SZ')
+                game_date = game_datetime.strftime('%A, %B %d')
+                game_time = game_datetime.strftime('%I:%M%p ET')
+            
+            return f"No {team_name} game today. Next: vs {opponent} on {game_date} at {game_time}.{record}"
+        
+        else:
+            return f"No upcoming {team_name} games found.{record}"
+            
+    except Exception as e:
+        logger.error(f"ESPN API error: {e}")
+        return f"Unable to get {team_name} schedule. Please try again."
+
+def get_sport_scores(sport):
+    """Get current scores for different sports from ESPN API"""
+    try:
+        # ESPN API URLs for scoreboards
+        scoreboard_urls = {
+            'nfl': "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+            'mlb': "https://site.web.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard", 
+            'nhl': "https://site.web.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+            'college': "https://site.web.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
+        }
+        
+        if sport not in scoreboard_urls:
+            return f"{sport.upper()} scores not available."
+        
+        url = scoreboard_urls[sport]
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            return f"Unable to get {sport.upper()} scores right now."
+        
+        data = response.json()
+        
+        if not data.get('events'):
+            return f"No {sport.upper()} games today."
+        
+        games = []
+        sport_name = sport.upper()
+        
+        for event in data['events'][:3]:  # Limit to 3 games
+            competition = event['competitions'][0]
+            
+            team1 = competition['competitors'][0]['team']['abbreviation']
+            team2 = competition['competitors'][1]['team']['abbreviation'] 
+            score1 = competition['competitors'][0].get('score', '0')
+            score2 = competition['competitors'][1].get('score', '0')
+            
+            status = competition['status']['type']['description']
+            
+            if status == 'Final':
+                games.append(f"{team1} {score1}, {team2} {score2} (Final)")
+            else:
+                games.append(f"{team1} {score1}, {team2} {score2} ({status})")
+        
+        return f"{sport_name} Scores: " + " | ".join(games) if games else f"No {sport_name} games today."
+        
+    except Exception as e:
+        logger.error(f"ESPN {sport} scores error: {e}")
+        return f"Unable to get {sport.upper()} scores. Please try again."
+
+def detect_sport_type(text):
+    """Detect which sport the user is asking about"""
+    text_lower = text.lower()
+    
+    # Sport-specific keywords
+    if any(word in text_lower for word in ['nfl', 'football', 'touchdown', 'quarterback', 'superbowl']):
+        return 'nfl'
+    elif any(word in text_lower for word in ['mlb', 'baseball', 'home run', 'pitcher', 'world series', 'innings']):
+        return 'mlb'  
+    elif any(word in text_lower for word in ['nhl', 'hockey', 'goal', 'puck', 'stanley cup', 'ice hockey']):
+        return 'nhl'
+    elif any(word in text_lower for word in ['college', 'ncaa', 'university', 'crimson tide', 'bulldogs', 'tigers']):
+        return 'college'
+    
+    # Default to NFL if no specific sport detected but has sports context
+    return 'nfl'
+
+def detect_sports_intent(text: str) -> Optional[IntentResult]:
+    """Enhanced sports intent detection for multiple sports"""
+    text_lower = text.lower()
+    
+    # All team names from all sports
+    all_teams = [
+        # NFL
+        'saints', 'patriots', 'cowboys', 'packers', 'chiefs', 'bills', 'bengals',
+        'ravens', 'steelers', 'browns', 'titans', 'colts', 'jaguars', 'texans',
+        'broncos', 'chargers', 'raiders', 'dolphins', 'jets', 'eagles',
+        'commanders', 'giants', 'rams', 'seahawks', '49ers', 'cardinals',
+        'vikings', 'lions', 'bears', 'buccaneers', 'falcons', 'panthers',
+        # MLB
+        'yankees', 'red sox', 'blue jays', 'orioles', 'rays', 'white sox',
+        'guardians', 'tigers', 'royals', 'twins', 'astros', 'angels',
+        'athletics', 'mariners', 'rangers', 'braves', 'marlins', 'mets',
+        'phillies', 'nationals', 'cubs', 'reds', 'brewers', 'pirates',
+        'cardinals', 'diamondbacks', 'rockies', 'dodgers', 'padres', 'giants',
+        # NHL
+        'bruins', 'sabres', 'red wings', 'panthers', 'canadiens', 'senators',
+        'lightning', 'maple leafs', 'hurricanes', 'blue jackets', 'devils',
+        'islanders', 'rangers', 'flyers', 'penguins', 'capitals', 'blackhawks',
+        'avalanche', 'stars', 'wild', 'predators', 'blues', 'flames',
+        'oilers', 'kraken', 'canucks', 'ducks', 'kings', 'sharks',
+        'golden knights', 'coyotes',
+        # College
+        'alabama', 'georgia', 'ohio state', 'michigan', 'clemson', 'notre dame',
+        'texas', 'oklahoma', 'lsu', 'florida', 'penn state', 'wisconsin',
+        'oregon', 'usc', 'ucla', 'stanford', 'miami', 'florida state',
+        'tulane'
+    ]
+    
+    # Sports keywords
+    sports_keywords = [
+        'game', 'score', 'scores', 'nfl', 'mlb', 'nhl', 'college', 'football', 
+        'baseball', 'hockey', 'schedule', 'play', 'team', 'season', 'record', 
+        'win', 'loss', 'touchdown', 'home run', 'goal', 'ncaa'
+    ]
+    
+    # Check for team mentions
+    mentioned_team = None
+    for team in all_teams:
+        if team in text_lower:
+            mentioned_team = team
+            break
+    
+    # Check for sports context
+    has_sports_context = any(keyword in text_lower for keyword in sports_keywords)
+    
+    if mentioned_team or has_sports_context:
+        # Determine sport type
+        sport_type = detect_sport_type(text)
+        
+        # Determine query type
+        if any(word in text_lower for word in ['today', 'tonight', 'game today']):
+            return IntentResult("sports_schedule", {"team": mentioned_team, "timeframe": "today", "sport": sport_type})
+        elif any(word in text_lower for word in ['score', 'scores', 'result']):
+            if mentioned_team:
+                return IntentResult("sports_team_score", {"team": mentioned_team, "sport": sport_type})
+            else:
+                return IntentResult("sports_scores", {"sport": sport_type})
+        elif any(word in text_lower for word in ['schedule', 'next game', 'when']):
+            return IntentResult("sports_schedule", {"team": mentioned_team, "timeframe": "upcoming", "sport": sport_type})
+        elif mentioned_team:
+            return IntentResult("sports_team_info", {"team": mentioned_team, "sport": sport_type})
+    
+    return None
+
 def detect_intent(text: str, phone: str = None) -> Optional[IntentResult]:
-    return detect_weather_intent(text)
+    # Check sports first
+    sports_intent = detect_sports_intent(text)
+    if sports_intent:
+        return sports_intent
+    
+    # Check weather
+    weather_intent = detect_weather_intent(text)
+    if weather_intent:
+        return weather_intent
+    
+    return None
 
 # === Web Search ===
 def web_search(q, num=3, search_type="general"):
@@ -1660,18 +2054,46 @@ def sms_webhook():
     user_context = get_user_context_for_queries(sender)
     
     try:
-        # Since all messages are now detailed (480 chars), simplify the logic
-        if user_context['personalized']:
-            personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
-            response_msg = ask_claude(sender, personalized_msg)
-        else:
-            response_msg = ask_claude(sender, body)
+        # Handle sports queries with ESPN API
+        if intent and intent.type.startswith("sports"):
+            if intent.type == "sports_schedule":
+                team_name = intent.entities.get("team")
+                if team_name:
+                    team_data = get_nfl_team_data(team_name)
+                    if team_data:
+                        response_msg = get_nfl_schedule(team_data['id'], team_data['name'])
+                    else:
+                        response_msg = f"Team '{team_name}' not found. Try: Saints, Patriots, Cowboys, etc."
+                else:
+                    response_msg = "Which NFL team are you asking about?"
+            
+            elif intent.type == "sports_scores":
+                response_msg = get_nfl_scores()
+            
+            elif intent.type == "sports_team_score" or intent.type == "sports_team_info":
+                team_name = intent.entities.get("team")
+                if team_name:
+                    team_data = get_nfl_team_data(team_name)
+                    if team_data:
+                        response_msg = get_nfl_schedule(team_data['id'], team_data['name'])
+                    else:
+                        response_msg = f"Team '{team_name}' not found."
+                else:
+                    response_msg = get_nfl_scores()
         
-        if "Let me search for" in response_msg:
-            search_term = body
-            if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
-                search_term += f" in {user_context['location']}"
-            response_msg = web_search(search_term, search_type="general")
+        # Handle other queries
+        else:
+            if user_context['personalized']:
+                personalized_msg = f"User's name is {user_context['first_name']} and they live in {user_context['location']}. " + body
+                response_msg = ask_claude(sender, personalized_msg)
+            else:
+                response_msg = ask_claude(sender, body)
+            
+            if "Let me search for" in response_msg:
+                search_term = body
+                if user_context['personalized'] and not any(keyword in body.lower() for keyword in ['in ', 'near ', 'at ']):
+                    search_term += f" in {user_context['location']}"
+                response_msg = web_search(search_term, search_type="general")
         
         original_length = len(response_msg)
         response_msg = truncate_response(response_msg, MAX_SMS_LENGTH)
