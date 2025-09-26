@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Version tracking
-APP_VERSION = "5.1"
+APP_VERSION = "5.2"
 CHANGELOG = {
+    "5.2": "IMPORTANT: Updated to new phone number +18338613041 for all Hey Alex SMS communications",
     "5.1": "ENHANCED: Added comprehensive ESPN Sports API integration for NFL, MLB, NHL, and College Football with real-time data",
     "5.0": "MAJOR: Added ESPN Sports API integration for accurate NFL team schedules, scores, and game information",
     "4.2": "PERFECT BALANCE: 200 messages/month at 320 characters each (2 SMS parts) - great value with 76% profit margin",
@@ -117,23 +118,25 @@ WELCOME_MSG = (
     "Hey there! 🌟 I'm Alex - think of me as your personal research assistant who lives in your texts. "
     "I'm great at finding: ✓ Weather & forecasts ✓ Restaurant info & hours ✓ Local business details "
     "✓ Current news & headlines ✓ Sports scores & schedules No apps, no browsing - just text me your question and I'll handle the rest! "
-    "Try asking \"weather today\" or \"Saints game today\" to get started."
+    "Try asking \"weather today\" or \"Saints game today\" to get started. Text +18338613041"
 )
 
 # ONBOARDING MESSAGES
 ONBOARDING_NAME_MSG = (
-    "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant. "
+    "🎉 Welcome to Hey Alex! I'm your personal SMS research assistant at +18338613041. "
     "Before we start, I need to get to know you better. What's your first name?"
 )
 
 ONBOARDING_LOCATION_MSG = (
     "Nice to meet you, {name}! 👋 Now, what's your city or zip code? "
-    "This helps me give you local weather, restaurants, and business info."
+    "This helps me give you local weather, restaurants, and business info. "
+    "Save this number: +18338613041"
 )
 
 ONBOARDING_COMPLETE_MSG = (
     "Perfect! You're all set up, {name}! 🌟 I can now help you with personalized local info. "
-    "You get 200 detailed messages per month. Try asking \"weather today\" or \"Saints game today\" to start!"
+    "You get 200 detailed messages per month. Try asking \"weather today\" or \"Saints game today\" to start! "
+    "Remember to text +18338613041 for all questions."
 )
 
 # === Intent Detection Classes ===
@@ -1055,7 +1058,7 @@ def remove_from_whitelist(phone, send_goodbye=False):
             logger.info(f"📱 Removed {phone} from whitelist")
             
             if send_goodbye:
-                goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co"
+                goodbye_msg = "Thanks for using Hey Alex! Your subscription has been cancelled. You can resubscribe anytime at heyalex.co Text +18338613041 for questions."
                 try:
                     send_sms(phone, goodbye_msg, bypass_quota=True)
                     logger.info(f"👋 Goodbye message sent to {phone}")
@@ -2027,7 +2030,7 @@ def sms_webhook():
     
     # Handle special commands
     if body.lower() in ['stop', 'quit', 'unsubscribe']:
-        response_msg = "You've been unsubscribed from Hey Alex. Text START to resume service."
+        response_msg = "You've been unsubscribed from Hey Alex at +18338613041. Text START to resume service."
         try:
             send_sms(sender, response_msg, bypass_quota=True)
             return jsonify({"message": "Unsubscribe processed"}), 200
@@ -2195,6 +2198,7 @@ def health_check():
         'version': APP_VERSION,
         'latest_changes': CHANGELOG[APP_VERSION],
         'database_type': 'PostgreSQL',
+        'sms_number': '+18338613041',
         'sms_char_limit': MAX_SMS_LENGTH,
         'monthly_message_limit': MONTHLY_LIMIT,
         'message_parts_per_response': 3,
@@ -2206,7 +2210,11 @@ def health_check():
             '/admin/reset-user', 
             '/admin/restore-user',
             '/admin/check-user'
-        ]
+        ],
+        'contact_info': {
+            'sms': '+18338613041',
+            'website': 'heyalex.co'
+        }
     })
 
 # Initialize database on startup
@@ -2220,4 +2228,5 @@ if __name__ == "__main__":
     logger.info(f"📊 Monthly message limit: {MONTHLY_LIMIT} detailed messages")
     logger.info(f"🏈 Sports API: ESPN integration enabled (NFL, MLB, NHL, College)")
     logger.info(f"🔧 Admin endpoints available: /admin/remove-user, /admin/reset-user, /admin/restore-user, /admin/check-user")
+    logger.info(f"📱 SMS Number: +18338613041")
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
