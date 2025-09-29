@@ -1086,12 +1086,12 @@ def send_sms(to_number, message, bypass_quota=False):
         message = message[:CLICKSEND_MAX_LENGTH - 3] + "..."
         logger.warning(f"📏 Message truncated to ClickSend limit: {CLICKSEND_MAX_LENGTH} chars")
     
-payload = {"messages": [{
-    "source": "+18338613041",  # <-- Change this line
-    "body": message,
-    "to": to_number,
-    "custom_string": "alex_reply"
-}]}
+    payload = {"messages": [{
+        "source": "+18338613041",  # <-- Change this line
+        "body": message,
+        "to": to_number,
+        "custom_string": "alex_reply"
+    }]}
     
     try:
         logger.info(f"📤 Sending SMS to {to_number}: {message[:50]}... (Length: {len(message)} chars)")
